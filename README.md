@@ -1,2 +1,2 @@
 # VibeCheck
-Vibe Coded Neural Network Verification Tool
+Vibe-Coded Neural Network Verification Tool
