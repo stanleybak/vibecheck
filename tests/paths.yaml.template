@@ -1,0 +1,5 @@
+# Copy this to paths.yaml and fill in your local paths.
+# paths.yaml is gitignored — never commit it.
+
+vnncomp_benchmarks: /path/to/vnncomp2025_benchmarks/benchmarks
+vnncomp_results: /path/to/vnncomp2025_results

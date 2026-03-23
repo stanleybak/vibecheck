@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibecheck"
+version = "0.1.0"
+description = "Vibe-Coded Neural Network Verification Tool"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "onnx",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyyaml"]
+
+[project.scripts]
+vibecheck = "vibecheck.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
