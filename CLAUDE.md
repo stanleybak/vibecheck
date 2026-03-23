@@ -27,26 +27,45 @@ python3 -m venv .venv
 
 ## Architecture
 
-The verification pipeline flows: **ONNX loading → VNNLIB parsing → interval arithmetic bounds → zonotope propagation → margin check**.
+The verification pipeline flows: **ONNX loading → graph construction → interval arithmetic bounds → zonotope propagation → margin check**.
 
-- **`onnx_loader.py`** — Parses ONNX models into a flat list of layers. FC layers are `(W, b)` tuples; Conv layers are `(kernel, bias, params)` 3-tuples. Handles Gemm, MatMul+Add, Conv, Sub normalization folding, and FC→Conv composition. The `is_conv()` function distinguishes layer types by tuple length.
+- **`graph.py`** — Core graph representation. `ComputeGraph` loads ONNX models into a DAG of `GraphNode` objects keyed by tensor name. Supports non-sequential architectures (ResNets, skip connections, feature pyramids). Performs topological sort (Kahn's algorithm), BatchNorm folding into preceding Conv/Gemm, constant folding, and shape inference. Handles Conv, ConvTranspose, Gemm, MatMul, Add, Sub, Mul, Div, Relu, LeakyRelu, Sigmoid, Clip, MaxPool, AveragePool, Pad, Concat, Split, Slice, Gather, Reshape, and many more ops.
+
+- **`onnx_loader.py`** — Legacy sequential ONNX loader. Returns a flat list of `(W, b)` or `(kernel, bias, params)` tuples. Still used by `zonotope_verify()` for backward compatibility. The `is_conv()` function distinguishes layer types by tuple length.
 
 - **`spec.py`** — Parses VNNLIB specifications (supports `.gz`). Extracts input bounds (`x_lo`, `x_hi`) and output constraints identifying `pred_label` and `competitors`.
 
-- **`bounds.py`** — Interval arithmetic (IA) bound propagation. Computes pre-ReLU and post-ReLU bounds per layer. Conv IA uses PyTorch's `F.conv2d` via numpy↔torch conversion.
+- **`bounds.py`** — Interval arithmetic (IA) bound propagation. `ia_bounds()` works on flat layer lists (legacy). `ia_bounds_graph()` works on `ComputeGraph`, returning `dict[node_name -> (lo, hi)]`. Conv/MaxPool/AveragePool/Pad IA uses PyTorch via numpy↔torch conversion. Falls back to conservative bounds on shape mismatches.
 
-- **`zonotope.py`** — Core verification engine. `DenseZonotope` represents sets as `{center + G @ e | ||e||_inf <= 1}`. `zonotope_verify()` runs multiple ReLU relaxation strategies (`min_area`, `y_bloat`, `box`) and intersects their results to tighten output bounds. Verification succeeds if `output_lo[pred] - output_hi[comp] > 0` for all competitors.
+- **`zonotope.py`** — `DenseZonotope` represents sets as `{center + G @ e | ||e||_inf <= 1}`. Methods: `propagate_linear()` (FC/Conv), `apply_relu()` with three relaxation types (`min_area`, `y_bloat`, `box`), `copy()` for fork points, `add(other, shared_gens)` for skip connection merges. The add method splits generators into shared prefix (added element-wise) and branch-specific suffix (concatenated).
 
-- **`main.py`** — CLI entry point. Exit code 0 = verified, 1 = unknown.
+- **`verify.py`** — Verification orchestration. `zonotope_verify()` is the legacy flat-layer path. `zonotope_verify_graph()` traverses `ComputeGraph` in topological order, tracks generator counts at fork points for merge operations, and falls back to interval bounds for unsupported/expensive ops (ConvTranspose, LeakyRelu, bilinear MatMul, or when generator matrices exceed 5M elements).
+
+- **`main.py`** — CLI entry point using the graph path. Exit code 0 = verified, 1 = unknown.
 
 ## Testing
 
 - **`test_zonotope.py`** — Unit tests for `DenseZonotope` (bounds, FC propagation, ReLU cases). No external data needed.
-- **`test_acasxu.py`** — Integration tests against ACAS Xu benchmarks. Requires `tests/paths.yaml` with a `vnncomp_benchmarks` path pointing to benchmark data. Tests skip automatically if not configured.
-- External data paths are configured in `tests/paths.yaml` (gitignored) and loaded via fixtures in `conftest.py`.
+- **`test_graph.py`** — Graph loading tests (sequential, cersyve dual-branch, ResNet with BN folding), zonotope add/copy tests, regression test (graph path matches flat path on ACAS Xu), and parametrized vnncomp benchmark tests. Benchmark tests run in subprocesses with 4GB memory caps and 120s timeouts. Each benchmark also checks soundness against onnxruntime (output of center point must fall within zonotope bounds).
+- **`test_acasxu.py`** — Legacy integration tests against ACAS Xu using the flat loader path.
+- External data paths configured in `tests/paths.yaml` (gitignored) with key `vnncomp_benchmarks` pointing to the benchmarks directory. Loaded via fixtures in `conftest.py`.
 
 ## Key Design Decisions
 
-- Layer type dispatch uses tuple length (`len(layer) == 3` → Conv), not class hierarchy.
-- Conv operations in both bounds and zonotope propagation go through PyTorch (`torch.nn.functional.conv2d`) even though the rest is pure numpy.
+- **Graph-based pipeline**: `ComputeGraph` replaced the flat layer list as the primary representation. Non-sequential architectures (ResNets, parallel branches) are supported via topological traversal with fork/merge tracking.
+- **Fork/merge zonotope semantics**: At fork points, zonotopes are copied. At Add merges, shared generator columns (from before the fork) are added element-wise while branch-specific columns are concatenated. The `shared_gens` count is found by walking ancestors to the common fork point.
+- **Interval fallback**: Ops without zonotope relaxations (Sigmoid, LeakyRelu, ConvTranspose, bilinear MatMul) fall back to interval bounds re-wrapped as zonotopes. This loses correlations but stays sound.
+- **BatchNorm folding**: BN nodes following Conv/Gemm are folded into the preceding layer's weights during graph construction (before verification).
+- **Constant folding**: Chains of constant-only operations (e.g. MatMul(C,C) → Add(C,C) → Relu(C)) are evaluated at load time and stored as constants.
+- Conv operations go through PyTorch (`torch.nn.functional.conv2d`) even though the rest is pure numpy.
 - The multi-zonotope strategy intersects bounds from different ReLU relaxation types rather than picking one — this is the main precision mechanism.
+
+## vnncomp Benchmark Support
+
+19 of 25 benchmarks run end-to-end. Skipped benchmarks:
+- `vggnet16_2022`, `safenlp_2024` — no ONNX files
+- `soundnessbench` — OOM (128→12288 Gemm then Conv on 24×64×64)
+- `cctsdb_yolo_2023` — complex preprocessing (Slice/Reshape/ScatterND before Conv)
+- `collins_aerospace_benchmark` — feature pyramid Concat→Conv shape mismatch
+- `ml4acopf_2024` — trig ops + complex broadcast patterns
+- `vit_2023` — multi-head attention reshape + bilinear MatMul
