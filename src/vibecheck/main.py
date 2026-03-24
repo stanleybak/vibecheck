@@ -14,10 +14,6 @@ def main():
         description='VibeCheck — Neural Network Verification via Zonotope Analysis')
     parser.add_argument('--net', required=True, help='Path to ONNX network')
     parser.add_argument('--spec', required=True, help='Path to VNNLIB specification')
-    parser.add_argument('--relu-types', nargs='+',
-                        default=['min_area', 'y_bloat', 'box'],
-                        choices=['min_area', 'y_bloat', 'box'],
-                        help='ReLU relaxation types to intersect (default: min_area y_bloat box)')
     args = parser.parse_args()
 
     t_start = time.time()
@@ -34,8 +30,8 @@ def main():
     print(f'  {spec.n_constraints} constraint(s), '
           f'{len(spec.disjuncts)} disjunct(s)')
 
-    print(f'Running zonotope analysis (relu types: {args.relu_types})...')
-    result, details = zonotope_verify(graph, spec, relu_types=args.relu_types)
+    print('Running zonotope analysis...')
+    result, details = zonotope_verify(graph, spec)
 
     t_total = time.time() - t_start
 

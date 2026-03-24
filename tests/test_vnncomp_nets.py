@@ -1,4 +1,4 @@
-"""Tests for graph-based loading and verification."""
+"""vnncomp benchmark tests — load, propagate, compare vs onnxruntime."""
 
 import glob
 import json
@@ -76,21 +76,26 @@ def test_point_propagation_cersyve(vnncomp_benchmarks):
     assert np.all(details['output_lo'] <= details['output_hi'])
 
 
-# ---- Comprehensive vnncomp benchmark test ----
+# ---- Comprehensive vnncomp benchmark tests ----
 
-# Benchmarks that OOM or have shape-tracking issues too complex for flat vectors.
-# These are excluded from the parametrized test entirely.
-_SKIP_BENCHMARKS = {
-    'vggnet16_2022',           # no onnx files
-    'safenlp_2024',            # no onnx files at top level
-    'soundnessbench',          # OOM: 128->12288 Gemm then Conv on 24x64x64
-    'cctsdb_yolo_2023',        # complex preprocessing (Slice/Reshape/ScatterND before Conv)
-    'collins_aerospace_benchmark',  # feature pyramid Concat->Conv shape mismatch
-    'ml4acopf_2024',           # trig ops + complex broadcast patterns
-    'vit_2023',                # multi-head attention reshape + bilinear MatMul
-    'lsnc_relu',               # shape mismatch: Concat→Gemm dimension + broadcast issues
+# Benchmarks with no ONNX files — cannot be tested at all
+_MISSING_BENCHMARKS = {
+    'vggnet16_2022',           # no onnx files in benchmark
+}
+
+# Benchmarks that currently fail — tested separately via test_vnncomp_hard
+_HARD_BENCHMARKS = {
+    'cctsdb_yolo_2023',        # shape broadcast / index errors in preprocessing
     'cgan_2023/cGAN_imgSz32_nCh_3_upsample',  # needs real Upsample implementation
-    'nn4sys',                          # complex multi-branch with ND Split/Concat shape issues
+    'collins_aerospace_benchmark',  # YOLOv5 640x640, timeout
+    'ml4acopf_2024',           # missing Floor op + complex broadcast patterns
+    'nn4sys/pensieve_big_parallel',   # ND Split shape mismatch from Concat
+    'nn4sys/pensieve_small_parallel', # same
+    'nn4sys/mscn_128d',        # Gemm dim mismatch after ND Slice/Split
+    'nn4sys/mscn_128d_dual',   # same
+    'nn4sys/mscn_2048d',       # same
+    'nn4sys/mscn_2048d_dual',  # corrupt ONNX file
+    'vit_2023',                # shape broadcast errors in attention
 }
 
 
@@ -245,7 +250,7 @@ def _run_benchmark_worker(onnx_path, spec_path, result_dict):
         spec.x_hi = center.copy()
 
         t0 = time.perf_counter()
-        result, details = zvg(g, spec, relu_types=['min_area'])
+        result, details = zvg(g, spec)
         t_verify = time.perf_counter() - t0
 
         result_dict['status'] = 'ok'
@@ -304,17 +309,25 @@ def _run_benchmark_worker(onnx_path, spec_path, result_dict):
         result_dict['error'] = f'{type(e).__name__}: {e}'
 
 
-def _discover_benchmark_cases(vnncomp_path):
+def _discover_benchmark_cases(vnncomp_path, include=None, exclude=None):
     """Discover (test_id, onnx_path, spec_path) triples from instances.csv.
 
     Picks the first instance row for each unique network.
+    include: if set, only include benchmarks/cases in this set
+    exclude: if set, skip benchmarks/cases in this set
     """
     import os, csv
     base = str(vnncomp_path)
     cases = []
     for d in sorted(os.listdir(base)):
-        if d in _SKIP_BENCHMARKS:
+        if d in _MISSING_BENCHMARKS:
             continue
+        if exclude and d in exclude:
+            continue
+        if include and d not in include:
+            # Check if any include entry starts with this dir
+            if not any(i.startswith(d + '/') for i in include):
+                continue
         csv_path = os.path.join(base, d, 'instances.csv')
         if not os.path.exists(csv_path):
             continue
@@ -328,7 +341,6 @@ def _discover_benchmark_cases(vnncomp_path):
                 onnx_path = os.path.join(base, d, onnx_rel)
                 spec_path = os.path.join(base, d, spec_rel)
                 if not os.path.exists(onnx_path) or not os.path.exists(spec_path):
-                    # Try .gz variants
                     if os.path.exists(onnx_path + '.gz'):
                         onnx_path += '.gz'
                     if os.path.exists(spec_path + '.gz'):
@@ -340,7 +352,9 @@ def _discover_benchmark_cases(vnncomp_path):
                     continue
                 seen_nets.add(net_name)
                 test_id = f'{d}/{net_name}'
-                if test_id in _SKIP_BENCHMARKS:
+                if exclude and test_id in exclude:
+                    continue
+                if include and d not in include and test_id not in include:
                     continue
                 cases.append((test_id, onnx_path, spec_path))
     return cases
@@ -351,27 +365,34 @@ def benchmark_cases(vnncomp_benchmarks):
     return _discover_benchmark_cases(vnncomp_benchmarks)
 
 
-def _get_benchmark_case_ids(vnncomp_path=None):
-    """Get test IDs for parametrize. Needs paths.yaml at collection time."""
+def _resolve_vnncomp_path():
+    """Resolve vnncomp benchmarks path from paths.yaml at collection time."""
     import os
-    from pathlib import Path
     paths_file = Path(__file__).parent / "paths.yaml"
     if not paths_file.exists():
-        return []
+        return None
     import yaml
     with open(paths_file) as f:
         paths = yaml.safe_load(f) or {}
     p = paths.get("vnncomp_benchmarks")
     if not p or not os.path.exists(p):
-        return []
+        return None
     base = Path(p)
     if (base / "benchmarks").is_dir():
         base = base / "benchmarks"
-    cases = _discover_benchmark_cases(base)
+    return base
+
+
+def _get_case_ids(include=None, exclude=None):
+    base = _resolve_vnncomp_path()
+    if base is None:
+        return []
+    cases = _discover_benchmark_cases(base, include=include, exclude=exclude)
     return [c[0] for c in cases]
 
 
-_CASE_IDS = _get_benchmark_case_ids()
+_CASE_IDS = _get_case_ids(exclude=_HARD_BENCHMARKS)
+_HARD_CASE_IDS = _get_case_ids(include=_HARD_BENCHMARKS)
 
 
 _PASS_CACHE = Path(__file__).parent / '.benchmark_pass_cache'
@@ -388,17 +409,14 @@ def _save_pass(case_id):
         f.write(case_id + '\n')
 
 
-@pytest.mark.parametrize('case_id', _CASE_IDS)
-def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
-    """Each (network, spec) pair: load, point-propagate, compare vs onnxruntime.
-
-    Runs in a subprocess with a 16GB memory limit so OOM can't kill the test runner.
-    """
-    if case_id in _load_pass_cache():
+def _run_benchmark_test(vnncomp_benchmarks, case_id, use_cache=True,
+                        include=None, exclude=None):
+    """Shared logic for benchmark tests."""
+    if use_cache and case_id in _load_pass_cache():
         pytest.skip('cached pass')
 
-    # Find the matching case
-    cases = _discover_benchmark_cases(vnncomp_benchmarks)
+    cases = _discover_benchmark_cases(vnncomp_benchmarks,
+                                       include=include, exclude=exclude)
     case = next((c for c in cases if c[0] == case_id), None)
     if case is None:
         pytest.skip(f'case {case_id} not found')
@@ -417,11 +435,11 @@ def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
     if p.is_alive():
         p.kill()
         p.join()
-        pytest.skip(f'{case_id}: timeout (>10s)')
+        pytest.fail(f'{case_id}: timeout (>10s)')
 
     status = result_dict.get('status', 'unknown')
     if status == 'oom':
-        pytest.skip(f'{case_id}: OOM (>16GB)')
+        pytest.fail(f'{case_id}: OOM (>16GB)')
     elif status == 'error':
         pytest.fail(f'{case_id}: {result_dict["error"]}')
     elif status == 'ok':
@@ -438,6 +456,21 @@ def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
         if 'max_err' in d:
             parts.append(f'err={d["max_err"]:.2e}')
         print('  '.join(parts))
-        _save_pass(case_id)
+        if use_cache:
+            _save_pass(case_id)
     else:
         pytest.fail(f'{case_id}: subprocess died (status={status}, exit={p.exitcode})')
+
+
+@pytest.mark.parametrize('case_id', _CASE_IDS)
+def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
+    """Passing benchmarks: load, point-propagate, compare vs onnxruntime."""
+    _run_benchmark_test(vnncomp_benchmarks, case_id,
+                        exclude=_HARD_BENCHMARKS)
+
+
+@pytest.mark.parametrize('case_id', _HARD_CASE_IDS)
+def test_vnncomp_hard(vnncomp_benchmarks, case_id):
+    """Hard benchmarks that currently fail — run to see error details."""
+    _run_benchmark_test(vnncomp_benchmarks, case_id, use_cache=False,
+                        include=_HARD_BENCHMARKS)

@@ -1,0 +1,141 @@
+Tasks:
+
+1. Pass all "execution" tests, to ensure we understand the semantics of all benchmarks
+2. does zonotope dense work on graph structures with forks and joins? I didn't see any special handling of the merges to ensure the right generators get merged.
+3. pick easy one like ACAS Xu and implement implicit zono... make sure it matches dense
+4. pick a conv example (relusplitter?) and try implicit zono... see if it's faster than the implementation in temp/tmux-test/experiments... should be right?
+5. add ZO3 optimization to acas xu for tightening
+6. add crown-like optimization
+7. Add auto-lipra derived bounds for nonlienar operations (sine/tanh/transformer?). can use same picking strategy
+
+
+vnncomp 2025 Benchmark Summary
+==============================
+
+Generated from instances.csv of each benchmark.
+"uncertain" = number of input dimensions with nonzero perturbation radius.
+"fork points" = nodes whose output feeds multiple consumers (skip connections, parallel branches).
+
+
+acasxu_2023 — 45 networks, 10 specs [SUPPORTED]
+  Airborne collision avoidance. 45 identical FC networks (5→50→50→50→50→50→50→5).
+  input=(1,1,1,5)  22 ops  13.6K params  6 relu  sequential
+  ops: MatMul, Add, Relu, Sub, Flatten
+  spec: 5/5 uncertain, 1 constraint (threshold or pairwise)
+
+cersyve — 12 networks, 3 specs [SUPPORTED]
+  Controller verification (lane keep, pendulum, point mass). Dual-branch architectures.
+  input=(1,2)–(1,4)  11–39 ops  1.2K–4.1K params  3–10 relu  1–4 fork points
+  ops: Gemm, Add, Relu
+  spec: 2–4/2–4 uncertain, 2 constraints (pairwise)
+  Notable: all have fork points (parallel Gemm branches merging via Add)
+
+cgan_2023 — 7 networks, 19 specs [SUPPORTED, 1 skipped]
+  Conditional GAN generators. Sequential conv/deconv chains.
+  input=(1,5)  26–32 ops  352K–684K params  7–9 relu  sequential
+  ops: ConvTranspose, Conv, BatchNorm, Relu, Gemm, Reshape, Sigmoid, Tanh, Upsample
+  spec: 3–5/5 uncertain, 2 constraints
+  Skipped: cGAN_imgSz32_nCh_3_upsample (needs real Upsample implementation)
+
+cifar100_2024 — 2 networks, 200 specs [SUPPORTED]
+  CIFAR-100 ResNets with skip connections.
+  input=(1,3,32,32)  40–41 ops  2.5M–3.8M params  10 relu  8 fork points
+  ops: Conv, Add, Relu, Flatten, Gemm
+  spec: 3072/3072 uncertain, 99 constraints (pairwise, 100-class)
+  Notable: residual skip connections, BatchNorm folded into Conv
+
+collins_rul_cnn_2022 — 3 networks, 41 specs [SUPPORTED]
+  Remaining useful life prediction CNNs.
+  input=(1,1,20,20)–(1,1,40,20)  13 ops  62K–262K params  5 relu  sequential
+  ops: Conv, Relu, Dropout, Flatten
+  spec: 2/400–800 uncertain, 2 constraints
+  Notable: ONNX puts weights in graph inputs (older export format)
+
+cora_2024 — 9 networks, 60 specs [SUPPORTED]
+  Certified robust accuracy (MNIST/SVHN/CIFAR-10).
+  input=(1,784)–(1,3072)  23–25 ops  577K–1.1M params  7 relu  sequential
+  ops: MatMul, Add, Relu, Mul
+  spec: 784–3072/784–3072 uncertain, 9 constraints (pairwise)
+
+dist_shift_2023 — 1 network, 72 specs [SUPPORTED]
+  Distribution shift detection (MNIST).
+  input=(1,792)  11 ops  343K params  3 relu  sequential
+  ops: Gemm, Relu, Reshape, Sigmoid
+  spec: 8/792 uncertain, 1 constraint (threshold)
+
+linearizenn_2024 — 10 networks, 60 specs [SUPPORTED]
+  Linearized neural networks with Concat+Slice.
+  input=(1,4)  20 ops  203K params  7 relu  1 fork point
+  ops: Gemm, MatMul, Relu, Concat, Slice
+  spec: 4/4 uncertain, 2 constraints
+  Notable: fork point from Concat of input slice + Gemm output
+
+malbeware — 3 networks, 50 specs [SUPPORTED]
+  Malware image classification (64×64).
+  input=(1,1,64,64)  2–4 ops  102K–1.5M params  0–1 relu  sequential
+  ops: Conv, Flatten, Gemm, Relu
+  spec: 4096/4096 uncertain, 24 constraints (pairwise)
+
+metaroom_2023 — 100 networks, 100 specs [SUPPORTED]
+  Room layout estimation CNNs.
+  input=(1,3,32,56)  8–12 ops  467K–7.4M params  3–5 relu  sequential
+  ops: Conv, Relu, Gemm, Reshape
+  spec: 13–157/5376 uncertain, 19 constraints
+
+relusplitter — 155 networks, 95 specs [SUPPORTED]
+  ReLU splitting benchmarks (MNIST FC + CIFAR Conv).
+  input=(1,16)–(1,3,32,32)  2–20 ops  2–401K params  1–8 relu  sequential
+  ops: Conv, Gemm, Relu, Flatten, Reshape, Add, MatMul
+  spec: 16–3072/16–3072 uncertain, 9 constraints (pairwise)
+
+sat_relu — 98 networks, 98 specs [SUPPORTED]
+  SAT-encoded ReLU instances. Tiny 2-layer FC networks.
+  input=(1,6)–(1,100)  3 ops  353–70K params  1 relu  sequential
+  ops: Gemm, Relu
+  spec: 6–100/6–100 uncertain, 2 constraints (threshold)
+
+test — 5 networks, 4 specs [SUPPORTED]
+  Tiny test networks (1–5 inputs).
+  input=(1,1)–(1,1,1,5)  2–22 ops  2–13.6K params  1–6 relu  sequential
+  ops: MatMul, Add, Relu, Sub, Flatten
+  spec: 1–5/1–5 uncertain, 1–4 constraints
+
+tinyimagenet_2024 — 1 network, 200 specs [SUPPORTED]
+  TinyImageNet ResNet with skip connections.
+  input=(1,3,56,56)  40 ops  3.6M params  10 relu  8 fork points
+  ops: Conv, Add, Relu, Flatten, Gemm
+  spec: 9408/9408 uncertain, 199 constraints (pairwise, 200-class)
+  Notable: same ResNet architecture as cifar100 but larger input
+
+tllverifybench_2023 — 32 networks, 32 specs [SUPPORTED]
+  Two-level lattice networks. Deep FC with many MatMul+Add layers.
+  input=(1,2)  34–64 ops  18K–10.4M params  6–12 relu  sequential
+  ops: MatMul, Add, Relu
+  spec: 2/2 uncertain, 1 constraint (threshold)
+
+traffic_signs_recognition_2023 — 3 networks, 45 specs [SUPPORTED]
+  Quantized traffic sign classifiers (Sign activations, no ReLU).
+  input=(1,30,30,3)–(1,64,64,3)  15–33 ops  905K–1.8M params  0 relu  sequential
+  ops: Conv, Sign, Add, Transpose, MatMul, Softmax, BatchNorm, MaxPool, Reshape, Mul
+  spec: 2700–12288/2700–12288 uncertain, 42 constraints (pairwise)
+  Notable: NHWC layout (Transpose before/after Conv), quantized with Sign, no ReLU
+
+yolo_2023 — 1 network, 72 specs [SUPPORTED]
+  Tiny YOLO object detection.
+  input=(1,3,52,52)  31 ops  92K params  7 relu  5 fork points
+  ops: Conv, Relu, Add, AveragePool, Pad, Flatten
+  spec: 7933/8112 uncertain, 5 constraints (threshold)
+  Notable: fork points from residual-style skip connections, Pad ops
+
+
+--- SKIPPED BENCHMARKS ---
+
+cctsdb_yolo_2023 — complex preprocessing (Slice/Reshape/ScatterND/Range before Conv)
+collins_aerospace_benchmark — YOLOv5 with LeakyRelu, feature pyramid Concat→Conv shape mismatch
+lsnc_relu — shape mismatch from Concat→Gemm dimension issues in multi-branch graph
+ml4acopf_2024 — trig ops (Sin/Cos), Pow, complex broadcast patterns with many fork points
+nn4sys — complex multi-branch with ND Split/Concat shape tracking issues
+safenlp_2024 — loads fine but only 1 network
+soundnessbench — OOM (128→12288 Gemm then Conv on 24×64×64)
+vggnet16_2022 — no ONNX files in benchmark
+vit_2023 — vision transformer: multi-head attention with bilinear MatMul, Shape/Gather/ConstantOfShape
