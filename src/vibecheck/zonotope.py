@@ -37,7 +37,13 @@ class DenseZonotope:
     @classmethod
     def from_input_bounds(cls, x_lo: np.ndarray, x_hi: np.ndarray) -> 'DenseZonotope':
         center = (x_lo + x_hi) / 2
-        generators = np.diag((x_hi - x_lo) / 2)
+        radii = (x_hi - x_lo) / 2
+        # Only create generator columns for dimensions with nonzero radius
+        nonzero = np.nonzero(radii)[0]
+        n = len(center)
+        generators = np.zeros((n, len(nonzero)))
+        for i, j in enumerate(nonzero):
+            generators[j, i] = radii[j]
         return cls(center, generators)
 
     def bounds(self):

@@ -29,32 +29,36 @@ python3 -m venv .venv
 
 The verification pipeline flows: **ONNX loading → graph construction → interval arithmetic bounds → zonotope propagation → margin check**.
 
-- **`graph.py`** — Core graph representation. `ComputeGraph` loads ONNX models into a DAG of `GraphNode` objects keyed by tensor name. Supports non-sequential architectures (ResNets, skip connections, feature pyramids). Performs topological sort (Kahn's algorithm), BatchNorm folding into preceding Conv/Gemm, constant folding, and shape inference. Handles Conv, ConvTranspose, Gemm, MatMul, Add, Sub, Mul, Div, Relu, LeakyRelu, Sigmoid, Clip, MaxPool, AveragePool, Pad, Concat, Split, Slice, Gather, Reshape, and many more ops.
+The codebase uses an **object-oriented dispatch** pattern: each ONNX op type is a `GraphNode` subclass (in `network.py`) that implements `infer_shape()`, `ia_bounds()`, and `zonotope_propagate()`. The main loops in `bounds.py` and `verify.py` simply iterate in topological order and call these methods.
 
-- **`onnx_loader.py`** — Legacy sequential ONNX loader. Returns a flat list of `(W, b)` or `(kernel, bias, params)` tuples. Still used by `zonotope_verify()` for backward compatibility. The `is_conv()` function distinguishes layer types by tuple length.
+- **`network.py`** — Core graph representation. `ComputeGraph` holds a DAG of `GraphNode` subclass instances keyed by tensor name. Each subclass (`ConvNode`, `ReluNode`, `AddNode`, etc.) implements its own shape inference, IA bounds, and zonotope propagation. Also contains: `OP_REGISTRY` (maps ONNX op strings to subclasses), `_find_shared_gens()` for fork/merge tracking, and torch-based IA helpers for spatial ops. Use `print(graph)` for a structural summary showing topo indices, shapes, predecessor/successor connections, and fork points.
+
+- **`onnx_loader.py`** — Loads ONNX models into `ComputeGraph`. Parses ONNX nodes into the right `GraphNode` subclass via `OP_REGISTRY`, performs constant folding, topological sort, shape inference (`node.infer_shape()`), and BatchNorm folding into preceding Conv/Gemm.
 
 - **`spec.py`** — Parses VNNLIB specifications (supports `.gz`). Extracts input bounds (`x_lo`, `x_hi`) and output constraints identifying `pred_label` and `competitors`.
 
-- **`bounds.py`** — Interval arithmetic (IA) bound propagation. `ia_bounds()` works on flat layer lists (legacy). `ia_bounds_graph()` works on `ComputeGraph`, returning `dict[node_name -> (lo, hi)]`. Conv/MaxPool/AveragePool/Pad IA uses PyTorch via numpy↔torch conversion. Falls back to conservative bounds on shape mismatches.
+- **`bounds.py`** — Thin dispatch loop: `ia_bounds_graph()` iterates topo order calling `node.ia_bounds()` on each node. Returns `dict[node_name -> (lo, hi)]`.
 
 - **`zonotope.py`** — `DenseZonotope` represents sets as `{center + G @ e | ||e||_inf <= 1}`. Methods: `propagate_linear()` (FC/Conv), `apply_relu()` with three relaxation types (`min_area`, `y_bloat`, `box`), `copy()` for fork points, `add(other, shared_gens)` for skip connection merges. The add method splits generators into shared prefix (added element-wise) and branch-specific suffix (concatenated).
 
-- **`verify.py`** — Verification orchestration. `zonotope_verify()` is the legacy flat-layer path. `zonotope_verify_graph()` traverses `ComputeGraph` in topological order, tracks generator counts at fork points for merge operations, and falls back to interval bounds for unsupported/expensive ops (ConvTranspose, LeakyRelu, bilinear MatMul, or when generator matrices exceed 5M elements).
+- **`verify.py`** — Thin dispatch loop: `zonotope_verify()` iterates topo order calling `node.zonotope_propagate()`. For ops without zonotope support, point zonotopes (0 generators) use IA; non-point zonotopes raise `NotImplementedError`.
 
-- **`main.py`** — CLI entry point using the graph path. Exit code 0 = verified, 1 = unknown.
+- **`graph.py`** — Backward-compat shim re-exporting `ComputeGraph` and `GraphNode` from `network.py`.
+
+- **`main.py`** — CLI entry point. Exit code 0 = verified, 1 = unknown.
 
 ## Testing
 
 - **`test_zonotope.py`** — Unit tests for `DenseZonotope` (bounds, FC propagation, ReLU cases). No external data needed.
-- **`test_graph.py`** — Graph loading tests (sequential, cersyve dual-branch, ResNet with BN folding), zonotope add/copy tests, regression test (graph path matches flat path on ACAS Xu), and parametrized vnncomp benchmark tests. Benchmark tests run in subprocesses with 4GB memory caps and 120s timeouts. Each benchmark also checks soundness against onnxruntime (output of center point must fall within zonotope bounds).
-- **`test_acasxu.py`** — Legacy integration tests against ACAS Xu using the flat loader path.
+- **`test_graph.py`** — Graph loading tests (sequential, cersyve dual-branch, ResNet with BN folding), zonotope add/copy tests, and parametrized vnncomp benchmark tests. Benchmark tests run in subprocesses with 16GB memory caps and 120s timeouts. Tests use point zonotopes (x_lo == x_hi) at the spec center for fast propagation, with soundness verified against onnxruntime.
+- **`test_acasxu.py`** — ACAS Xu integration tests using the graph-based pipeline.
 - External data paths configured in `tests/paths.yaml` (gitignored) with key `vnncomp_benchmarks` pointing to the benchmarks directory. Loaded via fixtures in `conftest.py`.
 
 ## Key Design Decisions
 
-- **Graph-based pipeline**: `ComputeGraph` replaced the flat layer list as the primary representation. Non-sequential architectures (ResNets, parallel branches) are supported via topological traversal with fork/merge tracking.
+- **Graph-based pipeline**: `ComputeGraph` is the core representation. Non-sequential architectures (ResNets, parallel branches) are supported via topological traversal with fork/merge tracking.
 - **Fork/merge zonotope semantics**: At fork points, zonotopes are copied. At Add merges, shared generator columns (from before the fork) are added element-wise while branch-specific columns are concatenated. The `shared_gens` count is found by walking ancestors to the common fork point.
-- **Interval fallback**: Ops without zonotope relaxations (Sigmoid, LeakyRelu, ConvTranspose, bilinear MatMul) fall back to interval bounds re-wrapped as zonotopes. This loses correlations but stays sound.
+- **Point propagation fallback**: Ops without zonotope relaxations (Sigmoid, LeakyRelu, ConvTranspose, bilinear MatMul) can propagate point zonotopes (0 generators) via IA on a zero-width interval. Non-point zonotopes raise `NotImplementedError`.
 - **BatchNorm folding**: BN nodes following Conv/Gemm are folded into the preceding layer's weights during graph construction (before verification).
 - **Constant folding**: Chains of constant-only operations (e.g. MatMul(C,C) → Add(C,C) → Relu(C)) are evaluated at load time and stored as constants.
 - Conv operations go through PyTorch (`torch.nn.functional.conv2d`) even though the rest is pure numpy.

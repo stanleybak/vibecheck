@@ -42,3 +42,34 @@ def test_relu_stable_negative():
     lo, hi = z.bounds()
     np.testing.assert_allclose(lo, [0.0])
     np.testing.assert_allclose(hi, [0.0])
+
+
+def test_add_shared_only():
+    """Add two zonotopes that share all generators."""
+    z1 = DenseZonotope(np.array([1.0, 2.0]), np.array([[0.5, 0.0], [0.0, 0.5]]))
+    z2 = DenseZonotope(np.array([3.0, 4.0]), np.array([[0.1, 0.0], [0.0, 0.1]]))
+    z3 = z1.add(z2, shared_gens=2)
+    np.testing.assert_allclose(z3.center, [4.0, 6.0])
+    np.testing.assert_allclose(z3.generators, [[0.6, 0.0], [0.0, 0.6]])
+
+
+def test_add_with_extra_gens():
+    """Add two zonotopes where each branch added extra generators."""
+    z1 = DenseZonotope(
+        np.array([1.0]),
+        np.array([[0.5, 0.3, 0.1]]),  # 2 shared + 1 extra
+    )
+    z2 = DenseZonotope(
+        np.array([2.0]),
+        np.array([[0.4, 0.2, 0.05, 0.02]]),  # 2 shared + 2 extra
+    )
+    z3 = z1.add(z2, shared_gens=2)
+    np.testing.assert_allclose(z3.center, [3.0])
+    np.testing.assert_allclose(z3.generators, [[0.9, 0.5, 0.1, 0.05, 0.02]])
+
+
+def test_copy_independent():
+    z = DenseZonotope(np.array([1.0, 2.0]), np.array([[0.5], [0.3]]))
+    z2 = z.copy()
+    z2.center[0] = 99.0
+    assert z.center[0] == 1.0

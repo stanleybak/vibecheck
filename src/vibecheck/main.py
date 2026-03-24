@@ -4,7 +4,7 @@ import argparse
 import sys
 import time
 
-from .graph import ComputeGraph
+from .network import ComputeGraph
 from .spec import parse_vnnlib
 from .verify import zonotope_verify
 

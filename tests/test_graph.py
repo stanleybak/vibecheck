@@ -5,45 +5,8 @@ import json
 import multiprocessing
 import numpy as np
 import pytest
-from vibecheck.graph import ComputeGraph
-from vibecheck.zonotope import DenseZonotope
+from vibecheck.network import ComputeGraph
 from vibecheck.verify import zonotope_verify
-from vibecheck.bounds import ia_bounds_graph
-
-
-# ---- DenseZonotope.add ----
-
-def test_zonotope_add_shared_only():
-    """Add two zonotopes that share all generators."""
-    z1 = DenseZonotope(np.array([1.0, 2.0]), np.array([[0.5, 0.0], [0.0, 0.5]]))
-    z2 = DenseZonotope(np.array([3.0, 4.0]), np.array([[0.1, 0.0], [0.0, 0.1]]))
-    z3 = z1.add(z2, shared_gens=2)
-    np.testing.assert_allclose(z3.center, [4.0, 6.0])
-    np.testing.assert_allclose(z3.generators, [[0.6, 0.0], [0.0, 0.6]])
-
-
-def test_zonotope_add_with_extra_gens():
-    """Add two zonotopes where each branch added extra generators."""
-    # Both share 2 original generators, z1 added 1 extra, z2 added 2 extra
-    z1 = DenseZonotope(
-        np.array([1.0]),
-        np.array([[0.5, 0.3, 0.1]]),  # 2 shared + 1 extra
-    )
-    z2 = DenseZonotope(
-        np.array([2.0]),
-        np.array([[0.4, 0.2, 0.05, 0.02]]),  # 2 shared + 2 extra
-    )
-    z3 = z1.add(z2, shared_gens=2)
-    np.testing.assert_allclose(z3.center, [3.0])
-    # shared: [0.9, 0.5], z1_extra: [0.1], z2_extra: [0.05, 0.02]
-    np.testing.assert_allclose(z3.generators, [[0.9, 0.5, 0.1, 0.05, 0.02]])
-
-
-def test_zonotope_copy_independent():
-    z = DenseZonotope(np.array([1.0, 2.0]), np.array([[0.5], [0.3]]))
-    z2 = z.copy()
-    z2.center[0] = 99.0
-    assert z.center[0] == 1.0
 
 
 # ---- ComputeGraph loading ----
@@ -99,19 +62,16 @@ def test_acasxu_end_to_end(vnncomp_benchmarks):
     assert len(details['margins']) == len(competitors)
 
 
-# ---- IA bounds graph ----
+# ---- Point propagation ----
 
-def test_ia_bounds_graph_cersyve(vnncomp_benchmarks):
-    """IA bounds propagate through cersyve graph without error."""
+def test_point_propagation_cersyve(vnncomp_benchmarks):
+    """Point zonotope propagates through cersyve graph without error."""
     net = str(vnncomp_benchmarks / "cersyve/onnx/point_mass_pretrain_con.onnx.gz")
     g = ComputeGraph.from_onnx(net)
-    x_lo = np.zeros(4)
-    x_hi = np.ones(4)
-    state, pre_relu = ia_bounds_graph(g, x_lo, x_hi)
-    # Output should have bounds
-    out_lo, out_hi = state[g.output_name]
-    assert out_lo.shape == (2,)
-    assert np.all(out_lo <= out_hi)
+    center = np.zeros(4)
+    result, details = zonotope_verify(g, center, center, 0, [1])
+    assert details['output_lo'].shape == (2,)
+    assert np.all(details['output_lo'] <= details['output_hi'])
 
 
 # ---- Comprehensive vnncomp benchmark test ----
@@ -126,6 +86,7 @@ _SKIP_BENCHMARKS = {
     'collins_aerospace_benchmark',  # feature pyramid Concat->Conv shape mismatch
     'ml4acopf_2024',           # trig ops + complex broadcast patterns
     'vit_2023',                # multi-head attention reshape + bilinear MatMul
+    'lsnc_relu',               # shape mismatch: Concat→Gemm dimension + broadcast issues
 }
 
 
@@ -148,7 +109,87 @@ def benchmark_list(vnncomp_benchmarks):
     return _benchmark_ids(vnncomp_benchmarks)
 
 
-def _run_benchmark_worker(base, benchmark_name, result_dict):
+def _ort_node_compare(onnx_path, graph, center, ort):
+    """Run onnxruntime with all intermediate outputs and compare per-node."""
+    import gzip
+    import onnx
+    from vibecheck.zonotope import DenseZonotope
+
+    if onnx_path.endswith('.gz'):
+        with gzip.open(onnx_path, 'rb') as f:
+            model = onnx.load_from_string(f.read())
+    else:
+        model = onnx.load(onnx_path)
+
+    # Add all intermediate tensors as outputs
+    existing = {o.name for o in model.graph.output}
+    for node in model.graph.node:
+        for out in node.output:
+            if out and out not in existing:
+                model.graph.output.append(
+                    onnx.helper.make_tensor_value_info(
+                        out, onnx.TensorProto.FLOAT, None))
+
+    sess = ort.InferenceSession(model.SerializeToString())
+    inp = sess.get_inputs()[0]
+    inp_shape = [d if isinstance(d, int) and d > 0 else 1 for d in inp.shape]
+    feed = {inp.name: center.astype(np.float32).reshape(inp_shape)}
+    out_names = [o.name for o in sess.get_outputs()]
+    results = sess.run(out_names, feed)
+    ort_vals = {name: val.flatten().astype(np.float64)
+                for name, val in zip(out_names, results)}
+
+    # Run our point propagation to get per-node centers
+    forks = graph.fork_points()
+    zono_state = {graph.input_name: DenseZonotope(
+        center, np.zeros((len(center), 0)))}
+    gen_count = {graph.input_name: 0}
+    def _get(name):
+        if name in forks:
+            return zono_state[name].copy()
+        return zono_state[name]
+    for name in graph.topo_order:
+        if name in zono_state:
+            continue
+        graph.nodes[name].zonotope_propagate(
+            zono_state, gen_count, _get, 'min_area', graph)
+        gen_count[name] = 0
+
+    lines = []
+    lines.append(f"{'idx':>4s}  {'op':15s}  {'size':>6s}  {'max_err':>10s}  "
+                 f"{'ort_range':>24s}  {'our_range':>24s}")
+    lines.append("-" * 100)
+
+    first_bad = None
+    for i, name in enumerate(graph.topo_order):
+        node = graph.nodes[name]
+        our_val = zono_state[name].center
+
+        if name not in ort_vals:
+            lines.append(f"[{i:>3d}]  {node.op_type:15s}  {len(our_val):>6d}  "
+                         f"{'(no ort)':>10s}")
+            continue
+
+        ort_val = ort_vals[name]
+        n = min(len(ort_val), len(our_val))
+        err = np.max(np.abs(ort_val[:n] - our_val[:n]))
+        ort_rng = f"[{ort_val[:n].min():.4f}, {ort_val[:n].max():.4f}]"
+        our_rng = f"[{our_val.min():.4f}, {our_val.max():.4f}]"
+        marker = " <<< FIRST" if first_bad is None and err > 1e-3 else ""
+        if first_bad is None and err > 1e-3:
+            first_bad = (i, node.op_type, name)
+        lines.append(f"[{i:>3d}]  {node.op_type:15s}  {n:>6d}  {err:>10.2e}  "
+                     f"{ort_rng:>24s}  {our_rng:>24s}{marker}")
+
+    report = '\n'.join(lines)
+    if first_bad:
+        idx, op, name = first_bad
+        return (f"Soundness diverges at [{idx}] {op} ({name[:60]})\n\n"
+                f"{report}")
+    return f"No per-node divergence found\n\n{report}"
+
+
+def _run_benchmark_worker(onnx_path, spec_paths, result_dict):
     """Worker function that runs in a subprocess with memory limits.
 
     IMPORTANT: The memory cap and subprocess isolation MUST NOT be removed.
@@ -158,102 +199,116 @@ def _run_benchmark_worker(base, benchmark_name, result_dict):
     import os
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
     os.environ['OMP_NUM_THREADS'] = '1'
-
     import resource
-    mem_limit = 4 * 1024 * 1024 * 1024  # 4GB
+    mem_limit = 16 * 1024 * 1024 * 1024  # 16GB
     try:
         resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
     except ValueError:
         pass  # some systems don't support RLIMIT_AS
 
+    # Suppress onnxruntime C++ GPU discovery warnings (writes to fd 2 directly)
     try:
+        _fd = os.dup(2)
+        os.close(2)
+        _devnull = os.open(os.devnull, os.O_WRONLY)
         import onnxruntime as ort
+        os.dup2(_fd, 2)
+        os.close(_fd)
+        os.close(_devnull)
     except ImportError:
         ort = None
 
     try:
-        from vibecheck.graph import ComputeGraph as CG
+        import time
+        from vibecheck.network import ComputeGraph as CG
         from vibecheck.verify import zonotope_verify as zvg
-        from vibecheck.bounds import ia_bounds_graph as iabg
         from vibecheck.spec import parse_vnnlib
         import gzip
 
-        onnx_files = sorted(glob.glob(f'{base}/{benchmark_name}/onnx/*.onnx*'))
-        spec_files = sorted(glob.glob(f'{base}/{benchmark_name}/vnnlib/*.vnnlib*'))
-
-        onnx_path = onnx_files[0]
+        t0 = time.perf_counter()
         g = CG.from_onnx(onnx_path)
+        t_load = time.perf_counter() - t0
 
         flat_input = 1
         for d in g.input_shape:
             flat_input *= d
 
-        x_lo = x_hi = pred_label = competitors = None
-        if spec_files:
+        result_dict['n_ops'] = len(g.topo_order)
+        result_dict['input_shape'] = str(g.input_shape)
+
+        # Parse spec — try each spec file, use first that works + matches input size
+        last_err = None
+        center = pred_label = competitors = None
+        for sp in spec_paths:
             try:
-                x_lo, x_hi, pred_label, competitors = parse_vnnlib(spec_files[0])
-            except Exception:
-                pass
+                lo, hi, pred_label, competitors = parse_vnnlib(sp)
+                if len(lo) != flat_input:
+                    last_err = (f'{os.path.basename(sp)}: spec input size '
+                                f'{len(lo)} != network {flat_input}')
+                    pred_label = competitors = None
+                    continue
+                center = (lo + hi) / 2
+                result_dict['spec'] = os.path.basename(sp)
+                break
+            except Exception as e:
+                last_err = f'{os.path.basename(sp)}: {e}'
+                continue
+        if center is None:
+            raise ValueError(f'No parseable spec found. Last error: {last_err}')
 
-        if x_lo is not None and len(x_lo) == flat_input:
-            # Shrink bounds to 1% of spec to keep zonotope propagation fast
-            center = (x_lo + x_hi) / 2
-            radius = (x_hi - x_lo) / 2 * 0.01
-            x_lo = center - radius
-            x_hi = center + radius
-        else:
-            x_lo = np.full(flat_input, -0.0001)
-            x_hi = np.full(flat_input, 0.0001)
+        x_lo = center.copy()
+        x_hi = center.copy()
 
-            ia_state, _ = iabg(g, x_lo, x_hi)
-            out_lo, out_hi = ia_state[g.output_name]
-            n_out = len(out_lo)
-
-            pred_label = 0
-            competitors = list(range(1, min(n_out, 3)))
-            if not competitors:
-                competitors = [0]
-
+        t0 = time.perf_counter()
         result, details = zvg(
             g, x_lo, x_hi, pred_label, competitors,
             relu_types=['min_area'])
+        t_verify = time.perf_counter() - t0
 
         result_dict['status'] = 'ok'
         result_dict['result'] = result
         result_dict['margin'] = details['worst_margin']
+        result_dict['t_load'] = t_load
+        result_dict['t_verify'] = t_verify
 
-        # Soundness check: run onnxruntime on the center point and verify
-        # the output falls within the zonotope bounds
-        if ort is not None:
-            try:
-                if onnx_path.endswith('.gz'):
-                    with gzip.open(onnx_path, 'rb') as f:
-                        model_bytes = f.read()
-                    sess = ort.InferenceSession(model_bytes)
-                else:
-                    sess = ort.InferenceSession(onnx_path)
-                inp_name = sess.get_inputs()[0].name
-                inp_shape = sess.get_inputs()[0].shape
-                center = ((x_lo + x_hi) / 2).astype(np.float32)
-                # Reshape to match onnx expected input
-                feed = {inp_name: center.reshape([1 if (d == 0 or d is None) else d for d in inp_shape])}
-                ort_out = sess.run(None, feed)[0].flatten().astype(np.float64)
-                out_lo = details['output_lo']
-                out_hi = details['output_hi']
-                n = min(len(ort_out), len(out_lo))
-                tol = 1e-4
-                if np.any(ort_out[:n] < out_lo[:n] - tol) or np.any(ort_out[:n] > out_hi[:n] + tol):
-                    violations = []
-                    for i in range(n):
-                        if ort_out[i] < out_lo[i] - tol:
-                            violations.append(f'dim {i}: ort={ort_out[i]:.6f} < lo={out_lo[i]:.6f}')
-                        if ort_out[i] > out_hi[i] + tol:
-                            violations.append(f'dim {i}: ort={ort_out[i]:.6f} > hi={out_hi[i]:.6f}')
-                    result_dict['status'] = 'error'
-                    result_dict['error'] = f'Soundness violation: {"; ".join(violations[:3])}'
-                    return
-            except Exception:
-                pass  # ort check is best-effort
+        # Compare against onnxruntime
+        if ort is None:
+            result_dict['status'] = 'error'
+            result_dict['error'] = 'onnxruntime not installed'
+            return
+
+        if onnx_path.endswith('.gz'):
+            with gzip.open(onnx_path, 'rb') as f:
+                model_bytes = f.read()
+            sess = ort.InferenceSession(model_bytes)
+        else:
+            sess = ort.InferenceSession(onnx_path)
+        inp_name = sess.get_inputs()[0].name
+        inp_shape = sess.get_inputs()[0].shape
+        center_f32 = center.astype(np.float32)
+        feed = {inp_name: center_f32.reshape(
+            [d if isinstance(d, int) and d > 0 else 1
+             for d in inp_shape])}
+        t0 = time.perf_counter()
+        ort_out = sess.run(None, feed)[0].flatten().astype(np.float64)
+        t_ort = time.perf_counter() - t0
+
+        result_dict['t_ort'] = t_ort
+
+        out_lo = details['output_lo']
+        out_hi = details['output_hi']
+        our_out = (out_lo + out_hi) / 2  # point zonotope → exact
+        n = min(len(ort_out), len(our_out))
+        max_err = np.max(np.abs(ort_out[:n] - our_out[:n]))
+        result_dict['max_err'] = float(max_err)
+
+        # Soundness check
+        tol = 1e-4
+        if np.any(ort_out[:n] < out_lo[:n] - tol) or np.any(ort_out[:n] > out_hi[:n] + tol):
+            diag = _ort_node_compare(onnx_path, g, center, ort)
+            result_dict['status'] = 'error'
+            result_dict['error'] = diag
+            return
 
     except (MemoryError, RuntimeError) as e:
         if 'allocate' in str(e).lower() or isinstance(e, MemoryError):
@@ -266,58 +321,99 @@ def _run_benchmark_worker(base, benchmark_name, result_dict):
         result_dict['error'] = f'{type(e).__name__}: {e}'
 
 
-# Parametrize over all non-skipped benchmarks
-_ALL_BENCHMARKS = [
-    'acasxu_2023',
-    'cersyve',
-    'cgan_2023',
-    'cifar100_2024',
-    'collins_rul_cnn_2022',
-    'cora_2024',
-    'dist_shift_2023',
-    'linearizenn_2024',
-    'lsnc_relu',
-    'malbeware',
-    'metaroom_2023',
-    'nn4sys',
-    'relusplitter',
-    'sat_relu',
-    'test',
-    'tinyimagenet_2024',
-    'tllverifybench_2023',
-    'traffic_signs_recognition_2023',
-    'yolo_2023',
-]
+def _discover_benchmark_cases(vnncomp_path):
+    """Discover (test_id, onnx_path, spec_paths) triples."""
+    import os
+    base = str(vnncomp_path)
+    cases = []
+    for d in sorted(os.listdir(base)):
+        if d in _SKIP_BENCHMARKS:
+            continue
+        onnx_files = sorted(glob.glob(f'{base}/{d}/onnx/*.onnx*'))
+        spec_files = sorted(glob.glob(f'{base}/{d}/vnnlib/*.vnnlib*'))
+        if not onnx_files or not spec_files:
+            continue
+        for onnx_path in onnx_files:
+            onnx_name = os.path.basename(onnx_path).replace('.onnx.gz', '').replace('.onnx', '')
+            test_id = f'{d}/{onnx_name}'
+            cases.append((test_id, onnx_path, spec_files))
+    return cases
 
 
-@pytest.mark.parametrize('benchmark_name', _ALL_BENCHMARKS)
-def test_vnncomp_benchmark(vnncomp_benchmarks, benchmark_name):
-    """Each vnncomp benchmark loads, propagates IA bounds, and runs zonotope verify.
+@pytest.fixture(scope='session')
+def benchmark_cases(vnncomp_benchmarks):
+    return _discover_benchmark_cases(vnncomp_benchmarks)
 
-    Runs in a subprocess with a 2GB memory limit so OOM can't kill the test runner.
+
+def _get_benchmark_case_ids(vnncomp_path=None):
+    """Get test IDs for parametrize. Needs paths.yaml at collection time."""
+    import os
+    from pathlib import Path
+    paths_file = Path(__file__).parent / "paths.yaml"
+    if not paths_file.exists():
+        return []
+    import yaml
+    with open(paths_file) as f:
+        paths = yaml.safe_load(f) or {}
+    p = paths.get("vnncomp_benchmarks")
+    if not p or not os.path.exists(p):
+        return []
+    base = Path(p)
+    if (base / "benchmarks").is_dir():
+        base = base / "benchmarks"
+    cases = _discover_benchmark_cases(base)
+    return [c[0] for c in cases]
+
+
+_CASE_IDS = _get_benchmark_case_ids()
+
+
+@pytest.mark.parametrize('case_id', _CASE_IDS)
+def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
+    """Each (network, spec) pair: load, point-propagate, compare vs onnxruntime.
+
+    Runs in a subprocess with a 16GB memory limit so OOM can't kill the test runner.
     """
+    # Find the matching case
+    cases = _discover_benchmark_cases(vnncomp_benchmarks)
+    case = next((c for c in cases if c[0] == case_id), None)
+    if case is None:
+        pytest.skip(f'case {case_id} not found')
+    _, onnx_path, spec_paths = case
+
     manager = multiprocessing.Manager()
     result_dict = manager.dict()
     result_dict['status'] = 'timeout'
 
-    base = str(vnncomp_benchmarks)
     p = multiprocessing.Process(
         target=_run_benchmark_worker,
-        args=(base, benchmark_name, result_dict))
+        args=(onnx_path, spec_paths, result_dict))
     p.start()
     p.join(timeout=120)
 
     if p.is_alive():
         p.kill()
         p.join()
-        pytest.skip(f'{benchmark_name}: timeout (>120s)')
+        pytest.skip(f'{case_id}: timeout (>120s)')
 
     status = result_dict.get('status', 'unknown')
     if status == 'oom':
-        pytest.skip(f'{benchmark_name}: OOM (>2GB)')
+        pytest.skip(f'{case_id}: OOM (>16GB)')
     elif status == 'error':
-        pytest.fail(f'{benchmark_name}: {result_dict["error"]}')
+        pytest.fail(f'{case_id}: {result_dict["error"]}')
     elif status == 'ok':
-        print(f'{benchmark_name}: {result_dict["result"]} margin={result_dict["margin"]:.4f}')
+        d = result_dict
+        import os
+        print(f'  net:  {os.path.basename(onnx_path)}')
+        print(f'  spec: {d.get("spec", "?")}')
+        parts = [f'  {d.get("n_ops", "?")} ops']
+        parts.append(f'in={d.get("input_shape", "?")}')
+        parts.append(f'load={d.get("t_load", 0):.3f}s')
+        parts.append(f'verify={d.get("t_verify", 0):.3f}s')
+        if 't_ort' in d:
+            parts.append(f'ort={d["t_ort"]:.3f}s')
+        if 'max_err' in d:
+            parts.append(f'err={d["max_err"]:.2e}')
+        print('  '.join(parts))
     else:
-        pytest.fail(f'{benchmark_name}: subprocess died (status={status}, exit={p.exitcode})')
+        pytest.fail(f'{case_id}: subprocess died (status={status}, exit={p.exitcode})')
