@@ -66,14 +66,17 @@ def _find_shared_gens(name_a, name_b, graph, gen_count):
 
 
 def _get_spatial_shape(node, graph, actual_len, kernel=None, transpose=False):
-    """Resolve (C, H, W) input shape for spatial ops."""
+    """Resolve (C, H, W) input shape for torch spatial ops (no batch dim)."""
     inp_name = node.inputs[0]
     inp_shape = (graph.nodes[inp_name].output_shape
                  if inp_name in graph.nodes else graph.input_shape)
-    if len(inp_shape) != 3 or _prod(inp_shape) != actual_len:
-        if kernel is not None:
-            return _infer_conv_input_shape(actual_len, kernel, transpose)
+    # Strip batch if present: (1, C, H, W) -> (C, H, W)
+    if len(inp_shape) == 4 and inp_shape[0] == 1:
+        inp_shape = inp_shape[1:]
+    if len(inp_shape) == 3 and _prod(inp_shape) == actual_len:
         return inp_shape
+    if kernel is not None:
+        return _infer_conv_input_shape(actual_len, kernel, transpose)
     return inp_shape
 
 
@@ -124,7 +127,42 @@ class PassthroughNode(GraphNode):
     def infer_shape(self, input_shapes):
         inp = input_shapes.get(self.inputs[0]) if self.inputs else None
         if inp is not None:
-            self.output_shape = (_prod(inp),)
+            # Flatten keeps batch dim: (1, C, H, W) -> (1, C*H*W)
+            if len(inp) > 2:
+                self.output_shape = (inp[0], _prod(inp[1:]))
+            else:
+                self.output_shape = inp
+
+    def zonotope_propagate(self, zono_state, gen_count, get_input,
+                           relu_type, graph):
+        zono_state[self.name] = get_input(self.inputs[0])
+
+
+class ReshapeNode(GraphNode):
+    """Reshape — preserves data, changes shape metadata."""
+    def infer_shape(self, input_shapes):
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if inp is not None:
+            target = self.params.get('shape')
+            if target:
+                total = _prod(inp)
+                out = list(target)
+                neg_idx = None
+                known = 1
+                for i, d in enumerate(out):
+                    if d == -1:
+                        neg_idx = i
+                    elif d == 0:
+                        if i < len(inp):
+                            out[i] = inp[i]
+                        known *= out[i]
+                    else:
+                        known *= d
+                if neg_idx is not None and known > 0:
+                    out[neg_idx] = total // known
+                self.output_shape = tuple(out)
+            else:
+                self.output_shape = inp  # no target shape, keep as-is
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -132,39 +170,50 @@ class PassthroughNode(GraphNode):
 
 
 class SplitOutputNode(PassthroughNode):
-    """Placeholder for Split's secondary outputs. Usually pre-set by SplitNode."""
-    pass
+    """Placeholder for Split's secondary outputs."""
+    def infer_shape(self, input_shapes):
+        # Get shape from parent Split node's params
+        parent_shape = input_shapes.get(self.inputs[0])
+        if parent_shape is None:
+            return
+        # Find parent Split's split sizes
+        # We need to look this up from the graph, but we only have input_shapes.
+        # The parent's infer_shape set its output_shape to the first split.
+        # For secondary outputs, we compute from the full input to Split.
+        # Since we don't have the graph here, use the passthrough shape.
+        # The correct shape will be set during zonotope propagation by SplitNode.
+        if len(parent_shape) > 2:
+            self.output_shape = (parent_shape[0], _prod(parent_shape[1:]))
+        else:
+            self.output_shape = parent_shape
 
 
 class TransposeNode(GraphNode):
     def infer_shape(self, input_shapes):
         inp = input_shapes.get(self.inputs[0]) if self.inputs else None
         if inp is not None:
-            perm = self._adjusted_perm(inp)
-            if perm is not None:
+            perm = self.params.get('perm')
+            if perm is None:
+                perm = list(range(len(inp) - 1, -1, -1))  # reverse
+            if len(perm) == len(inp):
                 self.output_shape = tuple(inp[p] for p in perm)
             else:
-                self.output_shape = (_prod(inp),)
+                self.output_shape = inp
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
-        inp_shape = self._nd_shape(graph)
-
-        if inp_shape is None or len(inp_shape) < 2:
-            # 1D or unknown shape — passthrough
-            zono_state[self.name] = z
-            return
-
-        perm = self._adjusted_perm(inp_shape)
+        inp_shape = (graph.nodes[self.inputs[0]].output_shape
+                     if self.inputs[0] in graph.nodes else graph.input_shape)
+        perm = self.params.get('perm')
         if perm is None:
+            perm = list(range(len(inp_shape) - 1, -1, -1))
+
+        if len(perm) != len(inp_shape) or len(inp_shape) < 2:
             zono_state[self.name] = z
             return
 
-        # Permute center
         center = np.transpose(z.center.reshape(inp_shape), perm).flatten()
-
-        # Permute generators
         n_gens = z.generators.shape[1]
         if n_gens > 0:
             g_nd = z.generators.reshape(*inp_shape, n_gens)
@@ -172,27 +221,7 @@ class TransposeNode(GraphNode):
             gens = g_nd.reshape(-1, n_gens)
         else:
             gens = np.zeros((len(center), 0))
-
         zono_state[self.name] = DenseZonotope(center, gens)
-
-    def _nd_shape(self, graph):
-        """Get the ND (non-flat) shape of the input tensor."""
-        inp_name = self.inputs[0]
-        if inp_name in graph.nodes:
-            return graph.nodes[inp_name].output_shape
-        return graph.input_shape
-
-    def _adjusted_perm(self, inp_shape):
-        """Get permutation adjusted for no-batch shapes."""
-        perm = self.params.get('perm')
-        if perm is None:
-            return list(range(len(inp_shape) - 1, -1, -1))  # reverse
-        if len(perm) == len(inp_shape) + 1:
-            # Strip batch dim (perm[0] should be 0)
-            return [p - 1 for p in perm[1:]]
-        if len(perm) == len(inp_shape):
-            return list(perm)
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +284,14 @@ class SoftmaxNode(GraphNode):
         _require_point(self, z)
         e = np.exp(z.center - z.center.max())
         zono_state[self.name] = _point_zono(e / e.sum())
+
+
+class TanhNode(GraphNode):
+    def zonotope_propagate(self, zono_state, gen_count, get_input,
+                           relu_type, graph):
+        z = get_input(self.inputs[0])
+        _require_point(self, z)
+        zono_state[self.name] = _point_zono(np.tanh(z.center))
 
 
 class TrigNode(GraphNode):
@@ -341,10 +378,17 @@ class DivNode(GraphNode):
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
-        s = self.params['scale']  # already inverted
-        z.center = z.center * s
-        z.generators = z.generators * s[:, None]
-        zono_state[self.name] = z
+        if 'scale' in self.params:
+            s = self.params['scale']  # already inverted
+            z.center = z.center * s
+            z.generators = z.generators * s[:, None]
+            zono_state[self.name] = z
+        else:
+            # Both inputs computed — point only
+            z_b = get_input(self.inputs[1])
+            _require_point(self, z)
+            _require_point(self, z_b)
+            zono_state[self.name] = _point_zono(z.center / z_b.center)
 
 
 # ---------------------------------------------------------------------------
@@ -354,24 +398,43 @@ class DivNode(GraphNode):
 class ConvNode(GraphNode):
     def infer_shape(self, input_shapes):
         kernel = self.params['kernel']
-        C_out, kH, kW = kernel.shape[0], kernel.shape[2], kernel.shape[3]
-        sH, sW = self.params['stride']
-        pH, pW = self.params['padding']
+        C_out = kernel.shape[0]
         inp_shape = input_shapes.get(self.inputs[0]) if self.inputs else None
-        if inp_shape is not None and len(inp_shape) == 3:
-            C_in, H_in, W_in = inp_shape
-        elif inp_shape is not None:
-            C_in = kernel.shape[1]
-            import math
-            spatial = inp_shape[0] // C_in if inp_shape[0] > 0 else 1
-            side = int(math.sqrt(spatial))
-            H_in = W_in = side
-            self.params['_inferred_input_shape'] = (C_in, H_in, W_in)
+
+        if kernel.ndim == 3:
+            # 1D conv: kernel (C_out, C_in, kW)
+            kW = kernel.shape[2]
+            sW = self.params['stride'][0]
+            pW = self.params['padding'][0]
+            if inp_shape is not None and len(inp_shape) == 3:
+                _, C_in, W_in = inp_shape
+            elif inp_shape is not None:
+                W_in = _prod(inp_shape) // kernel.shape[1]
+            else:
+                W_in = 1
+            W_out = (W_in + 2 * pW - kW) // sW + 1
+            self.output_shape = (1, C_out, W_out)
         else:
-            H_in = W_in = 1
-        H_out = (H_in + 2 * pH - kH) // sH + 1
-        W_out = (W_in + 2 * pW - kW) // sW + 1
-        self.output_shape = (C_out, H_out, W_out)
+            # 2D conv: kernel (C_out, C_in, kH, kW)
+            kH, kW = kernel.shape[2], kernel.shape[3]
+            sH, sW = self.params['stride']
+            pH, pW = self.params['padding']
+            if inp_shape is not None and len(inp_shape) == 4:
+                _, C_in, H_in, W_in = inp_shape
+            elif inp_shape is not None and len(inp_shape) == 3:
+                C_in, H_in, W_in = inp_shape
+            elif inp_shape is not None:
+                C_in = kernel.shape[1]
+                import math
+                total = _prod(inp_shape)
+                spatial = total // C_in if total > 0 else 1
+                side = int(math.sqrt(spatial))
+                H_in = W_in = side
+            else:
+                H_in = W_in = 1
+            H_out = (H_in + 2 * pH - kH) // sH + 1
+            W_out = (W_in + 2 * pW - kW) // sW + 1
+            self.output_shape = (1, C_out, H_out, W_out)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -381,15 +444,39 @@ class ConvNode(GraphNode):
             raise NotImplementedError(
                 f"Conv generator matrix too large ({n_gens} × {n_elems} > 5M) "
                 f"at node '{self.name}'")
-        inp_shape = _get_spatial_shape(self, graph, n_elems, self.params['kernel'])
+        # Extract (C, H, W) for torch conv2d
+        spatial = self._spatial_shape(graph, n_elems)
+        kernel = self.params['kernel']
+        stride = self.params['stride']
+        padding = self.params['padding']
+        if kernel.ndim == 3:
+            # 1D conv -> unsqueeze to 2D for conv2d
+            kernel = kernel[:, :, np.newaxis, :]
+            stride = (1, stride[0])
+            padding = (0, padding[0])
         conv_params = {
-            'input_shape': inp_shape,
-            'stride': self.params['stride'],
-            'padding': self.params['padding'],
+            'input_shape': spatial,
+            'stride': stride,
+            'padding': padding,
         }
-        layer = (self.params['kernel'], self.params['bias'], conv_params)
+        layer = (kernel, self.params['bias'], conv_params)
         z.propagate_linear(layer)
         zono_state[self.name] = z
+
+    def _spatial_shape(self, graph, n_elems):
+        """Get (C, H, W) for torch conv2d. For 1D conv, returns (C, 1, W)."""
+        inp_name = self.inputs[0]
+        inp_shape = (graph.nodes[inp_name].output_shape
+                     if inp_name in graph.nodes else graph.input_shape)
+        kernel = self.params['kernel']
+        if len(inp_shape) == 4:
+            return inp_shape[1:]  # (C, H, W)
+        if len(inp_shape) == 3 and kernel.ndim == 3:
+            # 1D: (1, C, W) -> unsqueeze to (C, 1, W) for conv2d
+            return (inp_shape[1], 1, inp_shape[2])
+        if len(inp_shape) == 3:
+            return inp_shape
+        return _infer_conv_input_shape(n_elems, kernel)
 
 
 class ConvTransposeNode(GraphNode):
@@ -401,14 +488,16 @@ class ConvTransposeNode(GraphNode):
         pH, pW = self.params['padding']
         opH, opW = self.params.get('output_padding', (0, 0))
         inp_shape = input_shapes.get(self.inputs[0]) if self.inputs else None
-        if inp_shape is not None and len(inp_shape) == 3:
+        if inp_shape is not None and len(inp_shape) == 4:
+            _, C_in, H_in, W_in = inp_shape
+        elif inp_shape is not None and len(inp_shape) == 3:
             C_in, H_in, W_in = inp_shape
         else:
             C_in = kernel.shape[0]
             H_in = W_in = 1
         H_out = (H_in - 1) * sH - 2 * pH + kH + opH
         W_out = (W_in - 1) * sW - 2 * pW + kW + opW
-        self.output_shape = (C_out, H_out, W_out)
+        self.output_shape = (1, C_out, H_out, W_out)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -433,7 +522,7 @@ class ConvTransposeNode(GraphNode):
 class GemmNode(GraphNode):
     """Gemm and MatMul with constant weight matrix."""
     def infer_shape(self, input_shapes):
-        self.output_shape = (self.params['W'].shape[0],)
+        self.output_shape = (1, self.params['W'].shape[0])
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -491,13 +580,17 @@ class BatchNormNode(GraphNode):
 class MaxPoolNode(GraphNode):
     def infer_shape(self, input_shapes):
         inp_shape = input_shapes.get(self.inputs[0]) if self.inputs else None
-        if inp_shape and len(inp_shape) == 3:
+        if inp_shape and len(inp_shape) >= 3:
             kH, kW = self.params['kernel_shape']
             sH, sW = self.params['stride']
             pH, pW = self.params['padding']
-            C, H_in, W_in = inp_shape
-            self.output_shape = (C, (H_in + 2*pH - kH) // sH + 1,
-                                    (W_in + 2*pW - kW) // sW + 1)
+            # Handle both (C,H,W) and (1,C,H,W)
+            if len(inp_shape) == 4:
+                _, C, H_in, W_in = inp_shape
+                self.output_shape = (1, C, (H_in+2*pH-kH)//sH+1, (W_in+2*pW-kW)//sW+1)
+            else:
+                C, H_in, W_in = inp_shape
+                self.output_shape = (1, C, (H_in+2*pH-kH)//sH+1, (W_in+2*pW-kW)//sW+1)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -518,13 +611,16 @@ class MaxPoolNode(GraphNode):
 class AveragePoolNode(GraphNode):
     def infer_shape(self, input_shapes):
         inp_shape = input_shapes.get(self.inputs[0]) if self.inputs else None
-        if inp_shape and len(inp_shape) == 3:
+        if inp_shape and len(inp_shape) >= 3:
             kH, kW = self.params['kernel_shape']
             sH, sW = self.params['stride']
             pH, pW = self.params['padding']
-            C, H_in, W_in = inp_shape
-            self.output_shape = (C, (H_in + 2*pH - kH) // sH + 1,
-                                    (W_in + 2*pW - kW) // sW + 1)
+            if len(inp_shape) == 4:
+                _, C, H_in, W_in = inp_shape
+                self.output_shape = (1, C, (H_in+2*pH-kH)//sH+1, (W_in+2*pW-kW)//sW+1)
+            else:
+                C, H_in, W_in = inp_shape
+                self.output_shape = (1, C, (H_in+2*pH-kH)//sH+1, (W_in+2*pW-kW)//sW+1)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -600,50 +696,137 @@ class ConcatNode(GraphNode):
 
 
 class SplitNode(GraphNode):
+    def infer_shape(self, input_shapes):
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if inp is not None:
+            split_sizes = self.params.get('split')
+            axis = self.params.get('axis', 0)
+            if split_sizes and axis < len(inp):
+                out = list(inp)
+                out[axis] = split_sizes[0]
+                self.output_shape = tuple(out)
+            else:
+                self.output_shape = inp
+
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
         split_sizes = self.params.get('split', None)
-        if split_sizes:
-            s = split_sizes[0]
-            zono_state[self.name] = DenseZonotope(
-                z.center[:s], z.generators[:s, :])
-            for succ_name, succ_node in graph.nodes.items():
-                if (succ_node.op_type == 'SplitOutput'
-                        and succ_node.inputs[0] == self.name):
-                    idx = succ_node.params['index']
-                    start = sum(split_sizes[:idx])
-                    end = start + split_sizes[idx]
-                    zono_state[succ_name] = DenseZonotope(
-                        z.center[start:end], z.generators[start:end, :])
-                    gen_count[succ_name] = z.generators.shape[1]
-        else:
+        if not split_sizes:
             zono_state[self.name] = z
+            return
+
+        inp_shape = (graph.nodes[self.inputs[0]].output_shape
+                     if self.inputs[0] in graph.nodes else graph.input_shape)
+        axis = self.params.get('axis', 0)
+
+        # Split along the axis in ND, then flatten each part
+        parts_center = []
+        parts_gens = []
+        offset = 0
+        for s in split_sizes:
+            slices = [slice(None)] * len(inp_shape)
+            slices[axis] = slice(offset, offset + s)
+            slices = tuple(slices)
+            c_part = z.center.reshape(inp_shape)[slices].flatten()
+            parts_center.append(c_part)
+            n_gens = z.generators.shape[1]
+            if n_gens > 0:
+                g_part = z.generators.reshape(*inp_shape, n_gens)[slices].reshape(-1, n_gens)
+            else:
+                g_part = np.zeros((len(c_part), 0))
+            parts_gens.append(g_part)
+            offset += s
+
+        # First part is this node
+        zono_state[self.name] = DenseZonotope(parts_center[0], parts_gens[0])
+
+        # Set SplitOutput children
+        for succ_name, succ_node in graph.nodes.items():
+            if (succ_node.op_type == 'SplitOutput'
+                    and succ_node.inputs[0] == self.name):
+                idx = succ_node.params['index']
+                if idx < len(parts_center):
+                    zono_state[succ_name] = DenseZonotope(
+                        parts_center[idx], parts_gens[idx])
+                    gen_count[succ_name] = z.generators.shape[1]
 
 
 class SliceNode(GraphNode):
+    def infer_shape(self, input_shapes):
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if inp is not None:
+            self.output_shape = self._sliced_shape(inp)
+
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
-        s, e = self._resolve_range(len(z.center))
-        zono_state[self.name] = DenseZonotope(
-            z.center[s:e], z.generators[s:e, :])
+        inp_shape = (graph.nodes[self.inputs[0]].output_shape
+                     if self.inputs[0] in graph.nodes else graph.input_shape)
 
-    def _resolve_range(self, n):
+        if inp_shape is not None and len(inp_shape) > 1:
+            # ND slice
+            axes = self.params.get('axes', [0])
+            starts = self.params.get('starts', [0])
+            ends = self.params.get('ends', [None])
+            slices = [slice(None)] * len(inp_shape)
+            for ax, s, e in zip(axes, starts, ends):
+                a = ax if ax >= 0 else len(inp_shape) + ax
+                if a >= len(inp_shape):
+                    continue
+                dim = inp_shape[a]
+                if s < 0:
+                    s = dim + s
+                if e is None or e > dim:
+                    e = dim
+                if e < 0:
+                    e = dim + e
+                slices[a] = slice(s, e)
+            slices = tuple(slices)
+            center = z.center.reshape(inp_shape)[slices].flatten()
+            n_gens = z.generators.shape[1]
+            if n_gens > 0:
+                g_nd = z.generators.reshape(*inp_shape, n_gens)
+                gens = g_nd[slices].reshape(-1, n_gens)
+            else:
+                gens = np.zeros((len(center), 0))
+            zono_state[self.name] = DenseZonotope(center, gens)
+        else:
+            # 1D fallback
+            n = len(z.center)
+            s = self.params.get('starts', [0])[0]
+            e = self.params.get('ends', [n])[0]
+            if e > n: e = n
+            if s < 0: s = n + s
+            if e < 0: e = n + e
+            zono_state[self.name] = DenseZonotope(
+                z.center[s:e], z.generators[s:e, :])
+
+    def _sliced_shape(self, inp_shape):
+        axes = self.params.get('axes', [0])
         starts = self.params.get('starts', [0])
-        ends = self.params.get('ends', [n])
-        s = starts[0] if starts else 0
-        e = ends[0] if ends else n
-        if e > n:
-            e = n
-        if s < 0:
-            s = n + s
-        if e < 0:
-            e = n + e
-        return s, e
+        ends = self.params.get('ends', [None])
+        out = list(inp_shape)
+        for ax, s, e in zip(axes, starts, ends):
+            a = ax if ax >= 0 else len(inp_shape) + ax
+            if a >= len(out):
+                continue
+            dim = out[a]
+            if s < 0: s = dim + s
+            if e is None or e > dim: e = dim
+            if e < 0: e = dim + e
+            out[a] = e - s
+        return tuple(out)
 
 
 class GatherNode(GraphNode):
+    def infer_shape(self, input_shapes):
+        indices = self.params.get('indices', None)
+        if indices is not None:
+            self.output_shape = (len(indices.flatten()),)
+        elif self.inputs and self.inputs[0] in input_shapes:
+            self.output_shape = input_shapes[self.inputs[0]]
+
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
@@ -718,7 +901,7 @@ class ShapeOpNode(GraphNode):
     def infer_shape(self, input_shapes):
         inp = input_shapes.get(self.inputs[0]) if self.inputs else None
         if inp is not None:
-            self.output_shape = (len(inp) + 1,)
+            self.output_shape = (len(inp),)
         else:
             self.output_shape = (1,)
 
@@ -747,7 +930,7 @@ OP_REGISTRY = {
     'Flatten': PassthroughNode,
     'Squeeze': PassthroughNode,
     'Unsqueeze': PassthroughNode,
-    'Reshape': PassthroughNode,
+    'Reshape': ReshapeNode,
     'Dropout': PassthroughNode,
     'Identity': PassthroughNode,
     'SplitOutput': SplitOutputNode,
@@ -760,6 +943,7 @@ OP_REGISTRY = {
     'Clip': ClipNode,
     'Sign': SignNode,
     'Softmax': SoftmaxNode,
+    'Tanh': TanhNode,
     'Sin': TrigNode,
     'Cos': TrigNode,
     'Pow': PowNode,
@@ -790,6 +974,7 @@ OP_REGISTRY = {
     'ReduceMean': ReduceNode,
     # Other
     'Resize': ResizeNode,
+    'Upsample': ResizeNode,
     'ConstantOfShape': ConstantOfShapeNode,
     'Shape': ShapeOpNode,
     'Cast': MiscNode,

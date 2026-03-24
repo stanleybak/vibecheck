@@ -5,7 +5,7 @@ import sys
 import time
 
 from .network import ComputeGraph
-from .spec import parse_vnnlib
+from .vnnlib_loader import load_vnnlib
 from .verify import zonotope_verify
 
 
@@ -22,7 +22,6 @@ def main():
 
     t_start = time.time()
 
-    # Load network as graph
     print(f'Loading network: {args.net}')
     graph = ComputeGraph.from_onnx(args.net)
     n_relu = len(graph.relu_nodes())
@@ -30,25 +29,21 @@ def main():
     print(f'  {len(graph.nodes)} ops, {n_relu} ReLU layers, '
           f'{len(forks)} fork points, input shape: {graph.input_shape}')
 
-    # Load spec
     print(f'Loading spec: {args.spec}')
-    x_lo, x_hi, pred_label, competitors = parse_vnnlib(args.spec)
-    print(f'  Predicted class: {pred_label}, competitors: {competitors}')
+    spec = load_vnnlib(args.spec)
+    print(f'  {spec.n_constraints} constraint(s), '
+          f'{len(spec.disjuncts)} disjunct(s)')
 
-    # Run zonotope verification
     print(f'Running zonotope analysis (relu types: {args.relu_types})...')
-    result, details = zonotope_verify(
-        graph, x_lo, x_hi, pred_label, competitors,
-        relu_types=args.relu_types)
+    result, details = zonotope_verify(graph, spec, relu_types=args.relu_types)
 
     t_total = time.time() - t_start
 
-    # Report results
     print(f'\nResult: {result}')
     print(f'  Worst margin: {details["worst_margin"]:.6f}')
-    for comp, margin in details['margins'].items():
+    for i, margin in details['margins'].items():
         status = 'SAFE' if margin > 0 else 'UNKNOWN'
-        print(f'  Class {pred_label} vs {comp}: margin={margin:.6f} [{status}]')
+        print(f'  Disjunct {i}: margin={margin:.6f} [{status}]')
     print(f'  Time: {t_total:.2f}s')
 
     sys.exit(0 if result == 'verified' else 1)

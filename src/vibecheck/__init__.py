@@ -3,4 +3,5 @@
 from .network import ComputeGraph, GraphNode
 from .zonotope import DenseZonotope
 from .verify import zonotope_verify
-from .spec import parse_vnnlib
+from .vnnlib_loader import load_vnnlib
+from .spec import VNNSpec, Conjunct, Constraint, PairwiseConstraint

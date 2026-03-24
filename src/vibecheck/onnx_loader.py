@@ -175,7 +175,7 @@ def load_onnx(onnx_path):
         elif op == 'Neg':
             computed_inputs = [node.input[0]]
 
-        elif op in ('Relu', 'LeakyRelu', 'Sigmoid', 'Sign', 'Softmax'):
+        elif op in ('Relu', 'LeakyRelu', 'Sigmoid', 'Tanh', 'Sign', 'Softmax'):
             computed_inputs = [node.input[0]]
             if 'alpha' in attrs:
                 params['alpha'] = attrs['alpha']
@@ -301,9 +301,9 @@ def load_onnx(onnx_path):
                 params['axes'] = attrs['axes']
             params['keepdims'] = attrs.get('keepdims', 1)
 
-        elif op == 'Resize':
+        elif op in ('Resize', 'Upsample'):
             computed_inputs = [node.input[0]]
-            for idx, param_name in [(2, 'scales'), (3, 'sizes')]:
+            for idx, param_name in [(1, 'scales'), (2, 'scales'), (3, 'sizes')]:
                 if len(node.input) > idx and node.input[idx] != '':
                     c = _const(node.input[idx])
                     if c is not None and c.size > 0:
@@ -385,18 +385,24 @@ def load_onnx(onnx_path):
             name=out_name, op_type=op,
             inputs=computed_inputs, params=params)
 
-    # Resolve input shape
+    # Resolve input shape — keep batch dim (always 1)
+    # dims from ONNX: first is batch (0 or dynamic), rest are data dims
+    # e.g. [0, 1, 20, 20] -> (1, 1, 20, 20)
+    # e.g. [0, 0, 0, 5]   -> (1, 5)  (only last dim is real data)
     dims = graph._raw_input_dims
-    has_conv = any(n.op_type in ('Conv', 'ConvTranspose')
-                   for n in graph.nodes.values())
-    if has_conv and len(dims) == 4:
-        graph.input_shape = tuple(dims[1:])
+    is_concrete = [isinstance(d, int) and d > 0 for d in dims]
+    # Find where the concrete (non-dynamic) dims start after the batch dim
+    first_data = 1  # skip dim 0 (batch)
+    while first_data < len(dims) and not is_concrete[first_data]:
+        first_data += 1
+    if first_data >= len(dims):
+        # All dims dynamic except maybe last — treat as flat
+        last_val = dims[-1] if isinstance(dims[-1], int) and dims[-1] > 0 else 1
+        graph.input_shape = (1, last_val)
     else:
-        total = 1
-        for d in dims:
-            if d > 0:
-                total *= d
-        graph.input_shape = (total,)
+        resolved = [1] + [d if isinstance(d, int) and d > 0 else 1
+                          for d in dims[first_data:]]
+        graph.input_shape = tuple(resolved)
 
     graph.topological_sort()
     _infer_shapes(graph)
@@ -471,8 +477,21 @@ def _infer_shapes(graph):
     """Propagate shapes through the graph via polymorphic dispatch."""
     shapes = {graph.input_name: graph.input_shape}
     for name in graph.topo_order:
-        graph.nodes[name].infer_shape(shapes)
-        shapes[name] = graph.nodes[name].output_shape
+        node = graph.nodes[name]
+        node.infer_shape(shapes)
+        # For SplitOutput, compute shape from parent Split
+        if node.op_type == 'SplitOutput':
+            parent = graph.nodes.get(node.inputs[0])
+            if parent and parent.op_type == 'Split':
+                parent_inp = shapes.get(parent.inputs[0])
+                split_sizes = parent.params.get('split')
+                axis = parent.params.get('axis', 0)
+                idx = node.params.get('index', 0)
+                if parent_inp and split_sizes and idx < len(split_sizes):
+                    out = list(parent_inp)
+                    out[axis] = split_sizes[idx]
+                    node.output_shape = tuple(out)
+        shapes[name] = node.output_shape
 
 
 def _fold_batchnorm(graph):

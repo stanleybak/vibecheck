@@ -5,16 +5,12 @@ from .zonotope import DenseZonotope
 from .network import _prod
 
 
-def zonotope_verify(graph, x_lo, x_hi, pred_label, competitors, relu_types=None):
-    """Run zonotope analysis on a ComputeGraph.
-
-    Dispatches to each node's zonotope_propagate() method.
+def zonotope_verify(graph, spec, relu_types=None):
+    """Run zonotope analysis on a ComputeGraph with a VNNSpec.
 
     Args:
         graph: ComputeGraph
-        x_lo, x_hi: input bounds
-        pred_label: predicted class index
-        competitors: list of competitor class indices
+        spec: VNNSpec with x_lo, x_hi, and disjuncts
         relu_types: list of ReLU relaxation types to intersect
 
     Returns:
@@ -33,7 +29,8 @@ def zonotope_verify(graph, x_lo, x_hi, pred_label, competitors, relu_types=None)
         zono_state = {}
         gen_count = {}
 
-        zono_state[graph.input_name] = DenseZonotope.from_input_bounds(x_lo, x_hi)
+        zono_state[graph.input_name] = DenseZonotope.from_input_bounds(
+            spec.x_lo, spec.x_hi)
         gen_count[graph.input_name] = zono_state[graph.input_name].generators.shape[1]
 
         def _get_input(inp_name):
@@ -42,7 +39,7 @@ def zonotope_verify(graph, x_lo, x_hi, pred_label, competitors, relu_types=None)
             return zono_state[inp_name]
 
         for name in graph.topo_order:
-            if name in zono_state:  # already set by parent (e.g., Split)
+            if name in zono_state:
                 continue
             node = graph.nodes[name]
             node.zonotope_propagate(
@@ -54,13 +51,11 @@ def zonotope_verify(graph, x_lo, x_hi, pred_label, competitors, relu_types=None)
         best_lo = np.maximum(best_lo, z_lo)
         best_hi = np.minimum(best_hi, z_hi)
 
-    margins = {comp: float(best_lo[pred_label] - best_hi[comp])
-               for comp in competitors}
-    worst_margin = min(margins.values())
+    result, check_details = spec.check(best_lo, best_hi)
 
-    return ('verified' if worst_margin > 0 else 'unknown'), {
+    return result, {
         'output_lo': best_lo,
         'output_hi': best_hi,
-        'margins': margins,
-        'worst_margin': float(worst_margin),
+        'margins': check_details['margins'],
+        'worst_margin': check_details['worst_margin'],
     }

@@ -18,8 +18,8 @@ python3 -m venv .venv
 # Run all tests
 .venv/bin/python -m pytest tests/ -v
 
-# Run a single test
-.venv/bin/python -m pytest tests/test_zonotope.py::test_from_input_bounds -v
+# Run a single benchmark test
+.venv/bin/python -m pytest "tests/test_graph.py::test_vnncomp_benchmark[acasxu_2023/ACASXU_run2a_1_1_batch_2000]" -v -s
 
 # Run the verifier
 .venv/bin/vibecheck --net model.onnx --spec property.vnnlib
@@ -27,49 +27,39 @@ python3 -m venv .venv
 
 ## Architecture
 
-The verification pipeline flows: **ONNX loading → graph construction → interval arithmetic bounds → zonotope propagation → margin check**.
+The verification pipeline flows: **ONNX loading → graph construction → zonotope propagation → spec check**.
 
-The codebase uses an **object-oriented dispatch** pattern: each ONNX op type is a `GraphNode` subclass (in `network.py`) that implements `infer_shape()`, `ia_bounds()`, and `zonotope_propagate()`. The main loops in `bounds.py` and `verify.py` simply iterate in topological order and call these methods.
+The codebase uses **object-oriented dispatch**: each ONNX op type is a `GraphNode` subclass (in `network.py`) that implements `infer_shape()` and `zonotope_propagate()`. The verifier loop simply iterates in topological order and calls these methods.
 
-- **`network.py`** — Core graph representation. `ComputeGraph` holds a DAG of `GraphNode` subclass instances keyed by tensor name. Each subclass (`ConvNode`, `ReluNode`, `AddNode`, etc.) implements its own shape inference, IA bounds, and zonotope propagation. Also contains: `OP_REGISTRY` (maps ONNX op strings to subclasses), `_find_shared_gens()` for fork/merge tracking, and torch-based IA helpers for spatial ops. Use `print(graph)` for a structural summary showing topo indices, shapes, predecessor/successor connections, and fork points.
+- **`network.py`** — Core graph representation. `ComputeGraph` holds a DAG of `GraphNode` subclass instances keyed by tensor name. Each subclass (`ConvNode`, `ReluNode`, `AddNode`, `TransposeNode`, `SliceNode`, etc.) implements its own shape inference and zonotope propagation. Also contains: `OP_REGISTRY` (maps ONNX op strings to subclasses), `_find_shared_gens()` for fork/merge tracking. Use `print(graph)` for a structural summary showing topo indices, shapes, predecessor/successor connections, and fork points.
 
-- **`onnx_loader.py`** — Loads ONNX models into `ComputeGraph`. Parses ONNX nodes into the right `GraphNode` subclass via `OP_REGISTRY`, performs constant folding, topological sort, shape inference (`node.infer_shape()`), and BatchNorm folding into preceding Conv/Gemm.
+- **`onnx_loader.py`** — Loads ONNX models into `ComputeGraph`. Parses ONNX nodes into the right `GraphNode` subclass via `OP_REGISTRY`, performs constant folding, topological sort, shape inference (`node.infer_shape()`), and BatchNorm folding into preceding Conv/Gemm. Sets `SplitOutput` shapes from parent `Split` params.
 
-- **`spec.py`** — Parses VNNLIB specifications (supports `.gz`). Extracts input bounds (`x_lo`, `x_hi`) and output constraints identifying `pred_label` and `competitors`.
+- **`spec.py`** — OOP specification types. `VNNSpec` holds input bounds + disjunction of `Conjunct`s (DNF). Each `Conjunct` contains `Constraint` (threshold: `Y_i >= val`) or `PairwiseConstraint` (`Y_comp >= Y_pred`). `VNNSpec.check(output_lo, output_hi)` evaluates margins — positive means verified safe.
 
-- **`bounds.py`** — Thin dispatch loop: `ia_bounds_graph()` iterates topo order calling `node.ia_bounds()` on each node. Returns `dict[node_name -> (lo, hi)]`.
+- **`vnnlib_loader.py`** — VNNLIB file parsing. `load_vnnlib(path)` reads `.vnnlib` / `.vnnlib.gz` files and returns a `VNNSpec`. Supports pairwise output constraints, threshold constraints, and `(or (and ...))` disjunctive normal form with mixed input/output constraints.
 
 - **`zonotope.py`** — `DenseZonotope` represents sets as `{center + G @ e | ||e||_inf <= 1}`. Methods: `propagate_linear()` (FC/Conv), `apply_relu()` with three relaxation types (`min_area`, `y_bloat`, `box`), `copy()` for fork points, `add(other, shared_gens)` for skip connection merges. The add method splits generators into shared prefix (added element-wise) and branch-specific suffix (concatenated).
 
-- **`verify.py`** — Thin dispatch loop: `zonotope_verify()` iterates topo order calling `node.zonotope_propagate()`. For ops without zonotope support, point zonotopes (0 generators) use IA; non-point zonotopes raise `NotImplementedError`.
-
-- **`graph.py`** — Backward-compat shim re-exporting `ComputeGraph` and `GraphNode` from `network.py`.
+- **`verify.py`** — Thin dispatch loop: `zonotope_verify(graph, spec)` iterates topo order calling `node.zonotope_propagate()`, then calls `spec.check()` on the output bounds.
 
 - **`main.py`** — CLI entry point. Exit code 0 = verified, 1 = unknown.
 
+## Shapes
+
+All tensor shapes **include the batch dimension** (always 1). For example:
+- FC input: `(1, 5)` not `(5,)`
+- Conv input: `(1, 3, 32, 32)` not `(3, 32, 32)`
+- NHWC input: `(1, 30, 30, 3)`
+
+This means ONNX axes and permutations work directly without batch-dim adjustment. Torch spatial ops (`conv2d`, `max_pool2d`, etc.) strip the batch via `shape[1:]` internally.
+
+## Zonotope Propagation
+
+- **Ops with full zonotope support** (work with any number of generators): Conv (1D/2D), Gemm/MatMul, Relu, Add, Sub, Mul (scale), Div (scale), Neg, BatchNorm, Concat, Split, Slice, Gather, Reduce, Transpose, Reshape, Flatten, passthrough ops.
+- **Point-only ops** (require 0 generators, execute concretely on center): Sigmoid, Tanh, LeakyRelu, Clip, Sign, Softmax, Pow, Sin/Cos, ConvTranspose, MaxPool, AvgPool, Pad, Resize/Upsample.
+- Conv/ConvTranspose/Pool use PyTorch (`torch.nn.functional`) for both zonotope propagation and point execution.
+
 ## Testing
 
-- **`test_zonotope.py`** — Unit tests for `DenseZonotope` (bounds, FC propagation, ReLU cases). No external data needed.
-- **`test_graph.py`** — Graph loading tests (sequential, cersyve dual-branch, ResNet with BN folding), zonotope add/copy tests, and parametrized vnncomp benchmark tests. Benchmark tests run in subprocesses with 16GB memory caps and 120s timeouts. Tests use point zonotopes (x_lo == x_hi) at the spec center for fast propagation, with soundness verified against onnxruntime.
-- **`test_acasxu.py`** — ACAS Xu integration tests using the graph-based pipeline.
-- External data paths configured in `tests/paths.yaml` (gitignored) with key `vnncomp_benchmarks` pointing to the benchmarks directory. Loaded via fixtures in `conftest.py`.
-
-## Key Design Decisions
-
-- **Graph-based pipeline**: `ComputeGraph` is the core representation. Non-sequential architectures (ResNets, parallel branches) are supported via topological traversal with fork/merge tracking.
-- **Fork/merge zonotope semantics**: At fork points, zonotopes are copied. At Add merges, shared generator columns (from before the fork) are added element-wise while branch-specific columns are concatenated. The `shared_gens` count is found by walking ancestors to the common fork point.
-- **Point propagation fallback**: Ops without zonotope relaxations (Sigmoid, LeakyRelu, ConvTranspose, bilinear MatMul) can propagate point zonotopes (0 generators) via IA on a zero-width interval. Non-point zonotopes raise `NotImplementedError`.
-- **BatchNorm folding**: BN nodes following Conv/Gemm are folded into the preceding layer's weights during graph construction (before verification).
-- **Constant folding**: Chains of constant-only operations (e.g. MatMul(C,C) → Add(C,C) → Relu(C)) are evaluated at load time and stored as constants.
-- Conv operations go through PyTorch (`torch.nn.functional.conv2d`) even though the rest is pure numpy.
-- The multi-zonotope strategy intersects bounds from different ReLU relaxation types rather than picking one — this is the main precision mechanism.
-
-## vnncomp Benchmark Support
-
-19 of 25 benchmarks run end-to-end. Skipped benchmarks:
-- `vggnet16_2022`, `safenlp_2024` — no ONNX files
-- `soundnessbench` — OOM (128→12288 Gemm then Conv on 24×64×64)
-- `cctsdb_yolo_2023` — complex preprocessing (Slice/Reshape/ScatterND before Conv)
-- `collins_aerospace_benchmark` — feature pyramid Concat→Conv shape mismatch
-- `ml4acopf_2024` — trig ops + complex broadcast patterns
-- `vit_2023` — multi-head attention reshape + bilinear MatMul
+Tests use pytest. Unit tests cover zonotope math and individual op propagation. Integration tests load real ONNX networks from vnncomp benchmarks (discovered via `instances.csv`), run point propagation, and validate against onnxruntime. On soundness failure, per-node comparison identifies the divergent op. External benchmark paths configured in `tests/paths.yaml` (gitignored, template at `tests/paths.yaml.template`).

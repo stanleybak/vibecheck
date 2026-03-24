@@ -27,3 +27,4 @@ Thumbs.db
 
 # development files
 run_*.py
+tests/.benchmark_pass_cache

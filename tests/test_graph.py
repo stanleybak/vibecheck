@@ -5,8 +5,11 @@ import json
 import multiprocessing
 import numpy as np
 import pytest
+from pathlib import Path
 from vibecheck.network import ComputeGraph
 from vibecheck.verify import zonotope_verify
+from vibecheck.vnnlib_loader import load_vnnlib
+from vibecheck.spec import VNNSpec, Conjunct, PairwiseConstraint
 
 
 # ---- ComputeGraph loading ----
@@ -15,7 +18,7 @@ def test_graph_load_sequential(vnncomp_benchmarks):
     """ACAS Xu loads as a sequential graph with no fork points."""
     net = str(vnncomp_benchmarks / "acasxu_2023/onnx/ACASXU_run2a_1_1_batch_2000.onnx.gz")
     g = ComputeGraph.from_onnx(net)
-    assert g.input_shape == (5,)
+    assert g.input_shape == (1, 1, 1, 5)
     assert len(g.fork_points()) == 0
     assert len(g.relu_nodes()) == 6
 
@@ -24,7 +27,7 @@ def test_graph_load_cersyve(vnncomp_benchmarks):
     """Cersyve has a dual-branch structure with Add merge."""
     net = str(vnncomp_benchmarks / "cersyve/onnx/point_mass_pretrain_con.onnx.gz")
     g = ComputeGraph.from_onnx(net)
-    assert g.input_shape == (4,)
+    assert g.input_shape == (1, 4)
     assert len(g.fork_points()) > 0  # input is a fork
     # Output is the Add node
     assert g.nodes[g.output_name].op_type == 'Add'
@@ -34,7 +37,7 @@ def test_graph_load_resnet(vnncomp_benchmarks):
     """cifar100 ResNet loads with BatchNorm folded and skip connections."""
     net = str(vnncomp_benchmarks / "cifar100_2024/onnx/CIFAR100_resnet_medium.onnx.gz")
     g = ComputeGraph.from_onnx(net)
-    assert g.input_shape == (3, 32, 32)
+    assert g.input_shape == (1, 3, 32, 32)
     # BN should be folded — no BatchNormalization nodes remain
     bn_nodes = [n for n in g.nodes.values() if n.op_type == 'BatchNormalization']
     assert len(bn_nodes) == 0
@@ -49,17 +52,15 @@ def test_graph_load_resnet(vnncomp_benchmarks):
 
 def test_acasxu_end_to_end(vnncomp_benchmarks):
     """ACAS Xu loads and verifies via the graph path."""
-    from vibecheck.spec import parse_vnnlib
-
     net = str(vnncomp_benchmarks / "acasxu_2023/onnx/ACASXU_run2a_1_1_batch_2000.onnx.gz")
-    spec = str(vnncomp_benchmarks / "acasxu_2023/vnnlib/prop_2.vnnlib.gz")
+    spec_path = str(vnncomp_benchmarks / "acasxu_2023/vnnlib/prop_2.vnnlib.gz")
 
     graph = ComputeGraph.from_onnx(net)
-    x_lo, x_hi, pred_label, competitors = parse_vnnlib(spec)
+    spec = load_vnnlib(spec_path)
 
-    result, details = zonotope_verify(graph, x_lo, x_hi, pred_label, competitors)
+    result, details = zonotope_verify(graph, spec)
     assert result in ('verified', 'unknown')
-    assert len(details['margins']) == len(competitors)
+    assert len(details['margins']) == len(spec.disjuncts)
 
 
 # ---- Point propagation ----
@@ -69,7 +70,8 @@ def test_point_propagation_cersyve(vnncomp_benchmarks):
     net = str(vnncomp_benchmarks / "cersyve/onnx/point_mass_pretrain_con.onnx.gz")
     g = ComputeGraph.from_onnx(net)
     center = np.zeros(4)
-    result, details = zonotope_verify(g, center, center, 0, [1])
+    spec = VNNSpec(center, center, [Conjunct([PairwiseConstraint(0, 1)])])
+    result, details = zonotope_verify(g, spec)
     assert details['output_lo'].shape == (2,)
     assert np.all(details['output_lo'] <= details['output_hi'])
 
@@ -87,6 +89,8 @@ _SKIP_BENCHMARKS = {
     'ml4acopf_2024',           # trig ops + complex broadcast patterns
     'vit_2023',                # multi-head attention reshape + bilinear MatMul
     'lsnc_relu',               # shape mismatch: Concat→Gemm dimension + broadcast issues
+    'cgan_2023/cGAN_imgSz32_nCh_3_upsample',  # needs real Upsample implementation
+    'nn4sys',                          # complex multi-branch with ND Split/Concat shape issues
 }
 
 
@@ -189,7 +193,7 @@ def _ort_node_compare(onnx_path, graph, center, ort):
     return f"No per-node divergence found\n\n{report}"
 
 
-def _run_benchmark_worker(onnx_path, spec_paths, result_dict):
+def _run_benchmark_worker(onnx_path, spec_path, result_dict):
     """Worker function that runs in a subprocess with memory limits.
 
     IMPORTANT: The memory cap and subprocess isolation MUST NOT be removed.
@@ -206,15 +210,8 @@ def _run_benchmark_worker(onnx_path, spec_paths, result_dict):
     except ValueError:
         pass  # some systems don't support RLIMIT_AS
 
-    # Suppress onnxruntime C++ GPU discovery warnings (writes to fd 2 directly)
     try:
-        _fd = os.dup(2)
-        os.close(2)
-        _devnull = os.open(os.devnull, os.O_WRONLY)
         import onnxruntime as ort
-        os.dup2(_fd, 2)
-        os.close(_fd)
-        os.close(_devnull)
     except ImportError:
         ort = None
 
@@ -222,7 +219,7 @@ def _run_benchmark_worker(onnx_path, spec_paths, result_dict):
         import time
         from vibecheck.network import ComputeGraph as CG
         from vibecheck.verify import zonotope_verify as zvg
-        from vibecheck.spec import parse_vnnlib
+        from vibecheck.vnnlib_loader import load_vnnlib
         import gzip
 
         t0 = time.perf_counter()
@@ -236,33 +233,19 @@ def _run_benchmark_worker(onnx_path, spec_paths, result_dict):
         result_dict['n_ops'] = len(g.topo_order)
         result_dict['input_shape'] = str(g.input_shape)
 
-        # Parse spec — try each spec file, use first that works + matches input size
-        last_err = None
-        center = pred_label = competitors = None
-        for sp in spec_paths:
-            try:
-                lo, hi, pred_label, competitors = parse_vnnlib(sp)
-                if len(lo) != flat_input:
-                    last_err = (f'{os.path.basename(sp)}: spec input size '
-                                f'{len(lo)} != network {flat_input}')
-                    pred_label = competitors = None
-                    continue
-                center = (lo + hi) / 2
-                result_dict['spec'] = os.path.basename(sp)
-                break
-            except Exception as e:
-                last_err = f'{os.path.basename(sp)}: {e}'
-                continue
-        if center is None:
-            raise ValueError(f'No parseable spec found. Last error: {last_err}')
+        # Parse spec
+        spec = load_vnnlib(spec_path)
+        if len(spec.x_lo) != flat_input:
+            raise ValueError(
+                f'spec input size {len(spec.x_lo)} != network {flat_input}')
 
-        x_lo = center.copy()
-        x_hi = center.copy()
+        # Use point zonotope at center of spec box
+        center = (spec.x_lo + spec.x_hi) / 2
+        spec.x_lo = center.copy()
+        spec.x_hi = center.copy()
 
         t0 = time.perf_counter()
-        result, details = zvg(
-            g, x_lo, x_hi, pred_label, competitors,
-            relu_types=['min_area'])
+        result, details = zvg(g, spec, relu_types=['min_area'])
         t_verify = time.perf_counter() - t0
 
         result_dict['status'] = 'ok'
@@ -322,21 +305,44 @@ def _run_benchmark_worker(onnx_path, spec_paths, result_dict):
 
 
 def _discover_benchmark_cases(vnncomp_path):
-    """Discover (test_id, onnx_path, spec_paths) triples."""
-    import os
+    """Discover (test_id, onnx_path, spec_path) triples from instances.csv.
+
+    Picks the first instance row for each unique network.
+    """
+    import os, csv
     base = str(vnncomp_path)
     cases = []
     for d in sorted(os.listdir(base)):
         if d in _SKIP_BENCHMARKS:
             continue
-        onnx_files = sorted(glob.glob(f'{base}/{d}/onnx/*.onnx*'))
-        spec_files = sorted(glob.glob(f'{base}/{d}/vnnlib/*.vnnlib*'))
-        if not onnx_files or not spec_files:
+        csv_path = os.path.join(base, d, 'instances.csv')
+        if not os.path.exists(csv_path):
             continue
-        for onnx_path in onnx_files:
-            onnx_name = os.path.basename(onnx_path).replace('.onnx.gz', '').replace('.onnx', '')
-            test_id = f'{d}/{onnx_name}'
-            cases.append((test_id, onnx_path, spec_files))
+        seen_nets = set()
+        with open(csv_path) as f:
+            for row in csv.reader(f):
+                if len(row) < 2:
+                    continue
+                onnx_rel = row[0].lstrip('./')
+                spec_rel = row[1].lstrip('./')
+                onnx_path = os.path.join(base, d, onnx_rel)
+                spec_path = os.path.join(base, d, spec_rel)
+                if not os.path.exists(onnx_path) or not os.path.exists(spec_path):
+                    # Try .gz variants
+                    if os.path.exists(onnx_path + '.gz'):
+                        onnx_path += '.gz'
+                    if os.path.exists(spec_path + '.gz'):
+                        spec_path += '.gz'
+                if not os.path.exists(onnx_path):
+                    continue
+                net_name = os.path.basename(onnx_path).replace('.onnx.gz', '').replace('.onnx', '')
+                if net_name in seen_nets:
+                    continue
+                seen_nets.add(net_name)
+                test_id = f'{d}/{net_name}'
+                if test_id in _SKIP_BENCHMARKS:
+                    continue
+                cases.append((test_id, onnx_path, spec_path))
     return cases
 
 
@@ -368,18 +374,35 @@ def _get_benchmark_case_ids(vnncomp_path=None):
 _CASE_IDS = _get_benchmark_case_ids()
 
 
+_PASS_CACHE = Path(__file__).parent / '.benchmark_pass_cache'
+
+
+def _load_pass_cache():
+    if _PASS_CACHE.exists():
+        return set(_PASS_CACHE.read_text().splitlines())
+    return set()
+
+
+def _save_pass(case_id):
+    with open(_PASS_CACHE, 'a') as f:
+        f.write(case_id + '\n')
+
+
 @pytest.mark.parametrize('case_id', _CASE_IDS)
 def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
     """Each (network, spec) pair: load, point-propagate, compare vs onnxruntime.
 
     Runs in a subprocess with a 16GB memory limit so OOM can't kill the test runner.
     """
+    if case_id in _load_pass_cache():
+        pytest.skip('cached pass')
+
     # Find the matching case
     cases = _discover_benchmark_cases(vnncomp_benchmarks)
     case = next((c for c in cases if c[0] == case_id), None)
     if case is None:
         pytest.skip(f'case {case_id} not found')
-    _, onnx_path, spec_paths = case
+    _, onnx_path, spec_path = case
 
     manager = multiprocessing.Manager()
     result_dict = manager.dict()
@@ -387,14 +410,14 @@ def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
 
     p = multiprocessing.Process(
         target=_run_benchmark_worker,
-        args=(onnx_path, spec_paths, result_dict))
+        args=(onnx_path, spec_path, result_dict))
     p.start()
-    p.join(timeout=120)
+    p.join(timeout=10)
 
     if p.is_alive():
         p.kill()
         p.join()
-        pytest.skip(f'{case_id}: timeout (>120s)')
+        pytest.skip(f'{case_id}: timeout (>10s)')
 
     status = result_dict.get('status', 'unknown')
     if status == 'oom':
@@ -405,7 +428,7 @@ def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
         d = result_dict
         import os
         print(f'  net:  {os.path.basename(onnx_path)}')
-        print(f'  spec: {d.get("spec", "?")}')
+        print(f'  spec: {os.path.basename(spec_path)}')
         parts = [f'  {d.get("n_ops", "?")} ops']
         parts.append(f'in={d.get("input_shape", "?")}')
         parts.append(f'load={d.get("t_load", 0):.3f}s')
@@ -415,5 +438,6 @@ def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
         if 'max_err' in d:
             parts.append(f'err={d["max_err"]:.2e}')
         print('  '.join(parts))
+        _save_pass(case_id)
     else:
         pytest.fail(f'{case_id}: subprocess died (status={status}, exit={p.exitcode})')

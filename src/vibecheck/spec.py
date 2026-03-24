@@ -1,47 +1,100 @@
-"""VNNLIB spec parsing."""
+"""Verification specification types.
+
+A VNNSpec defines input bounds and output constraints (the unsafe region).
+The unsafe region is a disjunction of conjuncts (DNF). Verification succeeds
+if ALL disjuncts are provably unreachable.
+"""
 
 import numpy as np
-import re
-import gzip
+from dataclasses import dataclass
 
 
-def parse_vnnlib(vnnlib_path):
-    """Parse VNNLIB spec. Returns (x_lo, x_hi, pred_label, competitors)."""
-    if vnnlib_path.endswith('.gz'):
-        with gzip.open(vnnlib_path, 'rt') as f:
-            text = f.read()
-    else:
-        with open(vnnlib_path, 'r') as f:
-            text = f.read()
+@dataclass
+class Constraint:
+    """Threshold constraint: Y[index] op value."""
+    index: int
+    op: str       # '>=' or '<='
+    value: float
 
-    x_bounds = {}
-    for m in re.finditer(r'\(assert\s+\(>=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)', text):
-        x_bounds.setdefault(int(m.group(1)), [None, None])[0] = float(m.group(2))
-    for m in re.finditer(r'\(assert\s+\(<=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)', text):
-        x_bounds.setdefault(int(m.group(1)), [None, None])[1] = float(m.group(2))
+    def margin(self, output_lo, output_hi):
+        """Positive margin = verified safe."""
+        if self.op == '>=':
+            # Unsafe if Y[idx] >= val. Safe if hi < val.
+            return self.value - output_hi[self.index]
+        else:
+            # Unsafe if Y[idx] <= val. Safe if lo > val.
+            return output_lo[self.index] - self.value
 
-    if not x_bounds:
-        for m in re.finditer(r'X_(\d+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)', text):
-            x_bounds[int(m.group(1))] = [float(m.group(2)), float(m.group(3))]
+    def __str__(self):
+        return f'Y_{self.index} {self.op} {self.value}'
 
-    n_input = max(x_bounds.keys()) + 1
-    x_lo = np.array([x_bounds[i][0] for i in range(n_input)])
-    x_hi = np.array([x_bounds[i][1] for i in range(n_input)])
 
-    # Format 1: >= Y_comp Y_pred (competitor >= pred)
-    output_constrs = re.findall(r'>=\s+Y_(\d+)\s+Y_(\d+)', text)
-    if output_constrs:
-        from collections import Counter
-        pred_label = Counter(int(c[1]) for c in output_constrs).most_common(1)[0][0]
-        competitors = sorted(set(int(c[0]) for c in output_constrs))
-        return x_lo, x_hi, pred_label, competitors
+@dataclass
+class PairwiseConstraint:
+    """Pairwise constraint: unsafe if Y[comp] >= Y[pred]."""
+    pred: int
+    comp: int
 
-    # Format 2: <= Y_pred Y_comp (pred <= competitor)
-    output_constrs = re.findall(r'<=\s+Y_(\d+)\s+Y_(\d+)', text)
-    if output_constrs:
-        from collections import Counter
-        pred_label = Counter(int(c[0]) for c in output_constrs).most_common(1)[0][0]
-        competitors = sorted(set(int(c[1]) for c in output_constrs))
-        return x_lo, x_hi, pred_label, competitors
+    def margin(self, output_lo, output_hi):
+        """Positive margin = pred provably beats comp."""
+        return output_lo[self.pred] - output_hi[self.comp]
 
-    raise ValueError("Cannot parse output constraints from VNNLIB")
+    def __str__(self):
+        return f'Y_{self.comp} >= Y_{self.pred}'
+
+
+@dataclass
+class Conjunct:
+    """Conjunction of constraints. All must hold for the unsafe region."""
+    constraints: list
+
+    def margin(self, output_lo, output_hi):
+        """Worst margin across constraints. Positive = conjunction verified safe."""
+        return min(c.margin(output_lo, output_hi) for c in self.constraints)
+
+    def __str__(self):
+        return ' AND '.join(str(c) for c in self.constraints)
+
+
+@dataclass
+class VNNSpec:
+    """VNNLIB specification: input bounds + disjunction of conjuncts.
+
+    The unsafe region is OR of conjuncts. Verified if ALL disjuncts have
+    positive margin (every unsafe region is provably unreachable).
+    """
+    x_lo: np.ndarray
+    x_hi: np.ndarray
+    disjuncts: list  # list of Conjunct
+
+    def check(self, output_lo, output_hi):
+        """Check spec against output bounds.
+
+        Returns:
+            result: 'verified' or 'unknown'
+            details: dict with margins per disjunct and worst_margin
+        """
+        margins = {}
+        for i, conj in enumerate(self.disjuncts):
+            margins[i] = conj.margin(output_lo, output_hi)
+
+        worst = min(margins.values()) if margins else 0.0
+        return ('verified' if worst > 0 else 'unknown'), {
+            'margins': margins,
+            'worst_margin': float(worst),
+        }
+
+    @property
+    def n_constraints(self):
+        return sum(len(d.constraints) for d in self.disjuncts)
+
+    def __str__(self):
+        parts = [f'input: {len(self.x_lo)}D  '
+                 f'[{self.x_lo.min():.4f}, {self.x_hi.max():.4f}]']
+        if len(self.disjuncts) == 1:
+            parts.append(f'unsafe if: {self.disjuncts[0]}')
+        else:
+            parts.append(f'unsafe if any of {len(self.disjuncts)} disjuncts:')
+            for i, d in enumerate(self.disjuncts):
+                parts.append(f'  [{i}] {d}')
+        return '\n'.join(parts)
