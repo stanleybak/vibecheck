@@ -24,3 +24,6 @@ tests/paths.yaml
 # OS
 .DS_Store
 Thumbs.db
+
+# development files
+run_*.py
