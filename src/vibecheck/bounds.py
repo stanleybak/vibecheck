@@ -1,38 +1,6 @@
 """Interval arithmetic bound propagation."""
 
 import numpy as np
-from .onnx_loader import is_conv, conv_output_shape
-
-
-def ia_bounds(layers, x_lo, x_hi):
-    """Interval arithmetic bounds. Returns (pre_bounds, post_bounds).
-
-    pre_bounds[l] = (z_lo, z_hi) — bounds before ReLU at layer l
-    post_bounds[l] = (a_lo, a_hi) — bounds after ReLU (or input bounds at l=0)
-    """
-    pre_bounds = []
-    post_bounds = [(x_lo.copy(), x_hi.copy())]
-    for l, layer in enumerate(layers):
-        a_lo, a_hi = post_bounds[-1]
-        if is_conv(layer):
-            kernel, bias, params = layer
-            z_lo, z_hi = _conv_ia(a_lo, a_hi, kernel, bias, params)
-        else:
-            W, b = layer
-            Wp = np.maximum(W, 0)
-            Wn = np.minimum(W, 0)
-            z_lo = Wp @ a_lo + Wn @ a_hi + b
-            z_hi = Wp @ a_hi + Wn @ a_lo + b
-        pre_bounds.append((z_lo, z_hi))
-        if l < len(layers) - 1:
-            post_bounds.append((np.maximum(z_lo, 0), np.maximum(z_hi, 0)))
-    return pre_bounds, post_bounds
-
-
-def unstable_counts(pre_bounds, n_hidden):
-    """Count unstable neurons per hidden layer."""
-    return [int(np.sum((pre_bounds[l][0] < 0) & (pre_bounds[l][1] > 0)))
-            for l in range(n_hidden)]
 
 
 def _conv_ia(a_lo, a_hi, kernel, bias, params):

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from vibecheck.graph import ComputeGraph
 from vibecheck.zonotope import DenseZonotope
-from vibecheck.verify import zonotope_verify, zonotope_verify_graph
+from vibecheck.verify import zonotope_verify
 from vibecheck.bounds import ia_bounds_graph
 
 
@@ -82,25 +82,21 @@ def test_graph_load_resnet(vnncomp_benchmarks):
     assert len(add_nodes) == 8  # 8 residual blocks
 
 
-# ---- Regression: graph path matches flat path ----
+# ---- End-to-end on ACAS Xu ----
 
-def test_graph_vs_flat_acasxu(vnncomp_benchmarks):
-    """Graph path produces identical results to flat path on ACAS Xu."""
-    from vibecheck.onnx_loader import load_onnx
+def test_acasxu_end_to_end(vnncomp_benchmarks):
+    """ACAS Xu loads and verifies via the graph path."""
     from vibecheck.spec import parse_vnnlib
 
     net = str(vnncomp_benchmarks / "acasxu_2023/onnx/ACASXU_run2a_1_1_batch_2000.onnx.gz")
     spec = str(vnncomp_benchmarks / "acasxu_2023/vnnlib/prop_2.vnnlib.gz")
 
-    layers, _ = load_onnx(net)
     graph = ComputeGraph.from_onnx(net)
     x_lo, x_hi, pred_label, competitors = parse_vnnlib(spec)
 
-    _, details_flat = zonotope_verify(layers, x_lo, x_hi, pred_label, competitors)
-    _, details_graph = zonotope_verify_graph(graph, x_lo, x_hi, pred_label, competitors)
-
-    np.testing.assert_allclose(details_flat['output_lo'], details_graph['output_lo'])
-    np.testing.assert_allclose(details_flat['output_hi'], details_graph['output_hi'])
+    result, details = zonotope_verify(graph, x_lo, x_hi, pred_label, competitors)
+    assert result in ('verified', 'unknown')
+    assert len(details['margins']) == len(competitors)
 
 
 # ---- IA bounds graph ----
@@ -153,14 +149,18 @@ def benchmark_list(vnncomp_benchmarks):
 
 
 def _run_benchmark_worker(base, benchmark_name, result_dict):
-    """Worker function that runs in a subprocess with memory limits."""
+    """Worker function that runs in a subprocess with memory limits.
+
+    IMPORTANT: The memory cap and subprocess isolation MUST NOT be removed.
+    Without them, large benchmarks (e.g. soundnessbench, cifar100) can OOM
+    and kill the parent process — including Claude Code sessions.
+    """
     import os
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
     os.environ['OMP_NUM_THREADS'] = '1'
 
     import resource
-    # Cap virtual memory at 4GB to prevent OOM killing the parent
-    mem_limit = 4 * 1024 * 1024 * 1024
+    mem_limit = 4 * 1024 * 1024 * 1024  # 4GB
     try:
         resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
     except ValueError:
@@ -173,7 +173,7 @@ def _run_benchmark_worker(base, benchmark_name, result_dict):
 
     try:
         from vibecheck.graph import ComputeGraph as CG
-        from vibecheck.verify import zonotope_verify_graph as zvg
+        from vibecheck.verify import zonotope_verify as zvg
         from vibecheck.bounds import ia_bounds_graph as iabg
         from vibecheck.spec import parse_vnnlib
         import gzip

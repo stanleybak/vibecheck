@@ -6,11 +6,18 @@ import pytest
 from pathlib import Path
 
 PATHS_FILE = Path(__file__).parent / "paths.yaml"
+PATHS_TEMPLATE = Path(__file__).parent / "paths.yaml.template"
 
 
 def _load_paths():
     if not PATHS_FILE.exists():
-        return {}
+        pytest.fail(
+            f"Missing {PATHS_FILE}\n\n"
+            f"Setup:\n"
+            f"  1. Clone benchmarks: git clone https://github.com/stanleybak/vnncomp2025_benchmarks.git\n"
+            f"  2. Copy template:    cp {PATHS_TEMPLATE} {PATHS_FILE}\n"
+            f"  3. Edit paths.yaml with your local benchmark path\n"
+        )
     with open(PATHS_FILE) as f:
         return yaml.safe_load(f) or {}
 
@@ -24,14 +31,28 @@ def paths():
 @pytest.fixture(scope="session")
 def vnncomp_benchmarks(paths):
     p = paths.get("vnncomp_benchmarks")
-    if not p or not Path(p).exists():
-        pytest.skip("vnncomp_benchmarks path not configured in tests/paths.yaml")
-    return Path(p)
+    if not p:
+        pytest.fail(
+            f"'vnncomp_benchmarks' not set in {PATHS_FILE}\n"
+            f"Add:  vnncomp_benchmarks: /path/to/vnncomp2025_benchmarks/benchmarks"
+        )
+    path = Path(p)
+    if not path.exists():
+        pytest.fail(
+            f"vnncomp_benchmarks path does not exist: {p}\n\n"
+            f"Clone it:\n"
+            f"  git clone https://github.com/stanleybak/vnncomp2025_benchmarks.git\n"
+            f"Then update {PATHS_FILE}"
+        )
+    return path
 
 
 @pytest.fixture(scope="session")
 def vnncomp_results(paths):
     p = paths.get("vnncomp_results")
-    if not p or not Path(p).exists():
-        pytest.skip("vnncomp_results path not configured in tests/paths.yaml")
-    return Path(p)
+    if not p:
+        pytest.fail(f"'vnncomp_results' not set in {PATHS_FILE}")
+    path = Path(p)
+    if not path.exists():
+        pytest.fail(f"vnncomp_results path does not exist: {p}")
+    return path

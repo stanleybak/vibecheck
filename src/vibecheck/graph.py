@@ -547,6 +547,12 @@ class ComputeGraph:
                 ref_count[inp] = ref_count.get(inp, 0) + 1
         return {name for name, count in ref_count.items() if count > 1}
 
+    def predecessors(self, name):
+        """Return list of input tensor names for a node."""
+        if name in self.nodes:
+            return list(self.nodes[name].inputs)
+        return []
+
     def successors(self, name):
         """Return list of node names that consume this node's output."""
         return [n.name for n in self.nodes.values() if name in n.inputs]

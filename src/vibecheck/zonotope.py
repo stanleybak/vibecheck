@@ -1,7 +1,23 @@
 """Zonotope forward propagation — dense numpy implementation."""
 
 import numpy as np
-from .onnx_loader import is_conv, conv_output_shape
+
+
+def is_conv(layer):
+    """Check if layer is Conv (3-tuple) vs FC (2-tuple)."""
+    return len(layer) == 3
+
+
+def conv_output_shape(input_shape, kernel, params):
+    """Compute output spatial shape for a Conv layer."""
+    C_in, H_in, W_in = input_shape
+    C_out = kernel.shape[0]
+    kH, kW = kernel.shape[2], kernel.shape[3]
+    sH, sW = params['stride']
+    pH, pW = params['padding']
+    H_out = (H_in + 2 * pH - kH) // sH + 1
+    W_out = (W_in + 2 * pW - kW) // sW + 1
+    return (C_out, H_out, W_out)
 
 
 class DenseZonotope:

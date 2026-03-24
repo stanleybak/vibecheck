@@ -6,7 +6,7 @@ import time
 
 from .graph import ComputeGraph
 from .spec import parse_vnnlib
-from .verify import zonotope_verify_graph
+from .verify import zonotope_verify
 
 
 def main():
@@ -37,7 +37,7 @@ def main():
 
     # Run zonotope verification
     print(f'Running zonotope analysis (relu types: {args.relu_types})...')
-    result, details = zonotope_verify_graph(
+    result, details = zonotope_verify(
         graph, x_lo, x_hi, pred_label, competitors,
         relu_types=args.relu_types)
 

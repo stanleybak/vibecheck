@@ -1,7 +1,7 @@
 """Verification orchestration — multi-zonotope intersection strategy."""
 
 import numpy as np
-from .bounds import ia_bounds, ia_bounds_graph, _infer_conv_input_shape, _prod
+from .bounds import ia_bounds_graph, _infer_conv_input_shape, _prod
 from .zonotope import DenseZonotope
 
 
@@ -10,60 +10,7 @@ def _interval_to_zonotope(lo, hi):
     return DenseZonotope.from_input_bounds(lo, hi)
 
 
-def zonotope_verify(layers, x_lo, x_hi, pred_label, competitors, relu_types=None):
-    """Run zonotope analysis to verify a spec.
-
-    Propagates through all layers using multi-zonotope (intersecting
-    multiple ReLU relaxation variants), then checks if the output
-    bounds prove the property.
-
-    Args:
-        layers: network layers from load_onnx
-        x_lo, x_hi: input bounds
-        pred_label: predicted class index
-        competitors: list of competitor class indices
-        relu_types: list of ReLU relaxation types to intersect
-
-    Returns:
-        result: 'verified' or 'unknown'
-        details: dict with output_lo, output_hi, margins, worst_margin
-    """
-    if relu_types is None:
-        relu_types = ['min_area', 'y_bloat', 'box']
-
-    n_hidden = len(layers) - 1
-    pre_bounds, _ = ia_bounds(layers, x_lo, x_hi)
-
-    best_lo = pre_bounds[-1][0].copy()
-    best_hi = pre_bounds[-1][1].copy()
-
-    for relu_type in relu_types:
-        zono = DenseZonotope.from_input_bounds(x_lo, x_hi)
-        for l, layer in enumerate(layers):
-            zono.propagate_linear(layer)
-            z_lo, z_hi = zono.bounds()
-            if l < n_hidden:
-                pb_lo, pb_hi = pre_bounds[l]
-                zono.apply_relu(
-                    np.maximum(z_lo, pb_lo),
-                    np.minimum(z_hi, pb_hi),
-                    relu_type,
-                )
-        best_lo = np.maximum(best_lo, z_lo)
-        best_hi = np.minimum(best_hi, z_hi)
-
-    margins = {comp: float(best_lo[pred_label] - best_hi[comp]) for comp in competitors}
-    worst_margin = min(margins.values())
-
-    return ('verified' if worst_margin > 0 else 'unknown'), {
-        'output_lo': best_lo,
-        'output_hi': best_hi,
-        'margins': margins,
-        'worst_margin': float(worst_margin),
-    }
-
-
-def zonotope_verify_graph(graph, x_lo, x_hi, pred_label, competitors, relu_types=None):
+def zonotope_verify(graph, x_lo, x_hi, pred_label, competitors, relu_types=None):
     """Run zonotope analysis on a ComputeGraph.
 
     Same multi-zonotope intersection strategy as zonotope_verify, but
@@ -81,8 +28,6 @@ def zonotope_verify_graph(graph, x_lo, x_hi, pred_label, competitors, relu_types
         result: 'verified' or 'unknown'
         details: dict with output_lo, output_hi, margins, worst_margin
     """
-    from .onnx_loader import conv_output_shape
-
     if relu_types is None:
         relu_types = ['min_area', 'y_bloat', 'box']
 
