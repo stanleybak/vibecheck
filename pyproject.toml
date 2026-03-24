@@ -11,10 +11,11 @@ dependencies = [
     "numpy",
     "scipy",
     "onnx",
+    "torch",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pyyaml"]
+dev = ["pytest", "pyyaml", "onnxruntime"]
 
 [project.scripts]
 vibecheck = "vibecheck.main:main"

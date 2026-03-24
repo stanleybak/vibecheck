@@ -34,7 +34,7 @@ def vnncomp_benchmarks(paths):
     if not p:
         pytest.fail(
             f"'vnncomp_benchmarks' not set in {PATHS_FILE}\n"
-            f"Add:  vnncomp_benchmarks: /path/to/vnncomp2025_benchmarks/benchmarks"
+            f"Add:  vnncomp_benchmarks: /path/to/vnncomp2025_benchmarks"
         )
     path = Path(p)
     if not path.exists():
@@ -44,6 +44,9 @@ def vnncomp_benchmarks(paths):
             f"  git clone https://github.com/stanleybak/vnncomp2025_benchmarks.git\n"
             f"Then update {PATHS_FILE}"
         )
+    # Auto-resolve benchmarks/ subfolder
+    if (path / "benchmarks").is_dir():
+        path = path / "benchmarks"
     return path
 
 

@@ -1,5 +1,11 @@
-# Copy this to paths.yaml and fill in your local paths.
+# Copy this file to paths.yaml and fill in your local paths.
 # paths.yaml is gitignored — never commit it.
+#
+#   cp tests/paths.yaml.template tests/paths.yaml
 
-vnncomp_benchmarks: /path/to/vnncomp2025_benchmarks/benchmarks
+# Clone: git clone https://github.com/stanleybak/vnncomp2025_benchmarks.git
+# Point to the repo root
+vnncomp_benchmarks: /path/to/vnncomp2025_benchmarks
+
+# Clone: git clone https://github.com/stanleybak/vnncomp2025_results.git
 vnncomp_results: /path/to/vnncomp2025_results
