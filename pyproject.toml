@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pyyaml", "onnxruntime"]
+dev = ["pytest", "pytest-cov", "pyyaml", "onnxruntime"]
 
 [project.scripts]
 vibecheck = "vibecheck.main:main"

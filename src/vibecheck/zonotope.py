@@ -108,7 +108,7 @@ class DenseZonotope:
                     lam = 0.0
                     mu = hi / 2
                 else:
-                    raise ValueError(f"Unknown relu_type: {relu_type}")
+                    assert False, f"Unknown relu_type: {relu_type}"
                 scale[j] = lam
                 offsets[j] = mu
 

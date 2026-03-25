@@ -344,10 +344,7 @@ def load_onnx(onnx_path):
 
         elif op in ('ConstantOfShape',):
             computed_inputs = [node.input[0]]
-            if 'value' in attrs:
-                params['value'] = attrs['value']
-            else:
-                params['value'] = 0.0
+            params['value'] = 0.0
 
         elif op in ('Expand', 'Where', 'Equal', 'ScatterND', 'ArgMax',
                      'Min', 'Max'):
@@ -434,44 +431,41 @@ def _parse_attrs(node):
 
 def _try_fold_constant(op, computed_inputs, params, const_fn):
     """Try to evaluate an op on constant inputs. Returns result or None."""
-    try:
-        vals = [const_fn(i) for i in computed_inputs]
-        if op == 'Relu':
-            return np.maximum(vals[0], 0)
-        elif op == 'LeakyRelu':
-            alpha = params.get('alpha', 0.01)
-            return np.where(vals[0] >= 0, vals[0], alpha * vals[0])
-        elif op == 'Neg':
-            return -vals[0]
-        elif op == 'Sigmoid':
-            return 1.0 / (1.0 + np.exp(-vals[0]))
-        elif op in ('Flatten', 'Squeeze', 'Unsqueeze', 'Reshape',
-                     'Dropout', 'Identity', 'Cast'):
-            return vals[0]
-        elif op == 'Concat':
-            return np.concatenate([v.flatten() for v in vals])
-        elif op == 'Slice':
-            starts = params.get('starts', [0])
-            ends = params.get('ends', [len(vals[0])])
-            return vals[0].flatten()[starts[0]:ends[0]]
-        elif op == 'Gather':
-            indices = params.get('indices')
-            if indices is not None:
-                return vals[0].flatten()[indices.flatten().astype(int)]
-        elif op == 'Transpose':
-            return vals[0]
-        elif op in ('Gemm', 'MatMul') and 'W' in params:
-            return params['W'] @ vals[0].flatten() + params['b']
-        elif op == 'Div' and 'scale' in params:
-            return vals[0].flatten() * params['scale']
-        elif op == 'Sign':
-            return np.sign(vals[0])
-        elif op == 'ReduceSum':
-            return np.array([vals[0].sum()])
-        elif op == 'ReduceMean':
-            return np.array([vals[0].mean()])
-    except Exception:
-        pass
+    vals = [const_fn(i) for i in computed_inputs]
+    if op == 'Relu':
+        return np.maximum(vals[0], 0)
+    elif op == 'LeakyRelu':
+        alpha = params.get('alpha', 0.01)
+        return np.where(vals[0] >= 0, vals[0], alpha * vals[0])
+    elif op == 'Neg':
+        return -vals[0]
+    elif op == 'Sigmoid':
+        return 1.0 / (1.0 + np.exp(-vals[0]))
+    elif op in ('Flatten', 'Squeeze', 'Unsqueeze', 'Reshape',
+                 'Dropout', 'Identity', 'Cast'):
+        return vals[0]
+    elif op == 'Concat':
+        return np.concatenate([v.flatten() for v in vals])
+    elif op == 'Slice':
+        starts = params.get('starts', [0])
+        ends = params.get('ends', [len(vals[0])])
+        return vals[0].flatten()[starts[0]:ends[0]]
+    elif op == 'Gather':
+        indices = params.get('indices')
+        if indices is not None:
+            return vals[0].flatten()[indices.flatten().astype(int)]
+    elif op == 'Transpose':
+        return vals[0]
+    elif op in ('Gemm', 'MatMul') and 'W' in params:
+        return params['W'] @ vals[0].flatten() + params['b']
+    elif op == 'Div' and 'scale' in params:
+        return vals[0].flatten() * params['scale']
+    elif op == 'Sign':
+        return np.sign(vals[0])
+    elif op == 'ReduceSum':
+        return np.array([vals[0].sum()])
+    elif op == 'ReduceMean':
+        return np.array([vals[0].mean()])
     return None
 
 

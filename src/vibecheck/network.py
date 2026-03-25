@@ -32,10 +32,9 @@ def _infer_conv_input_shape(flat_shape_or_size, kernel, transpose=False):
     side = int(math.sqrt(spatial))
     if side * side == spatial:
         return (C_in, side, side)
-    for h in range(side, 0, -1):
+    for h in range(side, 0, -1):  # h=1 always divides, so loop always returns
         if spatial % h == 0:
             return (C_in, h, spatial // h)
-    return (C_in, spatial, 1)
 
 
 def _find_shared_gens(name_a, name_b, graph, gen_count):
@@ -60,9 +59,8 @@ def _find_shared_gens(name_a, name_b, graph, gen_count):
     for anc in anc_a:
         if anc in anc_b_set and anc in forks:
             return gen_count[anc]
-    if graph.input_name in anc_b_set:
-        return gen_count[graph.input_name]
-    return 0
+    # Graph input is always a common ancestor and fork for merge nodes
+    return gen_count.get(graph.input_name, 0)
 
 
 def _get_spatial_shape(node, graph, actual_len, kernel=None, transpose=False):
@@ -120,11 +118,8 @@ def _broadcast_const_op(z, const, op_fn, node, graph):
     # If the shape doesn't match the flat center size, fall back to flat op
     if _prod(inp_shape) != len(z.center):
         new_center = op_fn(z.center, const.flatten() if isinstance(const, np.ndarray) else const)
-        if len(new_center) == len(z.center):
-            z.center = new_center
-            return z
-        _require_point(node, z)
-        return DenseZonotope(new_center, np.zeros((len(new_center), 0)))
+        z.center = new_center
+        return z
 
     center_nd = z.center.reshape(inp_shape)
     result = op_fn(center_nd, const)
@@ -691,20 +686,20 @@ class GemmNode(GraphNode):
             zono_state[self.name] = z
             return
 
-        # ND matmul: (..., K) @ (K, M) -> (..., M)
-        # W is stored as (M, K), so transpose for matmul: input @ W.T
-        if _prod(inp_shape) == len(z.center) and inp_shape[-1] == W.shape[1]:
-            _require_point(self, z)
-            center_nd = z.center.reshape(inp_shape)
-            result = np.matmul(center_nd, W.T) + b
-            zono_state[self.name] = _point_zono(result.flatten())
-            return
-
         # 1D weight: (..., K) @ (K,) -> (...)
         if W.ndim == 1 and _prod(inp_shape) == len(z.center) and inp_shape[-1] == len(W):
             _require_point(self, z)
             center_nd = z.center.reshape(inp_shape)
             result = np.matmul(center_nd, W) + b
+            zono_state[self.name] = _point_zono(result.flatten())
+            return
+
+        # ND matmul: (..., K) @ (K, M) -> (..., M)
+        # W is stored as (M, K), so transpose for matmul: input @ W.T
+        if W.ndim >= 2 and _prod(inp_shape) == len(z.center) and inp_shape[-1] == W.shape[1]:
+            _require_point(self, z)
+            center_nd = z.center.reshape(inp_shape)
+            result = np.matmul(center_nd, W.T) + b
             zono_state[self.name] = _point_zono(result.flatten())
             return
 
@@ -1096,9 +1091,6 @@ class ResizeNode(GraphNode):
         if inp_shape is not None and 'scales' in self.params:
             scales = self.params['scales']
             if len(scales) == len(inp_shape):
-                self.output_shape = tuple(
-                    int(d * s) for d, s in zip(inp_shape, scales))
-            elif len(scales) == 4 and len(inp_shape) == 4:
                 self.output_shape = tuple(
                     int(d * s) for d, s in zip(inp_shape, scales))
             else:

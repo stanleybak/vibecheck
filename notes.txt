@@ -1,13 +1,17 @@
+Stan's notes on development progress
+
 Tasks:
 
-1. Pass all "execution" tests, to ensure we understand the semantics of all benchmarks
+1a. Pass all "execution" tests, to ensure we understand the semantics of all benchmarks
+1b. Get 100% code coverage from unit tests (not integration tests) 
 2. does zonotope dense work on graph structures with forks and joins? I didn't see any special handling of the merges to ensure the right generators get merged.
 3. pick easy one like ACAS Xu and implement implicit zono... make sure it matches dense
 4. pick a conv example (relusplitter?) and try implicit zono... see if it's faster than the implementation in temp/tmux-test/experiments... should be right?
-5. add ZO3 optimization to acas xu for tightening
+5. add ZO3 optimization to acas xu for tightening. we should be able to do multiple directions at once at each layer.
 6. add crown-like optimization
 7. Add auto-lipra derived bounds for nonlienar operations (sine/tanh/transformer?). can use same picking strategy
-
+8. integrate MILP tightening strategy / LP tightening strategy (bound number of bool vars?)
+9. Use PGD to identify neuron importance, inform either splitting strategy or tightening effort.
 
 vnncomp 2025 Benchmark Summary
 ==============================

@@ -43,7 +43,3 @@ def main():
     print(f'  Time: {t_total:.2f}s')
 
     sys.exit(0 if result == 'verified' else 1)
-
-
-if __name__ == '__main__':
-    main()

@@ -8,20 +8,24 @@ from .spec import VNNSpec, Conjunct, Constraint, PairwiseConstraint
 
 
 def load_vnnlib(vnnlib_path):
-    """Parse a VNNLIB file into a VNNSpec object.
-
-    Supports:
-    - Pairwise constraints: (>= Y_i Y_j) or (<= Y_i Y_j)
-    - Threshold constraints: (>= Y_i val) or (<= Y_i val)
-    - (or (and ...)) disjunctive normal form with mixed X/Y constraints
-    """
+    """Parse a VNNLIB file into a VNNSpec object."""
     if vnnlib_path.endswith('.gz'):
         with gzip.open(vnnlib_path, 'rt') as f:
             text = f.read()
     else:
         with open(vnnlib_path, 'r') as f:
             text = f.read()
+    return parse_vnnlib_text(text)
 
+
+def parse_vnnlib_text(text):
+    """Parse VNNLIB text into a VNNSpec object.
+
+    Supports:
+    - Pairwise constraints: (>= Y_i Y_j) or (<= Y_i Y_j)
+    - Threshold constraints: (>= Y_i val) or (<= Y_i val)
+    - (or (and ...)) disjunctive normal form with mixed X/Y constraints
+    """
     # Check for (or (and ...)) blocks first
     or_match = re.search(r'\(assert\s+\(or\s(.+)\)\s*\)', text, re.DOTALL)
     if or_match:
@@ -149,8 +153,7 @@ def _parse_or_and(text, or_body):
                     and_blocks.append(block)
                 start = None
 
-    if not and_blocks:
-        raise ValueError("No (and ...) blocks found in (or ...)")
+    assert and_blocks, "No (and ...) blocks found in (or ...)"
 
     all_x_bounds = {}
     disjuncts = []
@@ -167,14 +170,12 @@ def _parse_or_and(text, or_body):
     for m in re.finditer(r'\(assert\s+\(<=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)\)', text):
         all_x_bounds.setdefault(int(m.group(1)), [None, None])[1] = float(m.group(2))
 
-    if not all_x_bounds:
-        raise ValueError("No input bounds found in VNNLIB (or/and format)")
+    assert all_x_bounds, "No input bounds found in VNNLIB (or/and format)"
 
     n_input = max(all_x_bounds.keys()) + 1
     x_lo = np.array([all_x_bounds.get(i, [0, 0])[0] or 0 for i in range(n_input)])
     x_hi = np.array([all_x_bounds.get(i, [0, 0])[1] or 0 for i in range(n_input)])
 
-    if not disjuncts:
-        raise ValueError("No output constraints found in (or (and ...)) blocks")
+    assert disjuncts, "No output constraints found in (or (and ...)) blocks"
 
     return VNNSpec(x_lo, x_hi, disjuncts)

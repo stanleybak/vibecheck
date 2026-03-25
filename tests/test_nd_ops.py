@@ -312,6 +312,22 @@ def test_squeeze_specific_axis():
 
 # ---- Unsqueeze -> Slice pipeline (ml4acopf pattern) ----
 
+def test_concat_propagation():
+    """ConcatNode propagation through a graph with fork."""
+    from vibecheck.network import GemmNode, ConcatNode, ReluNode
+    W = np.array([[1.0, 0.0], [0.0, 1.0]])
+    b = np.zeros(2)
+    # Fork: input -> relu1, input -> relu2, then concat
+    r1 = ReluNode(name='r1', op_type='Relu', inputs=['input'])
+    r2 = ReluNode(name='r2', op_type='Relu', inputs=['input'])
+    cat = ConcatNode(name='cat', op_type='Concat', inputs=['r1', 'r2'])
+    g = _make_graph([r1, r2, cat], input_shape=(1, 2), output_name='cat')
+    center = np.array([3.0, -1.0])
+    out = _run_point(g, center)
+    # relu([3, -1]) = [3, 0] for both branches, concat = [3, 0, 3, 0]
+    np.testing.assert_array_equal(out, [3, 0, 3, 0])
+
+
 def test_unsqueeze_then_slice():
     """Unsqueeze (1, 6) -> (1, 6, 1), then Slice axis 1 [2:4] -> (1, 2, 1)"""
     u = UnsqueezeNode(name='u', op_type='Unsqueeze', inputs=['input'],

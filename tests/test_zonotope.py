@@ -1,6 +1,7 @@
 """Basic tests for DenseZonotope."""
 
 import numpy as np
+import pytest
 from vibecheck.zonotope import DenseZonotope
 
 
@@ -73,3 +74,79 @@ def test_copy_independent():
     z2 = z.copy()
     z2.center[0] = 99.0
     assert z.center[0] == 1.0
+
+
+# ---- Conv propagation ----
+
+def test_propagate_conv_with_generators():
+    """Conv propagation with actual generators."""
+    from vibecheck.zonotope import is_conv, conv_output_shape
+    kernel = np.random.randn(2, 1, 3, 3)
+    bias = np.zeros(2)
+    params = {'input_shape': (1, 4, 4), 'stride': (1, 1), 'padding': (0, 0)}
+    layer = (kernel, bias, params)
+    assert is_conv(layer)
+
+    out_shape = conv_output_shape((1, 4, 4), kernel, params)
+    assert out_shape == (2, 2, 2)
+
+    z = DenseZonotope.from_input_bounds(np.zeros(16), np.ones(16))
+    z.propagate_linear(layer)
+    assert len(z.center) == 8  # 2*2*2
+    assert z.generators.shape[0] == 8
+
+
+def test_propagate_conv_point():
+    """Conv propagation with 0 generators (point zonotope)."""
+    kernel = np.ones((1, 1, 2, 2))
+    bias = np.array([0.0])
+    params = {'input_shape': (1, 3, 3), 'stride': (1, 1), 'padding': (0, 0)}
+    layer = (kernel, bias, params)
+
+    center = np.arange(9, dtype=float)
+    z = DenseZonotope(center, np.zeros((9, 0)))
+    z.propagate_linear(layer)
+    assert len(z.center) == 4  # 1*2*2
+    assert z.generators.shape == (4, 0)
+
+
+# ---- ReLU relaxation types ----
+
+def test_relu_unstable_min_area():
+    """Unstable neuron with min_area relaxation (hi > -lo)."""
+    z = DenseZonotope(np.array([0.0]), np.array([[1.0]]))
+    z.apply_relu(np.array([-1.0]), np.array([1.0]), 'min_area')
+    lo, hi = z.bounds()
+    assert lo[0] >= -0.01  # should be near 0
+    assert hi[0] <= 1.01
+
+def test_relu_unstable_min_area_lo_dominant():
+    """Unstable neuron with min_area where hi < -lo."""
+    z = DenseZonotope(np.array([-0.3]), np.array([[0.5]]))
+    z.apply_relu(np.array([-0.8]), np.array([0.2]), 'min_area')
+    lo, hi = z.bounds()
+    assert lo[0] >= -0.01
+    assert hi[0] <= 0.3
+
+def test_relu_y_bloat():
+    """Unstable neuron with y_bloat relaxation."""
+    z = DenseZonotope(np.array([0.0]), np.array([[1.0]]))
+    z.apply_relu(np.array([-1.0]), np.array([1.0]), 'y_bloat')
+    lo, hi = z.bounds()
+    assert lo[0] >= -1.01
+    assert hi[0] <= 2.01  # y_bloat gives wider bounds
+
+def test_relu_invalid_type():
+    """Invalid relu_type raises."""
+    z = DenseZonotope(np.array([0.0]), np.array([[1.0]]))
+    with pytest.raises(AssertionError, match="Unknown relu_type"):
+        z.apply_relu(np.array([-1.0]), np.array([1.0]), 'invalid')
+
+
+def test_relu_box():
+    """Unstable neuron with box relaxation."""
+    z = DenseZonotope(np.array([0.0]), np.array([[1.0]]))
+    z.apply_relu(np.array([-1.0]), np.array([1.0]), 'box')
+    lo, hi = z.bounds()
+    assert lo[0] >= -0.01
+    assert hi[0] <= 1.01

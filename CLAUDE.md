@@ -1,14 +1,11 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## What is VibeCheck?
+## What is vibecheck?
 
 A zonotope-based neural network verification tool. Given an ONNX network and a VNNLIB specification (input bounds + output property), it determines whether the property is provably satisfied ("verified") or "unknown" using abstract interpretation with zonotope domains.
 
 ## Development Commands
 
-Always use the venv (`.venv/bin/python`) for all commands.
+**Always use the venv (`.venv/bin/python`) for all commands. **
+**Never run `git commit` or `git push` — the user handles all git operations.**
 
 ```bash
 # Setup
@@ -45,21 +42,50 @@ The codebase uses **object-oriented dispatch**: each ONNX op type is a `GraphNod
 
 - **`main.py`** — CLI entry point. Exit code 0 = verified, 1 = unknown.
 
-## Shapes
-
-All tensor shapes **include the batch dimension** (always 1). For example:
-- FC input: `(1, 5)` not `(5,)`
-- Conv input: `(1, 3, 32, 32)` not `(3, 32, 32)`
-- NHWC input: `(1, 30, 30, 3)`
-
-This means ONNX axes and permutations work directly without batch-dim adjustment. Torch spatial ops (`conv2d`, `max_pool2d`, etc.) strip the batch via `shape[1:]` internally.
-
-## Zonotope Propagation
-
-- **Ops with full zonotope support** (work with any number of generators): Conv (1D/2D), Gemm/MatMul, Relu, Add, Sub, Mul (scale), Div (scale), Neg, BatchNorm, Concat, Split, Slice, Gather, Reduce, Transpose, Reshape, Flatten, passthrough ops.
-- **Point-only ops** (require 0 generators, execute concretely on center): Sigmoid, Tanh, LeakyRelu, Clip, Sign, Softmax, Pow, Sin/Cos, ConvTranspose, MaxPool, AvgPool, Pad, Resize/Upsample.
-- Conv/ConvTranspose/Pool use PyTorch (`torch.nn.functional`) for both zonotope propagation and point execution.
-
 ## Testing
 
 Tests use pytest. Unit tests cover zonotope math and individual op propagation. Integration tests load real ONNX networks from vnncomp benchmarks (discovered via `instances.csv`), run point propagation, and validate against onnxruntime. On soundness failure, per-node comparison identifies the divergent op. External benchmark paths configured in `tests/paths.yaml` (gitignored, template at `tests/paths.yaml.template`).
+
+### During development
+
+Run unit tests with coverage after any code change:
+
+```bash
+# Unit tests only (fast, ~2s) — must be 100% line coverage
+.venv/bin/python -m pytest tests/ -k "not vnncomp" --cov=src/vibecheck --cov-report=term --cov-report=html
+```
+
+### When user asks to run all tests
+
+Run the full suite including vnncomp integration:
+
+```bash
+# Full suite: unit tests + vnncomp regular track (~1 min)
+.venv/bin/python -m pytest tests/ -k "not extended" --cov=src/vibecheck --cov-report=term --cov-report=html
+```
+
+Coverage report at `htmlcov/index.html`.
+
+### Coverage rules
+
+The goal is **100% line coverage from unit tests alone** (without vnncomp). Current status: 300 unit tests, 100% coverage, 1586 statements.
+
+- **Never use `# pragma: no cover`** — write tests for every line instead.
+- **Never use defensive `try/except`** — use assertions so the passing path gets coverage. If a condition can't actually occur, remove the dead code rather than testing it.
+- **Remove dead code** rather than writing tests for unreachable branches. If a branch is provably unreachable (e.g., a loop that always returns), delete it.
+- **Synthetic ONNX models** for testing onnx_loader parsing branches: create models with `onnx.helper` in `test_onnx_ops.py`. Each ONNX op type should have a test that creates a minimal model exercising that parsing path.
+- **Inline VNNLIB text** for testing the parser: use `parse_vnnlib_text()` with strings in `test_spec.py`. No temp files needed.
+- **Small real ONNX files** for loading tests: use ACAS Xu (tiny FC), cersyve (fork points), cifar100 (ResNet+BN fold) from the vnncomp benchmarks in `test_loading.py`.
+
+### How to run
+
+```bash
+# Unit tests only — fast (~2s), must be 100% coverage
+.venv/bin/python -m pytest tests/ -k "not vnncomp"
+
+# Full correctness check — unit tests + vnncomp regular track (~1 min)
+.venv/bin/python -m pytest tests/ -k "not extended"
+
+# Extended track (currently has some known failures)
+.venv/bin/python -m pytest tests/ -k "extended"
+```
