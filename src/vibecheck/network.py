@@ -94,6 +94,52 @@ def _require_point(node, z):
             f"{z.generators.shape[1]} generators)")
 
 
+def _bilinear_point_op(z_a, z_b, op_fn, node, graph):
+    """Apply op_fn on two point zonotopes with ND broadcast."""
+    if len(z_a.center) == len(z_b.center):
+        return _point_zono(op_fn(z_a.center, z_b.center))
+    shape_a = (graph.nodes[node.inputs[0]].output_shape
+               if node.inputs[0] in graph.nodes else graph.input_shape)
+    shape_b = (graph.nodes[node.inputs[1]].output_shape
+               if node.inputs[1] in graph.nodes else graph.input_shape)
+    a_nd = z_a.center.reshape(shape_a) if _prod(shape_a) == len(z_a.center) else z_a.center
+    b_nd = z_b.center.reshape(shape_b) if _prod(shape_b) == len(z_b.center) else z_b.center
+    return _point_zono(op_fn(a_nd, b_nd).flatten())
+
+
+def _broadcast_const_op(z, const, op_fn, node, graph):
+    """Apply op_fn(center_nd, const) with numpy broadcasting, then flatten.
+
+    If broadcasting changes size, only works for point zonotopes (0 generators).
+    For same-size operations, generators are preserved.
+    """
+    inp_name = node.inputs[0]
+    inp_shape = (graph.nodes[inp_name].output_shape
+                 if inp_name in graph.nodes else graph.input_shape)
+
+    # If the shape doesn't match the flat center size, fall back to flat op
+    if _prod(inp_shape) != len(z.center):
+        new_center = op_fn(z.center, const.flatten() if isinstance(const, np.ndarray) else const)
+        if len(new_center) == len(z.center):
+            z.center = new_center
+            return z
+        _require_point(node, z)
+        return DenseZonotope(new_center, np.zeros((len(new_center), 0)))
+
+    center_nd = z.center.reshape(inp_shape)
+    result = op_fn(center_nd, const)
+    new_center = result.flatten()
+
+    if len(new_center) == len(z.center):
+        # Same size — generators still valid
+        z.center = new_center
+        return z
+    else:
+        # Size changed via broadcast — generators can't be reused
+        _require_point(node, z)
+        return DenseZonotope(new_center, np.zeros((len(new_center), 0)))
+
+
 # ---------------------------------------------------------------------------
 # GraphNode base
 # ---------------------------------------------------------------------------
@@ -120,18 +166,55 @@ class GraphNode:
 
 
 # ---------------------------------------------------------------------------
-# Passthrough ops: Flatten, Squeeze, Unsqueeze, Reshape, Dropout, Identity
+# Passthrough / shape-changing ops
 # ---------------------------------------------------------------------------
 
 class PassthroughNode(GraphNode):
+    """Flatten, Dropout, Identity — data unchanged, shape flattened."""
     def infer_shape(self, input_shapes):
         inp = input_shapes.get(self.inputs[0]) if self.inputs else None
         if inp is not None:
-            # Flatten keeps batch dim: (1, C, H, W) -> (1, C*H*W)
             if len(inp) > 2:
                 self.output_shape = (inp[0], _prod(inp[1:]))
             else:
                 self.output_shape = inp
+
+    def zonotope_propagate(self, zono_state, gen_count, get_input,
+                           relu_type, graph):
+        zono_state[self.name] = get_input(self.inputs[0])
+
+
+class UnsqueezeNode(GraphNode):
+    """Unsqueeze — insert size-1 dimensions. Data unchanged."""
+    def infer_shape(self, input_shapes):
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if inp is not None:
+            axes = self.params.get('axes', [])
+            out = list(inp)
+            for a in sorted(axes):
+                if a < 0:
+                    a = len(out) + 1 + a
+                out.insert(a, 1)
+            self.output_shape = tuple(out)
+
+    def zonotope_propagate(self, zono_state, gen_count, get_input,
+                           relu_type, graph):
+        zono_state[self.name] = get_input(self.inputs[0])
+
+
+class SqueezeNode(GraphNode):
+    """Squeeze — remove size-1 dimensions. Data unchanged."""
+    def infer_shape(self, input_shapes):
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if inp is not None:
+            axes = self.params.get('axes', None)
+            if axes:
+                out = [d for i, d in enumerate(inp) if i not in axes]
+            else:
+                out = [d for d in inp if d != 1]
+            if not out:
+                out = [1]
+            self.output_shape = tuple(out)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -313,6 +396,14 @@ class PowNode(GraphNode):
         zono_state[self.name] = _point_zono(z.center ** exp)
 
 
+class FloorNode(GraphNode):
+    def zonotope_propagate(self, zono_state, gen_count, get_input,
+                           relu_type, graph):
+        z = get_input(self.inputs[0])
+        _require_point(self, z)
+        zono_state[self.name] = _point_zono(np.floor(z.center))
+
+
 # ---------------------------------------------------------------------------
 # Arithmetic ops
 # ---------------------------------------------------------------------------
@@ -327,6 +418,19 @@ class NegNode(GraphNode):
 
 
 class AddNode(GraphNode):
+    def infer_shape(self, input_shapes):
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if inp is not None:
+            bias = self.params.get('bias')
+            if bias is not None and isinstance(bias, np.ndarray):
+                try:
+                    out = np.broadcast_shapes(inp, bias.shape)
+                    self.output_shape = out
+                    return
+                except ValueError:
+                    pass
+            self.output_shape = inp
+
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         if len(self.inputs) == 2 and self.inputs[1] in graph.nodes:
@@ -338,40 +442,75 @@ class AddNode(GraphNode):
         else:
             z = get_input(self.inputs[0])
             bias = self.params.get('bias', 0)
-            z.center = z.center + bias
-            zono_state[self.name] = z
+            zono_state[self.name] = _broadcast_const_op(
+                z, bias, np.add, self, graph)
 
 
 class SubNode(GraphNode):
+    def infer_shape(self, input_shapes):
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if inp is not None:
+            const = self.params.get('sub_val')
+            if const is None:
+                const = self.params.get('bias')
+            if const is not None and isinstance(const, np.ndarray):
+                try:
+                    self.output_shape = np.broadcast_shapes(inp, const.shape)
+                    return
+                except ValueError:
+                    pass
+            self.output_shape = inp
+
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
-        if self.params.get('negate'):
+        if len(self.inputs) == 2 and self.inputs[1] in graph.nodes:
+            # Two computed inputs: a - b
+            z_b = get_input(self.inputs[1])
+            _require_point(self, z)
+            _require_point(self, z_b)
+            zono_state[self.name] = _bilinear_point_op(
+                z, z_b, np.subtract, self, graph)
+        elif self.params.get('negate'):
             bias = self.params.get('bias', 0)
-            z.center = -z.center + bias
+            z.center = -z.center
             z.generators = -z.generators
+            zono_state[self.name] = _broadcast_const_op(
+                z, bias, np.add, self, graph)
         else:
             sub_val = self.params.get('sub_val', 0)
-            z.center = z.center - sub_val
-        zono_state[self.name] = z
+            zono_state[self.name] = _broadcast_const_op(
+                z, sub_val, np.subtract, self, graph)
 
 
 class MulNode(GraphNode):
+    def infer_shape(self, input_shapes):
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if inp is not None:
+            scale = self.params.get('scale')
+            if scale is not None and isinstance(scale, np.ndarray):
+                try:
+                    self.output_shape = np.broadcast_shapes(inp, scale.shape)
+                    return
+                except ValueError:
+                    pass
+            self.output_shape = inp
+
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         if 'scale' in self.params:
             z = get_input(self.inputs[0])
             s = self.params['scale']
-            z.center = z.center * s
-            z.generators = z.generators * s[:, None]
-            zono_state[self.name] = z
+            zono_state[self.name] = _broadcast_const_op(
+                z, s, np.multiply, self, graph)
         else:
-            # Bilinear mul — point only
+            # Bilinear mul — point only, with ND broadcast
             z = get_input(self.inputs[0])
             _require_point(self, z)
             z_b = get_input(self.inputs[1])
             _require_point(self, z_b)
-            zono_state[self.name] = _point_zono(z.center * z_b.center)
+            zono_state[self.name] = _bilinear_point_op(
+                z, z_b, np.multiply, self, graph)
 
 
 class DivNode(GraphNode):
@@ -380,15 +519,15 @@ class DivNode(GraphNode):
         z = get_input(self.inputs[0])
         if 'scale' in self.params:
             s = self.params['scale']  # already inverted
-            z.center = z.center * s
-            z.generators = z.generators * s[:, None]
-            zono_state[self.name] = z
+            zono_state[self.name] = _broadcast_const_op(
+                z, s, np.multiply, self, graph)
         else:
-            # Both inputs computed — point only
+            # Both inputs computed — point only, with ND broadcast
             z_b = get_input(self.inputs[1])
             _require_point(self, z)
             _require_point(self, z_b)
-            zono_state[self.name] = _point_zono(z.center / z_b.center)
+            zono_state[self.name] = _bilinear_point_op(
+                z, z_b, np.divide, self, graph)
 
 
 # ---------------------------------------------------------------------------
@@ -522,18 +661,56 @@ class ConvTransposeNode(GraphNode):
 class GemmNode(GraphNode):
     """Gemm and MatMul with constant weight matrix."""
     def infer_shape(self, input_shapes):
-        self.output_shape = (1, self.params['W'].shape[0])
+        W = self.params['W']
+        inp = input_shapes.get(self.inputs[0]) if self.inputs else None
+        if W.ndim == 1 and inp is not None:
+            # (..., K) @ (K,) -> (...)
+            self.output_shape = inp[:-1] if len(inp) > 1 else (1,)
+        elif W.ndim == 2 and inp is not None and len(inp) > 2:
+            # ND matmul: (..., K) @ (K, M) -> (..., M) where W stored as (M, K)
+            if inp[-1] == W.shape[1]:
+                self.output_shape = inp[:-1] + (W.shape[0],)
+            else:
+                self.output_shape = (1, W.shape[0])
+        elif W.ndim == 2:
+            self.output_shape = (1, W.shape[0])
+        else:
+            self.output_shape = (1, _prod(W.shape[:-1])) if W.ndim > 0 else (1,)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
         W = self.params['W']
-        if W.shape[1] != len(z.center):
-            raise NotImplementedError(
-                f"Gemm/MatMul dimension mismatch: W is {W.shape} but "
-                f"input has {len(z.center)} elements at node '{self.name}'")
-        z.propagate_linear((W, self.params['b']))
-        zono_state[self.name] = z
+        b = self.params['b']
+        inp_shape = (graph.nodes[self.inputs[0]].output_shape
+                     if self.inputs[0] in graph.nodes else graph.input_shape)
+
+        # Standard 2D case: W @ flat_input + b
+        if W.ndim == 2 and W.shape[1] == len(z.center):
+            z.propagate_linear((W, b))
+            zono_state[self.name] = z
+            return
+
+        # ND matmul: (..., K) @ (K, M) -> (..., M)
+        # W is stored as (M, K), so transpose for matmul: input @ W.T
+        if _prod(inp_shape) == len(z.center) and inp_shape[-1] == W.shape[1]:
+            _require_point(self, z)
+            center_nd = z.center.reshape(inp_shape)
+            result = np.matmul(center_nd, W.T) + b
+            zono_state[self.name] = _point_zono(result.flatten())
+            return
+
+        # 1D weight: (..., K) @ (K,) -> (...)
+        if W.ndim == 1 and _prod(inp_shape) == len(z.center) and inp_shape[-1] == len(W):
+            _require_point(self, z)
+            center_nd = z.center.reshape(inp_shape)
+            result = np.matmul(center_nd, W) + b
+            zono_state[self.name] = _point_zono(result.flatten())
+            return
+
+        raise NotImplementedError(
+            f"Gemm/MatMul dimension mismatch: W is {W.shape} but "
+            f"input shape {inp_shape} (flat {len(z.center)}) at node '{self.name}'")
 
 
 class MatMulBilinearNode(GraphNode):
@@ -544,7 +721,14 @@ class MatMulBilinearNode(GraphNode):
         z_b = get_input(self.inputs[1])
         _require_point(self, z_a)
         _require_point(self, z_b)
-        zono_state[self.name] = _point_zono(z_a.center * z_b.center)
+        # ND matmul with broadcast
+        shape_a = (graph.nodes[self.inputs[0]].output_shape
+                   if self.inputs[0] in graph.nodes else graph.input_shape)
+        shape_b = (graph.nodes[self.inputs[1]].output_shape
+                   if self.inputs[1] in graph.nodes else graph.input_shape)
+        a_nd = z_a.center.reshape(shape_a) if _prod(shape_a) == len(z_a.center) else z_a.center
+        b_nd = z_b.center.reshape(shape_b) if _prod(shape_b) == len(z_b.center) else z_b.center
+        zono_state[self.name] = _point_zono(np.matmul(a_nd, b_nd).flatten())
 
 
 # ---------------------------------------------------------------------------
@@ -848,19 +1032,58 @@ class ReduceNode(GraphNode):
     def infer_shape(self, input_shapes):
         inp = input_shapes.get(self.inputs[0]) if self.inputs else None
         if inp is not None:
-            self.output_shape = (_prod(inp),)
+            axes = self.params.get('axes')
+            keepdims = self.params.get('keepdims', 1)
+            if axes:
+                out = list(inp)
+                for a in sorted(axes, reverse=True):
+                    if a < 0:
+                        a = len(out) + a
+                    if keepdims:
+                        out[a] = 1
+                    else:
+                        out.pop(a)
+                self.output_shape = tuple(out) if out else (1,)
+            else:
+                # Reduce all axes
+                if keepdims:
+                    self.output_shape = tuple(1 for _ in inp)
+                else:
+                    self.output_shape = (1,)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
-        if self.op_type == 'ReduceSum':
-            zono_state[self.name] = DenseZonotope(
-                np.array([z.center.sum()]),
-                z.generators.sum(axis=0, keepdims=True))
+        axes = self.params.get('axes')
+        keepdims = bool(self.params.get('keepdims', 1))
+
+        inp_shape = (graph.nodes[self.inputs[0]].output_shape
+                     if self.inputs[0] in graph.nodes else graph.input_shape)
+
+        if axes and _prod(inp_shape) == len(z.center):
+            # ND reduce along specific axes
+            reduce_fn = np.sum if self.op_type == 'ReduceSum' else np.mean
+            center_nd = z.center.reshape(inp_shape)
+            new_center = reduce_fn(center_nd, axis=tuple(axes),
+                                   keepdims=keepdims).flatten()
+            n_gens = z.generators.shape[1]
+            if n_gens > 0:
+                g_nd = z.generators.reshape(*inp_shape, n_gens)
+                new_gens = reduce_fn(g_nd, axis=tuple(axes),
+                                     keepdims=keepdims).reshape(-1, n_gens)
+            else:
+                new_gens = np.zeros((len(new_center), 0))
+            zono_state[self.name] = DenseZonotope(new_center, new_gens)
         else:
-            zono_state[self.name] = DenseZonotope(
-                np.array([z.center.mean()]),
-                z.generators.mean(axis=0, keepdims=True))
+            # Reduce all
+            if self.op_type == 'ReduceSum':
+                zono_state[self.name] = DenseZonotope(
+                    np.array([z.center.sum()]),
+                    z.generators.sum(axis=0, keepdims=True))
+            else:
+                zono_state[self.name] = DenseZonotope(
+                    np.array([z.center.mean()]),
+                    z.generators.mean(axis=0, keepdims=True))
 
 
 # ---------------------------------------------------------------------------
@@ -872,9 +1095,12 @@ class ResizeNode(GraphNode):
         inp_shape = input_shapes.get(self.inputs[0]) if self.inputs else None
         if inp_shape is not None and 'scales' in self.params:
             scales = self.params['scales']
-            if len(scales) == 4 and len(inp_shape) == 3:
-                C, H, W = inp_shape
-                self.output_shape = (C, int(H * scales[2]), int(W * scales[3]))
+            if len(scales) == len(inp_shape):
+                self.output_shape = tuple(
+                    int(d * s) for d, s in zip(inp_shape, scales))
+            elif len(scales) == 4 and len(inp_shape) == 4:
+                self.output_shape = tuple(
+                    int(d * s) for d, s in zip(inp_shape, scales))
             else:
                 self.output_shape = inp_shape
         elif inp_shape is not None:
@@ -882,9 +1108,23 @@ class ResizeNode(GraphNode):
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
+        import torch
+        import torch.nn.functional as F
         z = get_input(self.inputs[0])
         _require_point(self, z)
-        zono_state[self.name] = z  # approximate
+        scales = self.params.get('scales')
+        inp_shape = (graph.nodes[self.inputs[0]].output_shape
+                     if self.inputs[0] in graph.nodes else graph.input_shape)
+
+        if scales is not None and len(inp_shape) == 4:
+            # Use torch interpolate for nearest-neighbor upsampling
+            center_4d = torch.tensor(z.center, dtype=torch.float64).reshape(inp_shape)
+            scale_h, scale_w = float(scales[2]), float(scales[3])
+            out = F.interpolate(center_4d, scale_factor=(scale_h, scale_w),
+                                mode='nearest')
+            zono_state[self.name] = _point_zono(out.flatten().numpy())
+        else:
+            zono_state[self.name] = z
 
 
 class ConstantOfShapeNode(GraphNode):
@@ -928,8 +1168,8 @@ class MiscNode(GraphNode):
 OP_REGISTRY = {
     # Passthrough
     'Flatten': PassthroughNode,
-    'Squeeze': PassthroughNode,
-    'Unsqueeze': PassthroughNode,
+    'Squeeze': SqueezeNode,
+    'Unsqueeze': UnsqueezeNode,
     'Reshape': ReshapeNode,
     'Dropout': PassthroughNode,
     'Identity': PassthroughNode,
@@ -947,6 +1187,7 @@ OP_REGISTRY = {
     'Sin': TrigNode,
     'Cos': TrigNode,
     'Pow': PowNode,
+    'Floor': FloorNode,
     # Arithmetic
     'Neg': NegNode,
     'Add': AddNode,

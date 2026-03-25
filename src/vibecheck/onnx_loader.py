@@ -128,10 +128,10 @@ def load_onnx(onnx_path):
                 continue
             elif c0 is not None:
                 computed_inputs = [node.input[1]]
-                params['bias'] = c0.flatten()
+                params['bias'] = c0
             elif c1 is not None:
                 computed_inputs = [node.input[0]]
-                params['bias'] = c1.flatten()
+                params['bias'] = c1
             else:
                 computed_inputs = [node.input[0], node.input[1]]
 
@@ -144,12 +144,12 @@ def load_onnx(onnx_path):
             if c0_s is not None:
                 computed_inputs = [node.input[1]]
                 params['negate'] = True
-                params['bias'] = c0_s.flatten()
-            else:
+                params['bias'] = c0_s
+            elif c1_s is not None:
                 computed_inputs = [node.input[0]]
-                c1 = _const(node.input[1])
-                if c1 is not None:
-                    params['sub_val'] = c1.flatten()
+                params['sub_val'] = c1_s
+            else:
+                computed_inputs = [node.input[0], node.input[1]]
 
         elif op == 'Mul':
             c0 = _const(node.input[0])
@@ -159,18 +159,20 @@ def load_onnx(onnx_path):
                 continue
             elif c0 is not None:
                 computed_inputs = [node.input[1]]
-                params['scale'] = c0.flatten()
+                params['scale'] = c0
             elif c1 is not None:
                 computed_inputs = [node.input[0]]
-                params['scale'] = c1.flatten()
+                params['scale'] = c1
             else:
                 computed_inputs = [node.input[0], node.input[1]]
 
         elif op == 'Div':
-            computed_inputs = [node.input[0]]
             c1 = _const(node.input[1])
             if c1 is not None:
-                params['scale'] = 1.0 / c1.flatten()
+                computed_inputs = [node.input[0]]
+                params['scale'] = 1.0 / c1
+            else:
+                computed_inputs = [node.input[0], node.input[1]]
 
         elif op == 'Neg':
             computed_inputs = [node.input[0]]
@@ -333,7 +335,7 @@ def load_onnx(onnx_path):
         elif op == 'Dropout':
             computed_inputs = [node.input[0]]
 
-        elif op in ('Sin', 'Cos', 'Pow'):
+        elif op in ('Sin', 'Cos', 'Pow', 'Floor'):
             computed_inputs = [node.input[0]]
             if op == 'Pow' and len(node.input) > 1:
                 c_exp = _const(node.input[1])

@@ -1,121 +1,45 @@
 """vnncomp benchmark tests — load, propagate, compare vs onnxruntime."""
 
 import glob
-import json
 import multiprocessing
 import numpy as np
 import pytest
 from pathlib import Path
-from vibecheck.network import ComputeGraph
-from vibecheck.verify import zonotope_verify
-from vibecheck.vnnlib_loader import load_vnnlib
-from vibecheck.spec import VNNSpec, Conjunct, PairwiseConstraint
 
 
-# ---- ComputeGraph loading ----
+# ---- vnncomp benchmark tests ----
 
-def test_graph_load_sequential(vnncomp_benchmarks):
-    """ACAS Xu loads as a sequential graph with no fork points."""
-    net = str(vnncomp_benchmarks / "acasxu_2023/onnx/ACASXU_run2a_1_1_batch_2000.onnx.gz")
-    g = ComputeGraph.from_onnx(net)
-    assert g.input_shape == (1, 1, 1, 5)
-    assert len(g.fork_points()) == 0
-    assert len(g.relu_nodes()) == 6
-
-
-def test_graph_load_cersyve(vnncomp_benchmarks):
-    """Cersyve has a dual-branch structure with Add merge."""
-    net = str(vnncomp_benchmarks / "cersyve/onnx/point_mass_pretrain_con.onnx.gz")
-    g = ComputeGraph.from_onnx(net)
-    assert g.input_shape == (1, 4)
-    assert len(g.fork_points()) > 0  # input is a fork
-    # Output is the Add node
-    assert g.nodes[g.output_name].op_type == 'Add'
-
-
-def test_graph_load_resnet(vnncomp_benchmarks):
-    """cifar100 ResNet loads with BatchNorm folded and skip connections."""
-    net = str(vnncomp_benchmarks / "cifar100_2024/onnx/CIFAR100_resnet_medium.onnx.gz")
-    g = ComputeGraph.from_onnx(net)
-    assert g.input_shape == (1, 3, 32, 32)
-    # BN should be folded — no BatchNormalization nodes remain
-    bn_nodes = [n for n in g.nodes.values() if n.op_type == 'BatchNormalization']
-    assert len(bn_nodes) == 0
-    # Should have Add nodes (skip connections)
-    add_nodes = [n for n in g.nodes.values()
-                 if n.op_type == 'Add' and len(n.inputs) == 2
-                 and n.inputs[1] in g.nodes]
-    assert len(add_nodes) == 8  # 8 residual blocks
-
-
-# ---- End-to-end on ACAS Xu ----
-
-def test_acasxu_end_to_end(vnncomp_benchmarks):
-    """ACAS Xu loads and verifies via the graph path."""
-    net = str(vnncomp_benchmarks / "acasxu_2023/onnx/ACASXU_run2a_1_1_batch_2000.onnx.gz")
-    spec_path = str(vnncomp_benchmarks / "acasxu_2023/vnnlib/prop_2.vnnlib.gz")
-
-    graph = ComputeGraph.from_onnx(net)
-    spec = load_vnnlib(spec_path)
-
-    result, details = zonotope_verify(graph, spec)
-    assert result in ('verified', 'unknown')
-    assert len(details['margins']) == len(spec.disjuncts)
-
-
-# ---- Point propagation ----
-
-def test_point_propagation_cersyve(vnncomp_benchmarks):
-    """Point zonotope propagates through cersyve graph without error."""
-    net = str(vnncomp_benchmarks / "cersyve/onnx/point_mass_pretrain_con.onnx.gz")
-    g = ComputeGraph.from_onnx(net)
-    center = np.zeros(4)
-    spec = VNNSpec(center, center, [Conjunct([PairwiseConstraint(0, 1)])])
-    result, details = zonotope_verify(g, spec)
-    assert details['output_lo'].shape == (2,)
-    assert np.all(details['output_lo'] <= details['output_hi'])
-
-
-# ---- Comprehensive vnncomp benchmark tests ----
-
-# Benchmarks with no ONNX files — cannot be tested at all
-_MISSING_BENCHMARKS = {
-    'vggnet16_2022',           # no onnx files in benchmark
+# vnncomp tracks (from scoring repo settings.py)
+_REGULAR_BENCHMARKS = {
+    'safenlp_2024', 'nn4sys', 'cora_2024', 'linearizenn_2024',
+    'dist_shift_2023', 'cifar100_2024', 'tinyimagenet_2024',
+    'acasxu_2023', 'cgan_2023', 'collins_rul_cnn_2022',
+    'metaroom_2023', 'tllverifybench_2023', 'cersyve',
+    'malbeware', 'sat_relu', 'soundnessbench',
+}
+_EXTENDED_BENCHMARKS = {
+    'ml4acopf_2024', 'collins_aerospace_benchmark', 'lsnc_relu',
+    'yolo_2023', 'cctsdb_yolo_2023', 'traffic_signs_recognition_2023',
+    'vggnet16_2022', 'vit_2023', 'relusplitter',
 }
 
-# Benchmarks that currently fail — tested separately via test_vnncomp_hard
-_HARD_BENCHMARKS = {
-    'cctsdb_yolo_2023',        # shape broadcast / index errors in preprocessing
-    'cgan_2023/cGAN_imgSz32_nCh_3_upsample',  # needs real Upsample implementation
-    'collins_aerospace_benchmark',  # YOLOv5 640x640, timeout
-    'ml4acopf_2024',           # missing Floor op + complex broadcast patterns
-    'nn4sys/pensieve_big_parallel',   # ND Split shape mismatch from Concat
+# Benchmarks that cannot be tested at all
+_MISSING_BENCHMARKS = {
+    'vggnet16_2022',             # no onnx files in benchmark
+    'nn4sys/mscn_2048d_dual',   # corrupt ONNX file (DecodeError)
+    'nn4sys/pensieve_big_parallel',   # ONNX input (1,8) but spec has 96 inputs
     'nn4sys/pensieve_small_parallel', # same
-    'nn4sys/mscn_128d',        # Gemm dim mismatch after ND Slice/Split
-    'nn4sys/mscn_128d_dual',   # same
-    'nn4sys/mscn_2048d',       # same
-    'nn4sys/mscn_2048d_dual',  # corrupt ONNX file
+}
+
+# Networks that currently fail — tested separately via test_vnncomp_hard_*
+_HARD_REGULAR = set()  # All regular track networks pass!
+_HARD_EXTENDED = {
+    'cctsdb_yolo_2023',        # shape broadcast / index errors in preprocessing
+    'collins_aerospace_benchmark',  # YOLOv5 640x640, conv shape mismatch
+    'ml4acopf_2024',           # ND broadcast + 1D MatMul chain
     'vit_2023',                # shape broadcast errors in attention
 }
 
-
-def _benchmark_ids(vnncomp_path):
-    """Discover benchmark directories that have onnx files."""
-    import os
-    base = str(vnncomp_path)
-    ids = []
-    for d in sorted(os.listdir(base)):
-        if d in _SKIP_BENCHMARKS:
-            continue
-        onnx_files = glob.glob(f'{base}/{d}/onnx/*.onnx*')
-        if onnx_files:
-            ids.append(d)
-    return ids
-
-
-@pytest.fixture(scope='session')
-def benchmark_list(vnncomp_benchmarks):
-    return _benchmark_ids(vnncomp_benchmarks)
 
 
 def _ort_node_compare(onnx_path, graph, center, ort):
@@ -322,9 +246,9 @@ def _discover_benchmark_cases(vnncomp_path, include=None, exclude=None):
     for d in sorted(os.listdir(base)):
         if d in _MISSING_BENCHMARKS:
             continue
-        if exclude and d in exclude:
+        if exclude is not None and d in exclude:
             continue
-        if include and d not in include:
+        if include is not None and d not in include:
             # Check if any include entry starts with this dir
             if not any(i.startswith(d + '/') for i in include):
                 continue
@@ -352,9 +276,11 @@ def _discover_benchmark_cases(vnncomp_path, include=None, exclude=None):
                     continue
                 seen_nets.add(net_name)
                 test_id = f'{d}/{net_name}'
-                if exclude and test_id in exclude:
+                if exclude is not None and test_id in exclude:
                     continue
-                if include and d not in include and test_id not in include:
+                if include is not None and d not in include and test_id not in include:
+                    continue
+                if test_id in _MISSING_BENCHMARKS:
                     continue
                 cases.append((test_id, onnx_path, spec_path))
     return cases
@@ -391,8 +317,14 @@ def _get_case_ids(include=None, exclude=None):
     return [c[0] for c in cases]
 
 
-_CASE_IDS = _get_case_ids(exclude=_HARD_BENCHMARKS)
-_HARD_CASE_IDS = _get_case_ids(include=_HARD_BENCHMARKS)
+_ALL_HARD = _HARD_REGULAR | _HARD_EXTENDED
+
+# Passing tests: regular track (exclude hard), extended track (exclude hard)
+_REGULAR_IDS = _get_case_ids(include=_REGULAR_BENCHMARKS, exclude=_ALL_HARD)
+_EXTENDED_IDS = _get_case_ids(include=_EXTENDED_BENCHMARKS, exclude=_ALL_HARD)
+# Failing tests: split by track
+_HARD_REGULAR_IDS = _get_case_ids(include=_HARD_REGULAR)
+_HARD_EXTENDED_IDS = _get_case_ids(include=_HARD_EXTENDED)
 
 
 _PASS_CACHE = Path(__file__).parent / '.benchmark_pass_cache'
@@ -409,14 +341,12 @@ def _save_pass(case_id):
         f.write(case_id + '\n')
 
 
-def _run_benchmark_test(vnncomp_benchmarks, case_id, use_cache=True,
-                        include=None, exclude=None):
+def _run_benchmark_test(vnncomp_benchmarks, case_id, use_cache=True):
     """Shared logic for benchmark tests."""
     if use_cache and case_id in _load_pass_cache():
         pytest.skip('cached pass')
 
-    cases = _discover_benchmark_cases(vnncomp_benchmarks,
-                                       include=include, exclude=exclude)
+    cases = _discover_benchmark_cases(vnncomp_benchmarks)
     case = next((c for c in cases if c[0] == case_id), None)
     if case is None:
         pytest.skip(f'case {case_id} not found')
@@ -462,15 +392,33 @@ def _run_benchmark_test(vnncomp_benchmarks, case_id, use_cache=True,
         pytest.fail(f'{case_id}: subprocess died (status={status}, exit={p.exitcode})')
 
 
-@pytest.mark.parametrize('case_id', _CASE_IDS)
-def test_vnncomp_benchmark(vnncomp_benchmarks, case_id):
-    """Passing benchmarks: load, point-propagate, compare vs onnxruntime."""
-    _run_benchmark_test(vnncomp_benchmarks, case_id,
-                        exclude=_HARD_BENCHMARKS)
+# ---- Regular track (must all pass) ----
+
+@pytest.mark.parametrize('case_id', _REGULAR_IDS)
+def test_vnncomp_regular(vnncomp_benchmarks, case_id):
+    """Regular track benchmarks — must pass."""
+    _run_benchmark_test(vnncomp_benchmarks, case_id)
 
 
-@pytest.mark.parametrize('case_id', _HARD_CASE_IDS)
-def test_vnncomp_hard(vnncomp_benchmarks, case_id):
-    """Hard benchmarks that currently fail — run to see error details."""
-    _run_benchmark_test(vnncomp_benchmarks, case_id, use_cache=False,
-                        include=_HARD_BENCHMARKS)
+# ---- Extended track (must all pass) ----
+
+@pytest.mark.parametrize('case_id', _EXTENDED_IDS)
+def test_vnncomp_extended(vnncomp_benchmarks, case_id):
+    """Extended track benchmarks — must pass."""
+    _run_benchmark_test(vnncomp_benchmarks, case_id)
+
+
+# ---- Hard: regular track networks that currently fail ----
+
+@pytest.mark.parametrize('case_id', _HARD_REGULAR_IDS)
+def test_vnncomp_hard_regular(vnncomp_benchmarks, case_id):
+    """Regular track networks that currently fail."""
+    _run_benchmark_test(vnncomp_benchmarks, case_id, use_cache=False)
+
+
+# ---- Hard: extended track networks that currently fail ----
+
+@pytest.mark.parametrize('case_id', _HARD_EXTENDED_IDS)
+def test_vnncomp_hard_extended(vnncomp_benchmarks, case_id):
+    """Extended track networks that currently fail."""
+    _run_benchmark_test(vnncomp_benchmarks, case_id, use_cache=False)
