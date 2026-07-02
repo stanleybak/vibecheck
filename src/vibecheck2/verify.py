@@ -268,6 +268,20 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                                 len(spec.disjuncts))
             log(f'[vc2] zono-lift: worst={float((lb0 + b).min()):.4f} '
                 f'open={len(open_d)}/{len(spec.disjuncts)}')
+            worst_l = float((lb0 + b).min())
+            if verdict != 'unsat' and -1.0 < worst_l <= 0 \
+                    and budget.remaining() > 20:
+                # the pre-lift polish never saw the lifted intermediates;
+                # a near-zero post-lift gap often closes under the same
+                # long low-lr pass (cifar100 idx_8945: -0.23 after lift)
+                lb2 = backward.alpha_crown(net, lo, hi, W, inter, iters=150,
+                                           lr=0.1, thresholds=-b,
+                                           budget=budget)[0]
+                lb0 = torch.maximum(lb0, lb2)
+                verdict, open_d = _verdict_from_lbs(lb0 + b, di,
+                                                    len(spec.disjuncts))
+                log(f'[vc2] lift-polish: worst={float((lb0 + b).min()):.4f} '
+                    f'open={len(open_d)}/{len(spec.disjuncts)}')
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
     if verdict != 'unsat' and not wide_route:

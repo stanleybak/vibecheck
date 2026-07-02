@@ -330,13 +330,203 @@ def build_state(net, lo, hi, inter=None, slopes=None):
 _VERIFIER = {}
 
 
+def _host_ram_room():
+    """Bytes the process can still safely allocate on the host: global
+    MemAvailable intersected with the cgroup-v2 ceiling when one is set
+    (systemd-run -p MemoryMax=... scopes -- /proc/meminfo alone would
+    happily report 50G inside a 6G scope and get us OOM-killed)."""
+    avail = None
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    avail = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        pass
+    try:
+        with open('/proc/self/cgroup') as f:
+            cg = f.read().strip().rsplit('::', 1)[-1]
+        with open(f'/sys/fs/cgroup{cg}/memory.max') as f:
+            mx = f.read().strip()
+        if mx != 'max':
+            with open(f'/sys/fs/cgroup{cg}/memory.current') as f:
+                room = int(mx) - int(f.read())
+            avail = room if avail is None else min(avail, room)
+    except (OSError, ValueError, IndexError):
+        pass
+    return avail if avail is not None else (4 << 30)
+
+
+def _make_host_frontier_verifier(base_cls):
+    """Subclass v1's compiled dual Verifier to hold the BaB frontier in HOST
+    memory. The stock loop keeps sides (B, d) int8 PLUS the per-node
+    warm-start duals lam0/lam1 (B, d) float and nu (B, M) float resident on
+    GPU, with masked + doubled copies at each depth -- ~3GB at the 7.8M-open
+    frontier where cifar100 idx_8945 died (reason=oom) on the 8GB part.
+    Here the frontier lives in RAM; the GPU sees per-chunk uploads inside
+    `_bounds` (compute-bound kernel, upload is noise). Kernel math and
+    chunk-halving are inherited unchanged."""
+    import time as _time
+    from vibecheck.fast_dual_ascent.fast_verify_topk import (
+        _TOL, _PARENT_FLOOR, _DeadlineExceeded)
+
+    class HostFrontierVerifier(base_cls):
+        def _bounds(self, F, sides, lam0, lam1, nu, deadline=None):
+            if sides.device.type != 'cpu':      # warmup / small direct calls
+                return base_cls._bounds(self, F, sides, lam0, lam1, nu,
+                                        deadline=deadline)
+            B = sides.shape[0]
+            best = torch.empty(B)
+            o0 = torch.empty_like(lam0)
+            o1 = torch.empty_like(lam1)
+            onu = torch.empty_like(nu)
+            dev = self.device
+            i = 0
+            while i < B:
+                if deadline is not None and _time.perf_counter() > deadline:
+                    raise _DeadlineExceeded()
+                step = min(self.chunk, B - i)
+                while True:
+                    try:
+                        bb, l0, l1, nv = self._kernel(
+                            F,
+                            sides[i:i + step].to(dev).long().contiguous(),
+                            lam0[i:i + step].to(dev).contiguous(),
+                            lam1[i:i + step].to(dev).contiguous(),
+                            nu[i:i + step].to(dev).contiguous())
+                        best[i:i + step] = bb.cpu()
+                        o0[i:i + step] = l0.cpu()
+                        o1[i:i + step] = l1.cpu()
+                        onu[i:i + step] = nv.cpu()
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        if step <= 256:
+                            raise
+                        step //= 2
+                        self.chunk = max(256, min(self.chunk, step))
+                i += step
+            return best, o0, o1, onu
+
+        def verify(self, prob, *, time_limit=120.0, verbose=False,
+                   stop_event=None):
+            # v1's loop with a HYBRID frontier: per-node tensors (sides,
+            # lam0, lam1, nu, floor) stay on GPU at full stock throughput
+            # until the projected footprint nears free VRAM, then spill to
+            # host once and continue via the chunk-uploading _bounds above
+            # (slower per node, but the alternative was reason=oom at ~8M
+            # open; tinyimagenet-class runs that fit VRAM never spill and
+            # keep the stock speed).
+            dev = self.device
+            G = self._upload(prob)
+            M = int(G['hs_a'].shape[0])
+            for D in self._warm_depths:
+                if D <= prob.n_splits and D not in self._warmed:
+                    z = torch.zeros(8, D, device=dev)
+                    self._kernel(self._F(G, D),
+                                 torch.zeros(8, D, device=dev,
+                                             dtype=torch.long),
+                                 z, z.clone(),
+                                 torch.zeros(8, M, device=dev))
+                    self._warmed.add(D)
+            if dev.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = _time.perf_counter()
+            elapsed = lambda: _time.perf_counter() - t0     # noqa: E731
+            deadline = t0 + time_limit
+            if prob.root_bound > 0:
+                return 'unsat', dict(nodes=0, depth=0, peak_frontier=0,
+                                     wall=0.0)
+            sides = torch.tensor([[0], [1]], device=dev, dtype=torch.int8)
+            lam0 = torch.zeros(2, 1, device=dev)
+            lam1 = torch.zeros(2, 1, device=dev)
+            nu = torch.zeros(2, M, device=dev)
+            floor = torch.full((2,), float('-inf'), device=dev)
+            on_host = dev.type != 'cuda'
+            nodes_total = 0
+            depth = 1
+            peak = 2
+
+            def _unknown(open_n, reason):
+                return 'unknown', dict(nodes=nodes_total, depth=depth,
+                                       peak_frontier=peak, open=int(open_n),
+                                       reason=reason, wall=elapsed())
+
+            while sides.shape[0] > 0:
+                if elapsed() > time_limit:
+                    return _unknown(sides.shape[0], 'time_limit')
+                if stop_event is not None and stop_event.is_set():
+                    return _unknown(sides.shape[0], 'stopped')
+                nodes_total += sides.shape[0]
+                peak = max(peak, sides.shape[0])
+                try:
+                    best, o0, o1, onu = self._bounds(
+                        self._F(G, depth), sides, lam0, lam1, nu,
+                        deadline=deadline)
+                    if _PARENT_FLOOR:
+                        best = torch.maximum(best, floor)
+                    keep = best <= _TOL
+                    ss = sides[keep]
+                    l0, l1, nk = o0[keep], o1[keep], onu[keep]
+                    pb = best[keep]
+                    if ss.shape[0] == 0:
+                        return 'unsat', dict(nodes=nodes_total, depth=depth,
+                                             peak_frontier=peak,
+                                             wall=elapsed())
+                    if depth >= prob.n_splits:
+                        return _unknown(ss.shape[0], 'splits_exhausted')
+                    # per-node bytes: sides d + lam0/lam1 8d + nu 4M +
+                    # floor 4, x2 children x2 cat temporaries
+                    need = 2 * 2 * ss.shape[0] * (9 * (depth + 1) + 4 * M + 4)
+                    if not on_host:
+                        free_b, _ = torch.cuda.mem_get_info(dev)
+                        if need > 0.4 * free_b:
+                            ss, l0, l1 = ss.cpu(), l0.cpu(), l1.cpu()
+                            nk, pb = nk.cpu(), pb.cpu()
+                            on_host = True
+                    if on_host and need > _host_ram_room() * 0.6:
+                        # graceful RAM ceiling, re-read per depth: 'unknown'
+                        # beats the scope's OOM kill, which loses the
+                        # verdict entirely
+                        return _unknown(2 * ss.shape[0], 'host_ram_cap')
+                    z8 = torch.zeros(ss.shape[0], 1, device=ss.device,
+                                     dtype=torch.int8)
+                    zf = torch.zeros(ss.shape[0], 1, device=ss.device)
+                    sides = torch.cat([torch.cat([ss, z8], 1),
+                                       torch.cat([ss, z8 + 1], 1)], 0)
+                    lam0 = torch.cat([torch.cat([l0, zf], 1),
+                                      torch.cat([l0, zf], 1)], 0)
+                    lam1 = torch.cat([torch.cat([l1, zf], 1),
+                                      torch.cat([l1, zf], 1)], 0)
+                    nu = torch.cat([nk, nk], 0)
+                    floor = torch.cat([pb, pb])
+                except _DeadlineExceeded:
+                    return _unknown(sides.shape[0], 'time_limit')
+                except torch.cuda.OutOfMemoryError:
+                    # kernel could not fit even a 256-node chunk: resource
+                    # failure of the sanctioned halving path, surfaced as
+                    # 'oom' exactly like v1's loop
+                    open_n = int(sides.shape[0])
+                    torch.cuda.empty_cache()
+                    return 'unknown', dict(nodes=nodes_total, depth=depth,
+                                           peak_frontier=peak, open=open_n,
+                                           reason='oom', wall=elapsed())
+                depth += 1
+            return 'unsat', dict(nodes=nodes_total, depth=depth,
+                                 peak_frontier=peak, wall=elapsed())
+
+    return HostFrontierVerifier
+
+
 def _verifier(device):
     """One compiled Verifier per device (kernel warm-up is reused)."""
     if device not in _VERIFIER:
         from vibecheck.fast_dual_ascent import Verifier
-        _VERIFIER[device] = Verifier(device=device,
-                                     compile=(torch.device(device).type
-                                              == 'cuda'))
+        cls = _make_host_frontier_verifier(Verifier)
+        _VERIFIER[device] = cls(device=device,
+                                compile=(torch.device(device).type
+                                         == 'cuda'))
     return _VERIFIER[device]
 
 
