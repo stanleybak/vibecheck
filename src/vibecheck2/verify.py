@@ -179,6 +179,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     verdict, open_d = _verdict_from_lbs(lb0 + b, di, len(spec.disjuncts))
     log(f'[vc2] crown: worst={float((lb0 + b).min()):.4f} '
         f'open={len(open_d)}/{len(spec.disjuncts)}')
+    # route by the number of WIDE input dims, not the raw input size:
+    # dist_shift is 792-dim with only 8 non-degenerate dims (v1 config
+    # split up to 800 dims for exactly this reason). Wide-route instances
+    # close by per-leaf zono planes under input splits; the heavy root
+    # phases (joint-inter alpha, lift, dual) are wasted work there.
+    n_wide = int((hi[0] - lo[0] > 1e-6).sum())
+    wide_route = n_wide <= 32
     if verdict != 'unsat':
         from .core import memory
         from .core.backward import _zono_cost_bytes
@@ -205,6 +212,28 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         log(f'[vc2] alpha-crown: worst={float((lb + b).min()):.4f} '
             f'open={len(open_d)}/{len(spec.disjuncts)}')
         worst = float((lb + b).min())
+        n_nonlin = sum(net.ops[nm].n for nm in net.order
+                       if net.ops[nm].kind == 'nonlin')
+        if verdict != 'unsat' and not wide_route and n_nonlin <= 20000 \
+                and budget.remaining() > 15:
+            # joint-intermediate alpha refresh (v1 phase-0.5): re-derive the
+            # intermediate bounds with alpha-optimized identity rows, then
+            # rerun the spec alpha (measured on dist_shift: root -11.3 ->
+            # v1-level with this; fixed intermediates were the ceiling)
+            inter = backward.intermediates_crown(net, lo, hi,
+                                                 base_inter=inter,
+                                                 alpha_iters=12,
+                                                 budget=budget)
+            lb_j = backward.alpha_crown(net, lo, hi, W, inter,
+                                        iters=alpha_iters, thresholds=-b,
+                                        budget=budget)[0]
+            lb = torch.maximum(lb, lb_j)
+            lb0 = torch.maximum(lb0, lb)
+            verdict, open_d = _verdict_from_lbs(lb + b, di,
+                                                len(spec.disjuncts))
+            log(f'[vc2] joint-inter alpha: worst={float((lb + b).min()):.4f} '
+                f'open={len(open_d)}/{len(spec.disjuncts)}')
+            worst = float((lb + b).min())
         if verdict != 'unsat' and -1.0 < worst <= 0 and budget.remaining() > 20:
             # near-zero gap: a longer, lower-lr polish often closes it
             # outright (abcrown runs ~100 root iters; the quick pass is 20)
@@ -216,7 +245,32 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                                 len(spec.disjuncts))
             log(f'[vc2] alpha-polish: worst={float((lb + b).min()):.4f} '
                 f'open={len(open_d)}/{len(spec.disjuncts)}')
-    if verdict != 'unsat':
+    if verdict != 'unsat' and not wide_route and len(open_d) == 1:
+        # zono-lift (v1 phase 2.5): exact box+halfspace LP tightening of
+        # every pre-activation under the open disjunct's own output rows.
+        # Region-conditional, hence scoped to the single-open-disjunct case
+        # where refuting that region IS the instance.
+        from .core.dual_lp import lift_intermediates
+        rows_d = torch.nonzero(di == open_d[0],
+                               as_tuple=False).flatten().tolist()
+        try:
+            inter = lift_intermediates(
+                net, lo, hi, inter,
+                cut_rows=[(W[r].cpu().numpy(), float(b[r]))
+                          for r in rows_d],
+                device=device, log=log)
+            lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
+            lb_l = backward.alpha_crown(net, lo, hi, W, inter,
+                                        iters=alpha_iters, thresholds=-b,
+                                        budget=budget)[0]
+            lb0 = torch.maximum(lb0, lb_l)
+            verdict, open_d = _verdict_from_lbs(lb0 + b, di,
+                                                len(spec.disjuncts))
+            log(f'[vc2] zono-lift: worst={float((lb0 + b).min()):.4f} '
+                f'open={len(open_d)}/{len(spec.disjuncts)}')
+        except NotImplementedError as e:
+            log(f'[vc2] zono-lift skipped ({e})')
+    if verdict != 'unsat' and not wide_route:
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
         # refuter. The state builds BACKWARD (unstable rows only, chunked),
@@ -236,7 +290,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # target; the two loops share bound/attack machinery meanwhile)
         from .core.search import input_split_bab, relu_split_bab
         kw = {}
-        if net.n_in <= 32:
+        if wide_route:
             bab = input_split_bab
         else:
             bab = relu_split_bab

@@ -50,6 +50,39 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     f_worst = torch.full((1,), -torch.inf, device=dev)
     n_bounded = n_split = rounds = 0
     t0 = time.time()
+    n_nonlin = sum(net.ops[nm].n for nm in net.order
+                   if net.ops[nm].kind == 'nonlin')
+    # tiny nets (acasxu class): full per-batch identity-CROWN refinement.
+    # bigger ones: joint-alpha refine ONCE at the root, then per batch only
+    # a cheap reforward intersected with the root bounds (subbox is a
+    # subset, so the intersection is sound) -- the abcrown cost model.
+    full_refine = n_nonlin <= 1200
+    if full_refine:
+        # identity-CROWN vs forward-zono planes flips by net class (acasxu
+        # amplifying weights favor backward refinement; dist_shift sigmoid
+        # bands close at depth 1 under zono but need 100k+ splits under
+        # identity-CROWN), so measure both on the root's first two
+        # children and keep the winner.
+        wax = int((f_hi - f_lo).argmax())
+        mid = (f_lo[0, wax] + f_hi[0, wax]) / 2
+        plo, phi = f_lo.repeat(2, 1), f_hi.repeat(2, 1)
+        phi[0, wax] = mid
+        plo[1, wax] = mid
+        try:
+            _l, _h, zst = backward.fwd.zono(net, plo, phi, return_state=True)
+            zi = backward._inter_from_state(net, lambda e: zst[e].bounds())
+            z_lb = float((backward.crown(net, plo, phi, W, zi) + bias).min())
+            ci = backward.intermediates_crown(net, plo, phi)
+            c_lb = float((backward.crown(net, plo, phi, W, ci) + bias).min())
+            full_refine = c_lb >= z_lb
+            log(f'[vc2/bab] refine probe: crown={c_lb:.3f} zono={z_lb:.3f} '
+                f'-> full_refine={full_refine}')
+        except (NotImplementedError, torch.cuda.OutOfMemoryError):
+            pass                       # no zono for this net: keep crown
+    root_ref = None
+    if not full_refine:
+        root_ref = backward.intermediates_crown(
+            net, f_lo, f_hi, alpha_iters=(12 if n_nonlin <= 20000 else 0))
 
     def domain_refuted(lbq):
         """(B, q) query lbs -> (B, D) refutation matrix."""
@@ -88,10 +121,32 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         blo, bhi = f_lo[take], f_hi[take]
         f_lo, f_hi, f_worst = f_lo[keep], f_hi[keep], f_worst[keep]
 
-        # per-edge CROWN-refined intermediates: the decisive tightener for
-        # input-split domains (zono intermediates alone leave ~85% of deep
-        # acasxu domains open; refined ones close them, measured 2026-07)
-        inter = backward.intermediates_crown(net, blo, bhi)
+        if full_refine:
+            inter = backward.intermediates_crown(net, blo, bhi)
+        else:
+            B = blo.shape[0]
+            try:
+                # true per-subbox planes from the wide-dims zonotope
+                _l, _h, zst = backward.fwd.zono(net, blo, bhi,
+                                                return_state=True)
+                ib = backward._inter_from_state(
+                    net, lambda e: zst[e].bounds())
+            except (NotImplementedError, torch.cuda.OutOfMemoryError):
+                ib_state = backward.fwd.interval(net, blo, bhi,
+                                                 return_state=True)
+                ib = backward._inter_from_state(net,
+                                                lambda e: ib_state[e])
+            inter = {}
+            for k2, v in root_ref.items():
+                rv = tuple(t.expand(B, -1) for t in v)
+                iv = ib[k2]
+                merged = []
+                for j2 in range(0, len(rv), 2):
+                    merged.append(torch.maximum(rv[j2], iv[j2]))
+                    merged.append(torch.minimum(rv[j2 + 1],
+                                                torch.maximum(iv[j2 + 1],
+                                                              merged[-1])))
+                inter[k2] = tuple(merged)
         lbq, Ain = backward.crown(net, blo, bhi, W, inter,
                                   return_input_adjoint=True)
         n_bounded += blo.shape[0]

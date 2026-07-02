@@ -24,83 +24,108 @@ import torch
 from . import forward as fwd
 
 
-def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu'):
-    """v1 reverse_g ported onto the vc2 IR: the alpha-zono LP state built by
-    BACKWARD passes (one seeded at each relu layer's unstable neurons, one at
-    the output), with NO forward zonotope. Memory-bounded: only unstable
-    rows materialize, seeds chunk through the memory service, and every
-    layout detail lives in LinMap.lin_t (patches-ready by construction).
+class _GenGeometry:
+    """The alpha-zono generator geometry of one box: per-nonlin band
+    coefficients (lam, mu, delta) from the given bounds, a global column
+    layout (inputs first, then non-relu band columns -- the FREE block --
+    then relu fresh columns), a slope-linear center pass, and a chunked
+    backward row builder (LinMap-generic; no forward zonotope).
 
-    The walk is the SLOPE-LINEAR adjoint (y = lam*z + mu + mu*e_new at each
-    relu: scale by lam, deposit mu on the fresh column), NOT the sign-split
-    CROWN planes; `slopes` optionally overrides lam per relu (any value in
-    [0,1] is sound; default DeepZ h/(h-l)).
+    Column-order soundness: v1's LP parser boxes [-1,1] only the leading
+    `n_input` columns and the relu e_new columns; everything splittable
+    must be a relu column and everything else must live in the free block.
     """
-    import scipy.sparse as sp
 
-    from . import memory
-    from .relax import REL
-    dev = torch.device(device)
-    dt = torch.float32
-    lo2 = lo.reshape(1, -1).to(dev, dt)
-    hi2 = hi.reshape(1, -1).to(dev, dt)
-    n_in = net.n_in
-    radii = ((hi2 - lo2) / 2)[0]
+    def __init__(self, net, lo, hi, inter, slopes=None, device='cpu'):
+        from .relax import REL
+        self.net = net
+        dev = torch.device(device)
+        dt = torch.float32
+        self.dev, self.dt = dev, dt
+        lo2 = lo.reshape(1, -1).to(dev, dt)
+        hi2 = hi.reshape(1, -1).to(dev, dt)
+        self.radii = ((hi2 - lo2) / 2)[0]
+        self.center_in = ((lo2 + hi2) / 2)[0]
+        n_in = net.n_in
 
-    # per-relu band coefficients from the (refined) bounds
-    relu_ops = [nm for nm in net.order
-                if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'relu']
-    lam_L, mu_L, ust_L, pre_lh = {}, {}, {}, {}
-    col = n_in
-    e_col = {}
-    for nm in relu_ops:
-        l, h = inter[nm]
-        l, h = l[0].to(dev, dt), h[0].to(dev, dt)
-        if slopes and nm in slopes:
-            a = slopes[nm].reshape(-1).to(dev, dt).clamp(0.0, 1.0)
-            lam = torch.where(l >= 0, torch.ones_like(l),
-                              torch.where(h <= 0, torch.zeros_like(l), a))
-            mu = torch.where((l < 0) & (h > 0),
-                             torch.maximum((1 - lam) * h, -lam * l) / 2,
-                             torch.zeros_like(l))
-        else:
-            lam, mu, _d = REL['relu'].band(l.unsqueeze(0), h.unsqueeze(0))
-            lam, mu = lam[0], mu[0]
-        lam_L[nm], mu_L[nm], pre_lh[nm] = lam, mu, (l, h)
-        u = torch.nonzero((l < 0) & (h > 0), as_tuple=False).flatten()
-        ust_L[nm] = u
-        for j in u.tolist():
-            e_col[(nm, j)] = col
-            col += 1
-    n_gens = col
+        self.nonlin = [nm for nm in net.order
+                       if net.ops[nm].kind == 'nonlin']
+        self.lam, self.mu, self.delta, self.fresh = {}, {}, {}, {}
+        for nm in self.nonlin:
+            op = net.ops[nm]
+            rel = REL[op.fn]
+            if not hasattr(rel, 'band'):
+                raise NotImplementedError(f'gen geometry: no band for {op.fn}')
+            entry = inter[nm]
+            if len(entry) != 2:
+                raise NotImplementedError(
+                    f'gen geometry: {op.fn} inter entry has {len(entry)} '
+                    f'fields (bilinear ops use the forward builder)')
+            l, h = entry[0][0].to(dev, dt), entry[1][0].to(dev, dt)
+            if slopes and nm in slopes and op.fn == 'relu':
+                a = slopes[nm].reshape(-1).to(dev, dt).clamp(0.0, 1.0)
+                lam = torch.where(l >= 0, torch.ones_like(l),
+                                  torch.where(h <= 0, torch.zeros_like(l), a))
+                mu = torch.where((l < 0) & (h > 0),
+                                 torch.maximum((1 - lam) * h, -lam * l) / 2,
+                                 torch.zeros_like(l))
+                delta = mu
+            else:
+                lam, mu, delta = rel.band(l.unsqueeze(0), h.unsqueeze(0),
+                                          op.params)
+                lam, mu, delta = lam[0], mu[0], delta[0]
+            self.lam[nm], self.mu[nm], self.delta[nm] = lam, mu, delta
+            self.fresh[nm] = torch.nonzero(delta > 0,
+                                           as_tuple=False).flatten()
+        # column layout: inputs, then non-relu band cols (free), then relu
+        self.e_col = {}
+        col = n_in
+        for nm in self.nonlin:
+            if net.ops[nm].fn != 'relu':
+                for j in self.fresh[nm].tolist():
+                    self.e_col[(nm, j)] = col
+                    col += 1
+        self.n_free = col
+        for nm in self.nonlin:
+            if net.ops[nm].fn == 'relu':
+                for j in self.fresh[nm].tolist():
+                    self.e_col[(nm, j)] = col
+                    col += 1
+        self.n_gens = col
+        self.n_in = n_in
 
-    # centers by one slope-linear forward point pass (relu -> lam*z + mu)
-    center = {net.input_name: ((lo2 + hi2) / 2)[0]}
-    pre_center = {}
-    for name in net.order:
-        op = net.ops[name]
-        if op.kind == 'linmap':
-            center[name] = op.lm.point(center[op.inputs[0]].unsqueeze(0))[0]
-        elif op.kind == 'nonlin' and op.fn == 'relu':
-            z = center[op.inputs[0]]
-            pre_center[name] = z
-            center[name] = lam_L[name] * z + mu_L[name]
-        elif op.kind == 'add':
-            center[name] = center[op.inputs[0]] + center[op.inputs[1]]
-        elif op.kind == 'concat':
-            out = torch.as_tensor(op.params['base'], device=dev,
-                                  dtype=dt).clone()
-            for src, pos in zip(op.inputs, op.params['positions']):
-                out[torch.as_tensor(pos, device=dev)] = center[src]
-            center[name] = out
-        else:
-            raise NotImplementedError(
-                f'state_backward center: {op.kind}/{op.fn} (relu nets only)')
+        # slope-linear center pass (nonlin -> lam*z + mu)
+        center = {net.input_name: self.center_in}
+        self.pre_center = {}
+        for name in net.order:
+            op = net.ops[name]
+            if op.kind == 'linmap':
+                center[name] = op.lm.point(
+                    center[op.inputs[0]].unsqueeze(0))[0]
+            elif op.kind == 'nonlin':
+                z = center[op.inputs[0]]
+                self.pre_center[name] = z
+                center[name] = self.lam[name] * z + self.mu[name]
+            elif op.kind == 'add':
+                center[name] = (center[op.inputs[0]]
+                                + center[op.inputs[1]])
+            elif op.kind == 'concat':
+                out = torch.as_tensor(op.params['base'], device=dev,
+                                      dtype=dt).clone()
+                for src, pos in zip(op.inputs, op.params['positions']):
+                    out[torch.as_tensor(pos, device=dev)] = center[src]
+                center[name] = out
+            else:
+                raise NotImplementedError(
+                    f'gen geometry center: {op.kind}/{op.fn}')
+        self.center = center
 
-    def backward_rows(seed_edge, seed_idx, self_relu):
-        """(len(seed_idx), n_gens) generator rows of the seeded neurons."""
+    def rows(self, seed_edge, seed_idx, self_nonlin=None):
+        """(len(seed_idx), n_gens) generator rows of the seeded neurons via
+        one slope-linear backward pass (delta deposited on fresh cols)."""
+        net, dev, dt = self.net, self.dev, self.dt
         ns = len(seed_idx)
-        rowG = torch.zeros(ns, n_gens, device=dev, dtype=dt)
+        rowG = torch.zeros(ns, self.n_gens, device=dev, dtype=dt)
         sens = {seed_edge: torch.zeros(ns, net.ops[seed_edge].n,
                                        device=dev, dtype=dt)}
         sens[seed_edge][torch.arange(ns, device=dev),
@@ -112,15 +137,16 @@ def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu'):
             op = net.ops[name]
             if op.kind == 'linmap':
                 add = op.lm.lin_t(sx)
-            elif op.kind == 'nonlin' and op.fn == 'relu':
-                if name != self_relu:
-                    u = ust_L[name]
+            elif op.kind == 'nonlin':
+                if name != self_nonlin:
+                    u = self.fresh[name]
                     if u.numel():
                         cols = torch.as_tensor(
-                            [e_col[(name, int(j))] for j in u.tolist()],
+                            [self.e_col[(name, int(j))] for j in u.tolist()],
                             device=dev)
-                        rowG[:, cols] += sx[:, u] * mu_L[name][u].unsqueeze(0)
-                    sx = sx * lam_L[name].unsqueeze(0)
+                        rowG[:, cols] += sx[:, u] \
+                            * self.delta[name][u].unsqueeze(0)
+                    sx = sx * self.lam[name].unsqueeze(0)
                 add = sx
             elif op.kind == 'add':
                 sens[op.inputs[1]] = sens.get(op.inputs[1], 0) + sx
@@ -131,55 +157,110 @@ def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu'):
                     sens[src] = sens.get(src, 0) + sx[:, p]
                 continue
             else:
-                raise NotImplementedError(
-                    f'state_backward: {op.kind}/{op.fn}')
+                raise NotImplementedError(f'gen rows: {op.kind}/{op.fn}')
             sens[op.inputs[0]] = sens.get(op.inputs[0], 0) + add
         s_in = sens.get(net.input_name)
         if s_in is not None:
-            rowG[:, :n_in] += s_in * radii.unsqueeze(0)
+            rowG[:, :self.n_in] += s_in * self.radii.unsqueeze(0)
         return rowG
 
-    widest = max(net.ops[o].n for o in net.order)
-    per_row = widest * 4 * 6
+    def rows_chunked(self, seed_edge, seed_idx, self_nonlin=None):
+        from . import memory
+        widest = max(self.net.ops[o].n for o in self.net.order)
+        acc = []
+
+        def take(sel):
+            acc.append(self.rows(seed_edge, sel.tolist(), self_nonlin))
+
+        memory.chunked_indices(take, torch.as_tensor(seed_idx,
+                                                     device=self.dev),
+                               widest * 4 * 6)
+        return torch.cat(acc)
+
+
+def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu'):
+    """The alpha-zono LP state built backward (v1 reverse_g port), now for
+    ANY banded net: non-relu band columns land in the free block (boxed
+    [-1,1] by the parser via n_input), relu columns stay splittable."""
+    import scipy.sparse as sp
+    geo = _GenGeometry(net, lo, hi, inter, slopes=slopes, device=device)
     unstable_list = []
-    for nm in relu_ops:
-        u = ust_L[nm]
-        if not u.numel():
+    for nm in geo.nonlin:
+        if net.ops[nm].fn != 'relu' or not geo.fresh[nm].numel():
             continue
-        pre_edge = net.ops[nm].inputs[0]
-        rows_out = []
-
-        def take(sel, _pre=pre_edge, _nm=nm, _acc=rows_out):
-            _acc.append(backward_rows(_pre, sel.tolist(), _nm))
-
-        memory.chunked_indices(take, u, per_row)
-        rowG = torch.cat(rows_out).cpu().numpy()
+        u = geo.fresh[nm]
+        rowG = geo.rows_chunked(net.ops[nm].inputs[0], u, nm).cpu().numpy()
         for i, j in enumerate(u.tolist()):
             nz = np.nonzero(rowG[i])[0]
             unstable_list.append({
                 'layer_idx': nm, 'neuron_idx': int(j),
-                'lam': float(lam_L[nm][j]), 'mu': float(mu_L[nm][j]),
-                'c_in': float(pre_center[nm][j]),
-                'e_new_col': e_col[(nm, int(j))],
+                'lam': float(geo.lam[nm][j]), 'mu': float(geo.mu[nm][j]),
+                'c_in': float(geo.pre_center[nm][j]),
+                'e_new_col': geo.e_col[(nm, int(j))],
                 'row_indices': nz.tolist(),
                 'row_values': rowG[i, nz].astype(np.float64).tolist(),
             })
-    obj_rows = []
-
-    def take_out(sel, _acc=obj_rows):
-        _acc.append(backward_rows(net.output_name, sel.tolist(), None))
-
-    memory.chunked_indices(take_out, torch.arange(net.n_out, device=dev),
-                           per_row)
-    obj_G = torch.cat(obj_rows).cpu().numpy()
+    obj_G = geo.rows_chunked(net.output_name,
+                             list(range(net.n_out))).cpu().numpy()
     state = {
-        'n_gens': int(n_gens), 'n_input': int(n_in),
+        'n_gens': int(geo.n_gens), 'n_input': int(geo.n_free),
         'unstable_list': unstable_list,
         'obj_G_out_csr': sp.csr_matrix(obj_G.astype(np.float64)),
-        'obj_c_out': center[net.output_name].cpu().numpy().astype(np.float64),
+        'obj_c_out': geo.center[net.output_name].cpu().numpy()
+        .astype(np.float64),
     }
     keys = [(u['layer_idx'], u['neuron_idx']) for u in unstable_list]
     return state, keys
+
+
+def lift_intermediates(net, lo, hi, inter, cut_rows, rounds=3,
+                       device='cpu', log=lambda m: None):
+    """v1 phase-2.5 zono-lift port: tighten every nonlinearity's
+    pre-activation bounds by the EXACT box+one-halfspace LP
+    (v1 box_halfspace.lagrangian_min, closed form) under the spec cut
+    "a counterexample satisfies w.y + b <= 0", then rebuild the geometry
+    with the shrunken bands and repeat. Bounds only ever tighten; each
+    round's LP is sound on the CE region, so the result is scoped to
+    refuting the supplied rows (same discipline as gamma).
+
+    cut_rows: [(w, b)] output rows that must be <= 0 at a counterexample.
+    """
+    from vibecheck.box_halfspace import lagrangian_min
+    inter = dict(inter)
+    for rnd in range(rounds):
+        geo = _GenGeometry(net, lo, hi, inter, device=device)
+        # the cut in generator coordinates (use the FIRST row; iterating
+        # rows each round would also be valid)
+        w, bcut = cut_rows[0]
+        obj = geo.rows_chunked(net.output_name, list(range(net.n_out)))
+        w_t = torch.as_tensor(np.asarray(w), device=geo.dev, dtype=geo.dt)
+        a_cut = (w_t @ obj).cpu().numpy().astype(np.float64)
+        c_out = geo.center[net.output_name]
+        beta = float(-(float(w_t @ c_out) + float(bcut)))
+        improved = 0.0
+        for nm in geo.nonlin:
+            e = net.ops[nm].inputs[0]
+            n = net.ops[e].n
+            rows = geo.rows_chunked(e, list(range(n)), nm).cpu().numpy()
+            c_pre = geo.pre_center[nm].cpu().numpy()
+            l0, h0 = inter[nm]
+            l0 = l0.clone()
+            h0 = h0.clone()
+            for j in range(n):
+                lo_j = lagrangian_min(rows[j], c_pre[j], a_cut, beta)
+                hi_j = -lagrangian_min(-rows[j], -c_pre[j], a_cut, beta)
+                if lo_j > float(l0[0, j]):
+                    improved += lo_j - float(l0[0, j])
+                    l0[0, j] = lo_j
+                if hi_j < float(h0[0, j]):
+                    improved += float(h0[0, j]) - hi_j
+                    h0[0, j] = hi_j
+            h0 = torch.maximum(h0, l0)
+            inter[nm] = (l0, h0)
+        log(f'[vc2/lift] round {rnd}: total tightening {improved:.3f}')
+        if improved < 1e-3:
+            break
+    return inter
 
 
 def build_state(net, lo, hi, inter=None, slopes=None):
@@ -288,6 +369,93 @@ def _state_for(net, lo, hi, inter, slopes, device):
                                    for k, v in slopes.items()})
 
 
+def range_split_dual(net, lo, hi, inter, qw, qb, extra, ver, deadline,
+                     slopes, device, log, max_depth=10, leaf_time=3.0):
+    """Refute one query on nets whose slack lives in SMOOTH free-block
+    generators (sigmoid/tanh bands): a small best-first BaB over smooth-op
+    RANGE splits, each leaf certified by the dual with its state rebuilt
+    under the tightened pre-activation ranges (tighter range -> smaller
+    band -> smaller free generator -> the dual can close).
+
+    Sound: every leaf state is built from intersected TRUE bounds, and the
+    disjunction of children covers the parent exactly.
+    """
+    import heapq
+    import time
+
+    from .relax import REL
+    smooth = [nm for nm in net.order
+              if net.ops[nm].kind == 'nonlin'
+              and net.ops[nm].fn in ('sigmoid', 'tanh', 'exp', 'reciprocal')]
+    if not smooth:
+        return 'unknown', {'reason': 'no smooth edges'}
+
+    def leaf(inter_d):
+        # refresh DOWNSTREAM bounds under the tightened ranges (an interval
+        # reforward intersected with the parent's refined bounds); without
+        # this the relu substitutions stay stale and no leaf ever tightens
+        from . import backward
+        rc = {nm: inter_d[nm] for nm in smooth}
+        ib_state = fwd.interval(net, lo, hi, return_state=True,
+                                range_clamps=rc)
+        ib = backward._inter_from_state(net, lambda e: ib_state[e])
+        inter_leaf = {}
+        for k, v in inter_d.items():
+            iv = ib[k]
+            merged = []
+            for j2 in range(0, len(v), 2):
+                merged.append(torch.maximum(v[j2], iv[j2]))
+                merged.append(torch.minimum(v[j2 + 1],
+                                            torch.maximum(iv[j2 + 1],
+                                                          merged[-1])))
+            inter_leaf[k] = tuple(merged)
+        state, keys = _state_for(net, lo, hi, inter_leaf, slopes, device)
+        if not keys:
+            return 'unknown', {}
+        sk = score_keys(net, lo, hi, torch.as_tensor(qw).unsqueeze(0),
+                        inter_leaf, keys)
+        return ver.verify_query(state, qw, qb, sk,
+                                time_limit=min(leaf_time,
+                                               deadline - time.time()),
+                                extra_hs=extra)
+
+    def pick_split(inter_d):
+        best = None
+        for nm in smooth:
+            l, h = inter_d[nm]
+            _lam, _mu, delta = REL[net.ops[nm].fn].band(l, h,
+                                                        net.ops[nm].params)
+            v, j = delta[0].max(dim=0)
+            if best is None or float(v) > best[0]:
+                best = (float(v), nm, int(j))
+        return best
+
+    heap = [(0, 0, inter)]                     # (depth, tiebreak, inter)
+    tick = 1
+    leaves = 0
+    while heap:
+        if time.time() > deadline:
+            return 'unknown', {'reason': 'time', 'leaves': leaves}
+        depth, _, inter_d = heapq.heappop(heap)
+        verdict, info = leaf(inter_d)
+        leaves += 1
+        if verdict == 'unsat':
+            continue                           # this region refuted
+        if depth >= max_depth:
+            return 'unknown', {'reason': 'depth', 'leaves': leaves}
+        _v, nm, j = pick_split(inter_d)
+        l, h = inter_d[nm]
+        mid = float((l[0, j] + h[0, j]) / 2)
+        for lo_j, hi_j in ((float(l[0, j]), mid), (mid, float(h[0, j]))):
+            child = dict(inter_d)
+            l2, h2 = l.clone(), h.clone()
+            l2[0, j], h2[0, j] = lo_j, hi_j
+            child[nm] = (l2, h2)
+            heapq.heappush(heap, (depth + 1, tick, child))
+            tick += 1
+    return 'unsat', {'leaves': leaves}
+
+
 def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                     deadline, device='cpu', log=lambda m: None):
     """Refute the still-open disjuncts with the dual-ascent BaB, one query
@@ -388,11 +556,19 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             if verdict == 'unsat':
                 refuted.add(d)
                 break
-            if info.get('reason') == 'splits_exhausted':
-                # every relu split used and the frontier is still open: the
-                # slack lives in unsplittable (free-block) generators, so no
-                # other row of this state can close either -- hand the time
-                # back to the outer BaB (which shrinks those generators)
-                log('[vc2/dual] splits exhausted; state too loose, bailing')
+            if (verdict != 'unsat'
+                    and info.get('reason') == 'splits_exhausted'
+                    and deadline - time.time() > 10.0):
+                # relu splits alone cannot close: the slack lives in smooth
+                # free-block generators. Range-split those OUTSIDE the dual,
+                # rebuilding the leaf states under the tightened ranges.
+                verdict, info = range_split_dual(
+                    net, lo, hi, inter, qw, qb, extra, ver, deadline,
+                    dir_adaptive_slopes(row_pos[r]), device, log)
+                log(f'[vc2/dual]   range-split: {verdict} {info}')
+                if verdict == 'unsat':
+                    refuted.add(d)
+                    break
+                log('[vc2/dual] state too loose even range-split; bailing')
                 return refuted
     return refuted

@@ -232,8 +232,14 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     B, n = lo.shape
     dev, dt = lo.device, lo.dtype
     c = (hi + lo) / 2
-    G = torch.diag_embed((hi - lo) / 2)                    # (B, n, n)
-    sym = [('input', i) for i in range(n)]
+    # generators only for dims that are WIDE somewhere in the batch: a
+    # zero-radius dim needs no symbol (dist_shift: 8 wide of 792 dims,
+    # so the input block shrinks 100x)
+    r = (hi - lo) / 2
+    wide = torch.nonzero((r > 0).any(dim=0), as_tuple=False).flatten()
+    G = torch.zeros(B, n, wide.numel(), device=dev, dtype=dt)
+    G[:, wide, torch.arange(wide.numel(), device=dev)] = r[:, wide]
+    sym = [('input', int(i)) for i in wide.tolist()]
     state = {net.input_name: ZonoState(c, G, sym)}
 
     def lin_cols(lmap, G):

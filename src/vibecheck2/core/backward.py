@@ -244,7 +244,7 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
 
 def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
                         clamps=None, range_clamps=None, gamma_rows=None,
-                        gamma_iters=8):
+                        gamma_iters=8, alpha_iters=0):
     """Pre-activation bounds per nonlin edge via per-edge backward CROWN
     (chunked identity queries, both signs in one pass). Strictly tighter
     than interval; the regime for conv nets whose dense zonotope does not
@@ -332,6 +332,14 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
             Wb = Wc.unsqueeze(0).expand(B, -1, -1)
             out = crown(net, lo, hi, Wb, inter, start=_e, clamps=clamps,
                         range_clamps=range_clamps)
+            if alpha_iters > 0:
+                # joint-intermediate alpha (v1 phase-0.5 alpha-refresh): the
+                # identity rows themselves get optimized slopes, which is
+                # what lifts the ROOT bound (measured: v1 -4.5 vs -11.3 on
+                # dist_shift with fixed-slope refinement only)
+                oa = alpha_crown(net, lo, hi, Wc, inter, iters=alpha_iters,
+                                 budget=budget, start=_e)
+                out = torch.maximum(out, oa)
             if gamma_rows is not None:
                 # gamma (INVPROP): Adam-ascend output-row multipliers; the
                 # refined bounds are CONDITIONAL on the CE region of the
@@ -430,7 +438,8 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
 
 
 def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
-                thresholds=None, budget=None, return_alpha=False):
+                thresholds=None, budget=None, return_alpha=False,
+                start=None):
     """Adam-optimized alpha-CROWN lower bounds (fixed intermediates).
 
     Maximizes each query's lb independently (sum of hinged bounds: a query
@@ -443,9 +452,20 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
         inter = intermediates(net, lo, hi)
     q = W.shape[-2]
     alpha = {}
+    upstream = None
+    if start is not None:
+        # only ops that can influence the start edge get alphas
+        upstream = set()
+        pending = {start}
+        for name in reversed(net.order):
+            if name in pending:
+                upstream.add(name)
+                pending.update(net.ops[name].inputs)
     for name in net.order:
         op = net.ops[name]
         if op.kind != 'nonlin':
+            continue
+        if upstream is not None and name not in upstream:
             continue
         if op.fn == 'relu':
             l, h = inter[name]
@@ -459,7 +479,8 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
                 .expand(B, q, 2, l.shape[1]).contiguous()
             alpha[name] = t0.requires_grad_(True)
     if not alpha:
-        return crown(net, lo, hi, W, inter)
+        lb = crown(net, lo, hi, W, inter, start=start)
+        return (lb, {}) if return_alpha else lb
     opt = torch.optim.Adam(list(alpha.values()), lr=lr)
     best = None
     thr = (torch.zeros(q, device=lo.device, dtype=lo.dtype)
@@ -467,7 +488,7 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
     for _ in range(max(1, iters)):
         if budget is not None and budget.over():
             break
-        lb = crown(net, lo, hi, W, inter, alpha)
+        lb = crown(net, lo, hi, W, inter, alpha, start=start)
         best = lb.detach() if best is None \
             else torch.maximum(best, lb.detach())
         loss = -(torch.minimum(lb, thr.unsqueeze(0) + 1.0)).sum()
@@ -477,7 +498,7 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
         with torch.no_grad():
             for t in alpha.values():
                 t.clamp_(0.0, 1.0)
-    lb = crown(net, lo, hi, W, inter, alpha)
+    lb = crown(net, lo, hi, W, inter, alpha, start=start)
     best = torch.maximum(best, lb.detach())
     if return_alpha:
         return best, {k: v.detach() for k, v in alpha.items()}
