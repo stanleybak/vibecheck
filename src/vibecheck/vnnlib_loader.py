@@ -434,8 +434,15 @@ class ConjunctiveSpec:
 
 @dataclass
 class DisjunctiveSpec:
-    """OR of conjunctive clauses."""
+    """OR of conjunctive clauses, ANDed with the shared `common` constraints.
+
+    `common` holds constraints that apply to EVERY clause (asserts whose DNF
+    is a single clause, i.e. the input box and unconditional output rows).
+    Keeping them out of the per-clause lists lets consumers process the
+    (potentially huge: collins is 2.4M input bounds) shared part once
+    instead of once per disjunct."""
     clauses: list = field(default_factory=list)
+    common: list = field(default_factory=list)
 
 
 @dataclass
@@ -702,17 +709,16 @@ def _to_dnf(expr, resolve):
 
 
 def _conjoin_asserts(asserts, resolve):
-    clauses = [[]]
+    common, clauses = [], [[]]
     for a in asserts:
         a_dnf = _to_dnf(a, resolve)
-        if len(a_dnf) == 1:  # common case, avoid quadratic copying
-            for c in clauses:
-                c.extend(a_dnf[0])
+        if len(a_dnf) == 1:  # applies to every clause: keep it shared
+            common.extend(a_dnf[0])
         else:
             clauses = [c + s for c in clauses for s in a_dnf]
             if len(clauses) > MAX_DNF_CLAUSES:
                 raise VnnlibParseError("DNF explosion combining asserts")
-    return DisjunctiveSpec([ConjunctiveSpec(c) for c in clauses])
+    return DisjunctiveSpec([ConjunctiveSpec(c) for c in clauses], common)
 
 
 # ---------------------------------------------------------------- v2 parser
@@ -854,13 +860,18 @@ def _adapt_y_constraint(var_coeffs, bias):
 
 
 def _adapt_clause(clause, xbox, ycons):
-    """Split one DNF clause's PolynomialConstraints into X box + Y constraints.
+    """Split one DNF clause's PolynomialConstraints into X box + Y constraints."""
+    _adapt_pcs(clause.constraints, xbox, ycons)
+
+
+def _adapt_pcs(pcs, xbox, ycons):
+    """Split PolynomialConstraints into X box + Y constraints.
 
     `xbox` (dict i->[lo,hi]) and `ycons` (list) are accumulated in place.
     Multiple X bounds on the same var within a clause are INTERSECTED
     (conjunction): max of los, min of his.
     """
-    for pc in clause.constraints:
+    for pc in pcs:
         if not pc.is_linear:
             raise NotImplementedError(
                 f'unsupported nonlinear vnnlib constraint (degree>=2 monomial): '
@@ -893,19 +904,40 @@ def _vnnlib_v2_to_spec(prop, dtype=np.float32):
     """Map a parsed VnnlibProperty (v2) to VC's VNNSpec."""
     n_in = prop.num_inputs
 
-    # Split every clause into (X box dict, Y constraint list).
+    # Shared constraints (the input box, unconditional Y rows) adapt ONCE;
+    # clauses that add no X bound of their own reuse `base_xbox` by
+    # identity, so the huge-box case (collins: 2.4M bounds x 19 disjuncts)
+    # stays linear in the file size.
+    base_xbox, base_ycons = {}, []
+    _adapt_pcs(prop.spec.common, base_xbox, base_ycons)
+
     parsed = []
     for clause in prop.spec.clauses:
         xbox, ycons = {}, []
         _adapt_clause(clause, xbox, ycons)
-        parsed.append((xbox, ycons))
+        if xbox:
+            merged = {i: list(v) for i, v in base_xbox.items()}
+            for i, (lo, hi) in xbox.items():
+                slot = merged.setdefault(i, [None, None])
+                if lo is not None:
+                    slot[0] = lo if slot[0] is None else max(slot[0], lo)
+                if hi is not None:
+                    slot[1] = hi if slot[1] is None else min(slot[1], hi)
+            xbox = merged
+        else:
+            xbox = base_xbox
+        parsed.append((xbox, base_ycons + ycons))
 
     if not parsed:
         raise ValueError("No disjuncts found in v2 vnnlib spec")
 
     # Global bounding box = UNION across all clause X boxes (min lo, max hi).
     union = {}
+    _seen_boxes = set()
     for xbox, _ in parsed:
+        if id(xbox) in _seen_boxes:      # shared base box: union once
+            continue
+        _seen_boxes.add(id(xbox))
         for i, (lo, hi) in xbox.items():
             slot = union.setdefault(i, [None, None])
             if lo is not None:
@@ -924,10 +956,15 @@ def _vnnlib_v2_to_spec(prop, dtype=np.float32):
 
     # Attach per-disjunct boxes only when the X box genuinely varies across
     # disjuncts (input-OR). When all clauses share one box (simple +
-    # output-OR), leave input_lo=None — identical to the v1 path.
-    box_keys = {tuple(sorted((i, tuple(v)) for i, v in xbox.items()))
-                for xbox, _ in parsed}
-    attach = len(parsed) > 1 and len(box_keys) > 1
+    # output-OR), leave input_lo=None — identical to the v1 path. Identity
+    # pre-check first: sorting 2.4M-entry boxes per clause is the slow way
+    # to learn they are all the same dict.
+    if len({id(xbox) for xbox, _ in parsed}) == 1:
+        attach = False
+    else:
+        box_keys = {tuple(sorted((i, tuple(v)) for i, v in xbox.items()))
+                    for xbox, _ in parsed}
+        attach = len(parsed) > 1 and len(box_keys) > 1
 
     disjuncts = []
     for xbox, ycons in parsed:

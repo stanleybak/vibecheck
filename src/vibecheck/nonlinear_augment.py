@@ -35,7 +35,8 @@ import onnxruntime as ort
 
 from .network_pair import (_load_onnx, _read_vnnlib_text, _prep, _free_input,
                            _const, TARGET_OPSET)
-from .vnnlib_loader import parse_vnnlib_v2, detect_version, VnnlibParseError
+from .vnnlib_loader import (parse_vnnlib_v2, detect_version,
+                            VnnlibParseError, ConjunctiveSpec)
 
 
 def _var_idx(v):
@@ -62,7 +63,8 @@ def is_nonlinear_v2_spec(vnnlib_text):
         # malformed/unsupported v2 spec — not something we augment; let the
         # normal loader surface the proper error.
         return False
-    for cl in prop.spec.clauses:
+    for cl in ([ConjunctiveSpec(list(getattr(prop.spec, 'common', ())))]
+               + prop.spec.clauses):
         for c in cl.constraints:
             for mono, _ in c.terms:
                 if len(mono) >= 2:        # degree>=2 (incl. X*Y, X^2, Y^2)
@@ -87,7 +89,7 @@ def analyze(prop):
     xlo, xhi = {}, {}
     for cl in prop.spec.clauses:
         idxs = []
-        for c in cl.constraints:
+        for c in list(getattr(prop.spec, 'common', ())) + cl.constraints:
             # single-var linear X constraint -> also fold into the input box
             if (len(c.terms) == 1 and len(c.terms[0][0]) == 1
                     and c.terms[0][0][0].startswith('X')):

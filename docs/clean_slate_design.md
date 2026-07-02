@@ -500,3 +500,36 @@ fixed-intermediate ceiling). Anchors stay 33/33; M4 framework complete.
 Hard-tail rows and their pinned levers: cifar100 idx_8945-class = joint
 intermediate alpha optimization; dist_shift/lsnc = nonlinear splits in the
 dual; iso-deep/img100 = frontier memory + LP-tightening rounds.
+
+### Day-3 log: the dist_shift class falls (per-leaf bound selection)
+
+The blocker was never the root bound. v1 with the dist_shift config
+closes index7901 in 1.36s with 13 leaves (widest-axis input splits, sb
+disabled, free_dims=8), while vc2's input-split BaB burned 130k+ splits.
+Probing vc2's own bound at v1's winning leaves found the whole story:
+zono-forward intermediates + CROWN backward flips the worst query from
+-13.98 (root) to +3.16 after ONE halving of X_791. The BaB just never
+used that bound: the net has 1048 nonlins, under the full_refine <= 1200
+threshold, so every batch took the identity-CROWN refinement path, which
+at those same leaves gives -37 (sigmoid bands barely respond to it).
+
+Three durable fixes, all measured:
+
+- **Wide-dims zonotope** (`forward.zono`): input generators only for
+  dims that are wide somewhere in the batch; a zero-radius dim carries no
+  symbol. dist_shift's input block shrinks 792 -> 8 columns, making
+  per-subbox zono trivially cheap at BaB batch sizes.
+- **Refine probe** (`search.input_split_bab`): identity-CROWN vs
+  forward-zono per-batch refinement flips by net class (acasxu-style
+  amplifying weights favor backward refinement ~2x; sigmoid band nets
+  flip hard the other way). Measure both once on the root's first two
+  children, keep the winner. crown=-37.5 vs zono=-2.7 picks zono here;
+  acasxu keeps crown.
+- **Wide routing hoisted** (`verify`): the n_wide <= 32 route decision
+  moves above the root phases; joint-inter alpha, zono-lift, and the
+  dual are skipped on the wide route (they cost ~20s of wasted work when
+  the leaves close by per-leaf zono planes; 24.7s -> 1.8s).
+
+Results: index7901 timeout -> **unsat 1.8s (1 split, 5 domains)**;
+index112 (v1's border-vcslow row: 96.8s, abcrown 11.1s) -> **unsat
+2.0s**; easy sat/unsat rows stay green at ~1.1s.

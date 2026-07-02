@@ -828,8 +828,11 @@ def test_conjoin_asserts_multiclause_and_fastpath():
         ["<=", "X[0]", "5"],
     ], r)
     assert len(spec.clauses) == 2
+    # single-clause asserts land in the shared `common` list (processed once
+    # by consumers), not copied into every clause
+    assert any(c.terms[0][0] == ("X_0",) for c in spec.common)
     for clause in spec.clauses:
-        assert any(c.terms[0][0] == ("X_0",) for c in clause.constraints)
+        assert not any(c.terms[0][0] == ("X_0",) for c in clause.constraints)
 
 def test_conjoin_asserts_dnf_explosion(monkeypatch):
     import vibecheck.vnnlib_loader as vl

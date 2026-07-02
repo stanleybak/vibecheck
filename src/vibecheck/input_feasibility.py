@@ -181,14 +181,14 @@ def _contract_clause(x_cons, nvars, init_box):
     return box
 
 
-def _n_inputs(clauses):
+def _n_inputs(clauses, common=()):
     nv = 0
-    for cl in clauses:
-        for c in cl.constraints:
-            for mono, _ in c.terms:
-                for v in mono:
-                    if _is_x(v):
-                        nv = max(nv, _xidx(v) + 1)
+    all_cons = list(common) + [c for cl in clauses for c in cl.constraints]
+    for c in all_cons:
+        for mono, _ in c.terms:
+            for v in mono:
+                if _is_x(v):
+                    nv = max(nv, _xidx(v) + 1)
     return nv
 
 
@@ -204,17 +204,21 @@ def tighten_input_box(prop, n_in=None, init_box=None):
     unconstrained variables keep finite bounds. The returned box always contains
     the true region -> never cuts a real counterexample."""
     clauses = prop.spec.clauses
+    common = getattr(prop.spec, 'common', ())
     if not clauses:
         return []                       # indeterminate, NOT provably empty
-    nv = n_in if n_in is not None else _n_inputs(clauses)
+    nv = n_in if n_in is not None else _n_inputs(clauses, common)
     if nv == 0:
         return []                       # no input variables -> indeterminate
     if init_box is None:
         init_box = [(-INF, INF) for _ in range(nv)]
     hull = None
+    common_x = [(c.terms, c.bias) for c in common
+                if all(all(_is_x(v) for v in mono) for mono, _ in c.terms)]
     for cl in clauses:
-        x_cons = [(c.terms, c.bias) for c in cl.constraints
-                  if all(all(_is_x(v) for v in mono) for mono, _ in c.terms)]
+        x_cons = common_x + [
+            (c.terms, c.bias) for c in cl.constraints
+            if all(all(_is_x(v) for v in mono) for mono, _ in c.terms)]
         if x_cons:
             box = _contract_clause(x_cons, nv, init_box)
             if box is None:
