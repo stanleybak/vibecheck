@@ -120,16 +120,24 @@ class _GenGeometry:
                     f'gen geometry center: {op.kind}/{op.fn}')
         self.center = center
 
-    def rows(self, seed_edge, seed_idx, self_nonlin=None):
-        """(len(seed_idx), n_gens) generator rows of the seeded neurons via
-        one slope-linear backward pass (delta deposited on fresh cols)."""
+    def rows(self, seed_edge, seed_idx, self_nonlin=None, seed_mat=None):
+        """(ns, n_gens) generator rows via one slope-linear backward pass
+        (delta deposited on fresh cols). Seeded by unit vectors at
+        `seed_idx`, or by arbitrary row combinations `seed_mat` (ns, n) --
+        the zono-lift cut needs w @ G_out, which is ONE seeded row, not
+        the n_out identity rows (TinyYOLO: 28k rows, minutes vs ms)."""
         net, dev, dt = self.net, self.dev, self.dt
-        ns = len(seed_idx)
-        rowG = torch.zeros(ns, self.n_gens, device=dev, dtype=dt)
-        sens = {seed_edge: torch.zeros(ns, net.ops[seed_edge].n,
-                                       device=dev, dtype=dt)}
-        sens[seed_edge][torch.arange(ns, device=dev),
-                        torch.as_tensor(seed_idx, device=dev)] = 1.0
+        if seed_mat is not None:
+            sens = {seed_edge: seed_mat.to(dev, dt)}
+            ns = seed_mat.shape[0]
+            rowG = torch.zeros(ns, self.n_gens, device=dev, dtype=dt)
+        else:
+            ns = len(seed_idx)
+            rowG = torch.zeros(ns, self.n_gens, device=dev, dtype=dt)
+            sens = {seed_edge: torch.zeros(ns, net.ops[seed_edge].n,
+                                           device=dev, dtype=dt)}
+            sens[seed_edge][torch.arange(ns, device=dev),
+                            torch.as_tensor(seed_idx, device=dev)] = 1.0
         for name in reversed(net.order):
             if name not in sens:
                 continue
@@ -165,12 +173,16 @@ class _GenGeometry:
         return rowG
 
     def rows_chunked(self, seed_edge, seed_idx, self_nonlin=None):
+        # chunks accumulate on HOST: the assembled (n_rows, n_gens) matrix
+        # itself can exceed VRAM (TinyYOLO output rows: 2.5GB), and every
+        # consumer (scipy csr, numpy state fields) is CPU-bound anyway
         from . import memory
         widest = max(self.net.ops[o].n for o in self.net.order)
         acc = []
 
         def take(sel):
-            acc.append(self.rows(seed_edge, sel.tolist(), self_nonlin))
+            acc.append(self.rows(seed_edge, sel.tolist(),
+                                 self_nonlin).cpu())
 
         memory.chunked_indices(take, torch.as_tensor(seed_idx,
                                                      device=self.dev),
@@ -178,7 +190,8 @@ class _GenGeometry:
         return torch.cat(acc)
 
 
-def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu'):
+def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu',
+                         proj_rows=None):
     """The alpha-zono LP state built backward (v1 reverse_g port), now for
     ANY banded net: non-relu band columns land in the free block (boxed
     [-1,1] by the parser via n_input), relu columns stay splittable."""
@@ -200,13 +213,24 @@ def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu'):
                 'row_indices': nz.tolist(),
                 'row_values': rowG[i, nz].astype(np.float64).tolist(),
             })
-    obj_G = geo.rows_chunked(net.output_name,
-                             list(range(net.n_out))).cpu().numpy()
+    if proj_rows is not None:
+        # thin output map: only the query + sibling row COMBINATIONS
+        # (k, n_gens); the dense (n_out, n_gens) map is ~11GB for
+        # TinyYOLO and no consumer needs more than these projections
+        pr = torch.as_tensor(np.asarray(proj_rows), device=geo.dev,
+                             dtype=geo.dt)
+        obj_G = geo.rows(net.output_name, None,
+                         seed_mat=pr).cpu().numpy()
+        obj_c = (pr @ geo.center[net.output_name]).cpu().numpy()
+    else:
+        obj_G = geo.rows_chunked(net.output_name,
+                                 list(range(net.n_out))).cpu().numpy()
+        obj_c = geo.center[net.output_name].cpu().numpy()
     state = {
         'n_gens': int(geo.n_gens), 'n_input': int(geo.n_free),
         'unstable_list': unstable_list,
         'obj_G_out_csr': sp.csr_matrix(obj_G.astype(np.float64)),
-        'obj_c_out': geo.center[net.output_name].cpu().numpy()
+        'obj_c_out': obj_c
         .astype(np.float64),
     }
     keys = [(u['layer_idx'], u['neuron_idx']) for u in unstable_list]
@@ -214,7 +238,7 @@ def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu'):
 
 
 def lift_intermediates(net, lo, hi, inter, cut_rows, rounds=3,
-                       device='cpu', log=lambda m: None):
+                       device='cpu', budget=None, log=lambda m: None):
     """v1 phase-2.5 zono-lift port: tighten every nonlinearity's
     pre-activation bounds by the EXACT box+one-halfspace LP
     (v1 box_halfspace.lagrangian_min, closed form) under the spec cut
@@ -228,13 +252,20 @@ def lift_intermediates(net, lo, hi, inter, cut_rows, rounds=3,
     from vibecheck.box_halfspace import lagrangian_min
     inter = dict(inter)
     for rnd in range(rounds):
+        if budget is not None and budget.remaining() < 10:
+            # a big-output net (TinyYOLO: 28k rows) can spend minutes per
+            # round; return what is already tightened instead of
+            # overrunning the instance budget
+            log(f'[vc2/lift] budget stop after round {rnd}')
+            break
         geo = _GenGeometry(net, lo, hi, inter, device=device)
         # the cut in generator coordinates (use the FIRST row; iterating
         # rows each round would also be valid)
         w, bcut = cut_rows[0]
-        obj = geo.rows_chunked(net.output_name, list(range(net.n_out)))
         w_t = torch.as_tensor(np.asarray(w), device=geo.dev, dtype=geo.dt)
-        a_cut = (w_t @ obj).cpu().numpy().astype(np.float64)
+        a_cut = geo.rows(net.output_name, None,
+                         seed_mat=w_t.unsqueeze(0))[0] \
+            .cpu().numpy().astype(np.float64)
         c_out = geo.center[net.output_name]
         beta = float(-(float(w_t @ c_out) + float(bcut)))
         improved = 0.0
@@ -582,16 +613,25 @@ def score_keys(net, lo, hi, W_open, inter, keys):
     return sorted(keys, key=lambda k: -scores[k])
 
 
-def _state_for(net, lo, hi, inter, slopes, device):
+def _state_for(net, lo, hi, inter, slopes, device, proj_rows=None):
     """Backward state build with the forward-recorded fallback for nets
     carrying non-slope-linear ops (mul/sigmoid free-block generators)."""
     try:
         return build_state_backward(net, lo, hi, inter, device=device,
-                                    slopes=slopes)
+                                    slopes=slopes, proj_rows=proj_rows)
     except NotImplementedError:
-        return build_state(net, lo, hi, inter=inter,
-                           slopes={k: v.unsqueeze(0)
-                                   for k, v in slopes.items()})
+        state, keys = build_state(net, lo, hi, inter=inter,
+                                  slopes={k: v.unsqueeze(0)
+                                          for k, v in slopes.items()})
+        if proj_rows is not None:
+            import scipy.sparse as sp
+            pr = sp.csr_matrix(np.asarray(proj_rows, dtype=np.float64))
+            state = dict(state)
+            state['obj_G_out_csr'] = (pr
+                                      @ state['obj_G_out_csr']).tocsr()
+            state['obj_c_out'] = pr @ np.asarray(state['obj_c_out'],
+                                                 dtype=np.float64)
+        return state, keys
 
 
 def range_split_dual(net, lo, hi, inter, qw, qb, extra, ver, deadline,
@@ -690,8 +730,27 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
     from . import backward
     # per-edge CROWN refinement of the pre-activation bounds first: the LP
     # state's bands inherit them, which is what makes the dual competitive
-    # with v1's tightened states
-    inter = backward.intermediates_crown(net, lo, hi, base_inter=inter)
+    # with v1's tightened states. Gated by size: on a 640x640 YOLO the
+    # identity refinement pass alone exceeds the 8G scope (the caller's
+    # root inter is already crown-refined there)
+    n_nonlin = sum(net.ops[nm].n for nm in net.order
+                   if net.ops[nm].kind == 'nonlin')
+    if n_nonlin <= 20000:
+        inter = backward.intermediates_crown(net, lo, hi, base_inter=inter)
+    # dense-state feasibility: every unstable row carries ~n_gens floats
+    # (n_gens ~ n_in + unstable). A 640x640 YOLO needs the sparse-patches
+    # state (M5); building it densely is a RAM kill, not a verdict.
+    n_unstable = 0
+    for nm in net.order:
+        if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'relu':
+            l, h = inter[nm]
+            n_unstable += int(((l < 0) & (h > 0)).sum())
+    est = float(n_unstable) * (net.n_in + n_unstable) * 4
+    if est > 2e9:
+        log(f'[vc2/dual] skipped: dense state ~{est / 1e9:.1f}GB '
+            f'({n_unstable} unstable rows; needs the sparse-patches '
+            f'state, M5)')
+        return set()
     # per-query direction-adaptive slopes (v1 build_dir_adaptive_alpha):
     # per neuron, the OPTIMIZED alpha where the query's adjoint ew > 0
     # (lower plane binds) and the chord slope h/(h-l) where ew <= 0, so the
@@ -730,7 +789,15 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             break
         per_q = max(2.0, left / max(1, len(open_d)) / max(1, len(rows)))
         for r in rows:
-            qw = W[r].cpu().numpy()
+            # thin state: obj rows are the query + sibling COMBINATIONS
+            # already projected (row 0 = this query), so qw/extra_hs are
+            # unit selectors and the state never materializes the
+            # (n_out, n_gens) map (TinyYOLO: ~11GB dense)
+            order = [r] + [r2 for r2 in rows if r2 != r]
+            proj = W[order].cpu().numpy()
+            k_rows = len(order)
+            qw = np.zeros(k_rows)
+            qw[0] = 1.0
             qb = float(bias[r])
             # NOTE: naively reusing CROWN alphas as zonotope slopes makes
             # the state LOOSER (measured: img96 dual went unsat 3.5s ->
@@ -740,13 +807,13 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             if r not in state_cache:
                 state_cache[r] = _state_for(
                     net, lo, hi, inter, dir_adaptive_slopes(row_pos[r]),
-                    device)
+                    device, proj_rows=proj)
             state, keys = state_cache[r]
             if not keys:
                 continue
             sk = score_keys(net, lo, hi, W[r:r + 1], inter, keys)
-            extra = [(W[r2].cpu().numpy(), float(bias[r2]))
-                     for r2 in rows if r2 != r]
+            extra = [(np.eye(k_rows)[i], float(bias[r2]))
+                     for i, r2 in enumerate(order) if r2 != r]
             verdict, info = ver.verify_query(
                 state, qw, qb, sk, time_limit=min(per_q,
                                                   deadline - time.time()),
@@ -765,7 +832,8 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                         gamma_rows=(Wg, bg))
                 g_state, g_keys = _state_for(
                     net, lo, hi, gamma_inter[d],
-                    dir_adaptive_slopes(row_pos[r]), device)
+                    dir_adaptive_slopes(row_pos[r]), device,
+                    proj_rows=proj)
                 sk2 = score_keys(net, lo, hi, W[r:r + 1], gamma_inter[d],
                                  g_keys)
                 verdict, info = ver.verify_query(

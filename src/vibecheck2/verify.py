@@ -280,7 +280,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                                 len(spec.disjuncts))
             log(f'[vc2] alpha-polish: worst={float((lb + b).min()):.4f} '
                 f'open={len(open_d)}/{len(spec.disjuncts)}')
-    if verdict != 'unsat' and len(open_d) == 1:
+    if verdict != 'unsat' and len(open_d) == 1 and n_nonlin <= 20000:
         # zono-lift (v1 phase 2.5): exact box+halfspace LP tightening of
         # every pre-activation under the open disjunct's own output rows.
         # Region-conditional, hence scoped to the single-open-disjunct case
@@ -293,7 +293,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                 net, lo, hi, inter,
                 cut_rows=[(W[r].cpu().numpy(), float(b[r]))
                           for r in rows_d],
-                device=device, log=log)
+                device=device, budget=budget, log=log)
             lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
             lb_l = backward.alpha_crown(net, lo, hi, W, inter,
                                         iters=alpha_iters, thresholds=-b,
