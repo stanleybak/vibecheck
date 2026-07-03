@@ -815,3 +815,15 @@ the remaining gap to v1's unsat is bilinear tightness (Q@K McCormick
 with refined factors, alpha over the McCormick mix) on nets whose true
 logit-diff ranges are genuinely wide. Battery: acasxu 6/6, dist_shift
 4/4, idx_8945 89.7s, suite 168/168.
+
+### Day-7 (AWS): challenging_certified idx3310 classified
+
+Three-retry diagnosis on the A10G produced two real fixes (the budget
+ledger: alpha-polish's fixed 150 iterations ate 2.5 minutes on the
+460k-neuron cnn7, the dual's gamma retry double-drew its budget) and a
+classification: with an honest ledger the relu BaB bounded 9.6k domains
+in 180s with ZERO closures -- the malbeware signature (per-split gain
+~0; slack spread over the layer). v1 closes this row only via its
+Gurobi conv->MILP route at 536 of 550s. MILP-class; vc2 core stays
+Gurobi-free, handlers/ escalation remains the open decision for the
+class {malbeware Wintrim, challenging idx3310}.
