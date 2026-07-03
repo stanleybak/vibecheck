@@ -154,7 +154,14 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
             put(op.inputs[0], Ao)
             put(op.inputs[1], Ao)
         elif op.kind == 'concat':
-            base = torch.as_tensor(op.params['base'], device=dev, dtype=dt)
+            # the forward OVERWRITES covered slots with input values, so
+            # the base constant contributes only at uncovered slots --
+            # adding it everywhere double-counts covered positions
+            # (caught by the op-coverage suite with a nonzero base)
+            base = torch.as_tensor(op.params['base'], device=dev,
+                                   dtype=dt).clone()
+            for pos in op.params['positions']:
+                base[torch.as_tensor(pos, device=dev)] = 0.0
             d = d + Ao @ base
             for src, pos in zip(op.inputs, op.params['positions']):
                 put(src, Ao[:, :, torch.as_tensor(pos, device=dev)])
