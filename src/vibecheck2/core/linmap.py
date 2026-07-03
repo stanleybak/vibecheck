@@ -243,6 +243,28 @@ class AvgPool(LinMap):
         return torch.zeros(self.n_out, device=X.device, dtype=X.dtype)
 
 
+class Scale(LinMap):
+    """y = a * x, elementwise scalar scale (the -1 instance turns `add`
+    into subtraction for the maxpool relu tree)."""
+
+    def __init__(self, a: float, n: int):
+        super().__init__()
+        self.a = float(a)
+        self.n_in = self.n_out = int(n)
+
+    def lin(self, X):
+        return self.a * X
+
+    def lin_t(self, Y):
+        return self.a * Y
+
+    def lin_abs(self, X):
+        return abs(self.a) * X
+
+    def bias_vec(self, X):
+        return torch.zeros(self.n_out, device=X.device, dtype=X.dtype)
+
+
 class Select(LinMap):
     """y[i] = x[idx[i]]: transpose / slice / gather / split as one gather.
 

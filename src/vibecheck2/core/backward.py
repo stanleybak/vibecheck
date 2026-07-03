@@ -48,6 +48,32 @@ def _zono_cost_bytes(net, B):
     return worst * B * 4
 
 
+def _mccormick_planes(lx, hx, ly, hy):
+    """Per-term McCormick planes for a product x*y over box bounds, with
+    the midpoint-tightness selection between the two valid planes on each
+    side. One engine; `mul` (elementwise) and `bmm` (contracted) are shape
+    instances -- future bilinear ops (attention Q@K) reuse it by
+    broadcasting their bounds to the term layout.
+
+    Returns (alx, aly, clo, aux, auy, cup): lower plane
+    x*y >= alx*x + aly*y + clo and upper x*y <= aux*x + auy*y + cup.
+    """
+    cx, cy = (lx + hx) / 2, (ly + hy) / 2
+    lo1_v = ly * cx + lx * cy - lx * ly
+    lo2_v = hy * cx + hx * cy - hx * hy
+    pick_lo = (lo1_v >= lo2_v)
+    alx = torch.where(pick_lo, ly, hy)
+    aly = torch.where(pick_lo, lx, hx)
+    clo = torch.where(pick_lo, -lx * ly, -hx * hy)
+    up1_v = ly * cx + hx * cy - hx * ly
+    up2_v = hy * cx + lx * cy - lx * hy
+    pick_up = (up1_v <= up2_v)
+    aux = torch.where(pick_up, ly, hy)
+    auy = torch.where(pick_up, hx, lx)
+    cup = torch.where(pick_up, -hx * ly, -lx * hy)
+    return alx, aly, clo, aux, auy, cup
+
+
 def _inter_from_state(net, bounds_of):
     """{op: pre-activation bounds} for nonlin ops; a bilinear mul stores the
     bound pair of BOTH factors (its McCormick planes need them)."""
@@ -56,7 +82,7 @@ def _inter_from_state(net, bounds_of):
         op = net.ops[name]
         if op.kind == 'nonlin':
             inter[name] = bounds_of(op.inputs[0])
-        elif op.kind == 'mul':
+        elif op.kind in ('mul', 'bmm'):
             (lx, hx) = bounds_of(op.inputs[0])
             (ly, hy) = bounds_of(op.inputs[1])
             inter[name] = (lx, hx, ly, hy)     # flat: slices uniformly
@@ -221,23 +247,38 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
             # per element pick the plane pair that is tighter at the box
             # center; adjoint sign selects lower (A+) vs upper (A-).
             lx, hx, ly, hy = inter[name]
-            cx, cy = (lx + hx) / 2, (ly + hy) / 2
-            lo1_v = ly * cx + lx * cy - lx * ly
-            lo2_v = hy * cx + hx * cy - hx * hy
-            pick_lo = (lo1_v >= lo2_v)
-            alx = torch.where(pick_lo, ly, hy).unsqueeze(1)
-            aly = torch.where(pick_lo, lx, hx).unsqueeze(1)
-            clo = torch.where(pick_lo, -lx * ly, -hx * hy).unsqueeze(1)
-            up1_v = ly * cx + hx * cy - hx * ly
-            up2_v = hy * cx + lx * cy - lx * hy
-            pick_up = (up1_v <= up2_v)
-            aux = torch.where(pick_up, ly, hy).unsqueeze(1)
-            auy = torch.where(pick_up, hx, lx).unsqueeze(1)
-            cup = torch.where(pick_up, -hx * ly, -lx * hy).unsqueeze(1)
+            alx, aly, clo, aux, auy, cup = (
+                t.unsqueeze(1)
+                for t in _mccormick_planes(lx, hx, ly, hy))
             Ap, An = _pos_part(Ao), _neg_part(Ao)
             put(op.inputs[0], Ap * alx + An * aux)
             put(op.inputs[1], Ap * aly + An * auy)
             d = d + (Ap * clo + An * cup).sum(dim=2)
+        elif op.kind == 'bmm':
+            # bmm = the contracted instance of the same McCormick engine:
+            # out[g,i,j] = sum_l X[g,i,l] * Y[g,l,j]; the adjoint on each
+            # (g,i,l,j) term distributes sign-wise onto the factor planes
+            lx, hx, ly, hy = inter[name]
+            ash, bsh = op.params['a_shape'], op.params['b_shape']
+            m, k, p = ash[-2], ash[-1], bsh[-1]
+            G = 1
+            for dd in ash[:-2]:
+                G *= int(dd)
+            B = Ao.shape[0]
+            q = Ao.shape[1]
+            lxr = lx.reshape(B, 1, G, m, k, 1)
+            hxr = hx.reshape(B, 1, G, m, k, 1)
+            lyr = ly.reshape(B, 1, G, 1, k, p)
+            hyr = hy.reshape(B, 1, G, 1, k, p)
+            alx, aly, clo, aux, auy, cup = _mccormick_planes(
+                lxr, hxr, lyr, hyr)
+            Aot = Ao.reshape(B, q, G, m, 1, p)
+            Ap, An = _pos_part(Aot), _neg_part(Aot)
+            put(op.inputs[0],
+                (Ap * alx + An * aux).sum(dim=5).reshape(B, q, -1))
+            put(op.inputs[1],
+                (Ap * aly + An * auy).sum(dim=3).reshape(B, q, -1))
+            d = d + (Ap * clo + An * cup).sum(dim=(2, 3, 4, 5))
         elif op.kind == 'maxpool':
             raise NotImplementedError(
                 'crown: maxpool relaxation arrives with M5 (relu decomposition)')
@@ -279,7 +320,7 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
         if budget is not None:
             budget.check()
         op = net.ops[name]
-        if op.kind == 'mul':
+        if op.kind in ('mul', 'bmm'):
             # refine BOTH factor edges (McCormick quality tracks them);
             # bounds land back in the (lx, hx, ly, hy) flat tuple
             lx, hx, ly, hy = inter[name]

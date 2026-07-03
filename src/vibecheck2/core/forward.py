@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .relax import REL
+from .relax import OUT_RANGE as REL_RANGE, REL
 
 
 
@@ -138,7 +138,11 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
             else:
                 raise NotImplementedError(f'interval: nonlin {op.fn!r}')
             lo_hi = torch.minimum(flo, fhi), torch.maximum(flo, fhi)
-            state[name] = ((lo_hi[1] + lo_hi[0]) / 2, (lo_hi[1] - lo_hi[0]) / 2)
+            rlo, rhi = REL_RANGE.get(op.fn, (None, None))
+            l2 = lo_hi[0] if rlo is None else lo_hi[0].clamp_min(rlo)
+            h2 = lo_hi[1] if rhi is None else lo_hi[1].clamp_max(rhi)
+            h2 = torch.maximum(h2, l2)
+            state[name] = ((h2 + l2) / 2, (h2 - l2) / 2)
         elif op.kind == 'add':
             (c1, r1), (c2, r2) = state[op.inputs[0]], state[op.inputs[1]]
             state[name] = (c1 + c2, r1 + r2)

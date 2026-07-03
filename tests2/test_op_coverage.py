@@ -158,7 +158,8 @@ def _maxpool_case():
                         'stride': (2, 2), 'padding': (0, 0)}),
         'y': Op('y', 'linmap', ('m',), (3,), 3, lm=lm3),
     }
-    net = Net(ops, ['u', 'm', 'y'], 'x', 'y')
+    from vibecheck2.core.graph import decompose_maxpool
+    net = decompose_maxpool(Net(ops, ['u', 'm', 'y'], 'x', 'y'))
 
     def ref(x):
         u = (x @ lm1.W.T + lm1.b).reshape(-1, 1, 4, 4)
@@ -250,14 +251,12 @@ GOLDEN = {
     'add': dict.fromkeys(PATHS, True),
     'concat': dict.fromkeys(PATHS, True),
     'mul': dict.fromkeys(PATHS, True),
-    # maxpool: point/interval only -- the zono/crown/dual story is the M5
-    # relu decomposition (padded pools included)
-    'maxpool': {**dict.fromkeys(PATHS, False),
-                'point': True, 'interval': True},
-    # bmm: point/interval/zono today; the crown-side McCormick adjoint is
-    # M6 (vit); the dual state rides the zono recording
-    'bmm': {**dict.fromkeys(PATHS, True),
-            'crown': False, 'alpha': False, 'inter': False},
+    # maxpool decomposes to relu at load (max(a,b) = a + relu(b - a)),
+    # so every path, split scoring, and alpha ride the relu machinery
+    'maxpool': dict.fromkeys(PATHS, True),
+    # bmm crown-side: the general McCormick bilinear adjoint (mul and bmm
+    # are shape instances of one engine)
+    'bmm': dict.fromkeys(PATHS, True),
 }
 
 

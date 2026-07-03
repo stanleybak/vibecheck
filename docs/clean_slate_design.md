@@ -717,3 +717,36 @@ full 200s. Remaining for the class: per-leaf bound quality on
 mul/sigmoid nets (closures ~0; use the compare_debug workflow on mscn
 leaf boxes next). Regressions: acasxu 6/6, dist_shift 4/4, iso 36.2s,
 lsnc 52.4s.
+
+### Day-5 close: the coverage matrix goes fully green
+
+tests2/test_op_coverage.py (112 cells in ~1.5s: 16 ops x 7 paths on
+synthetic nets vs independent references) is the new soundness-first
+contract: every cell is supported-and-bracketing or a declared
+NotImplementedError, in both directions. Its first runs caught two real
+soundness bugs: crown's concat base double-count, and the exp point
+clamp I had added for softmax stability (understates the interval upper
+past x = 87 -- reverted to exact; attack NaN-robustness lives in the
+attack, bounds stay bracketing).
+
+The two gap rows are closed:
+- maxpool decomposes to the exact pairwise relu tree at Net level
+  (max(a,b) = a + relu(b-a)); padded pools work too, since padded window
+  slots repeat a valid element (max(a,a) = a) -- the ONNX-level rewrite
+  refused those. Every bound path, the split scoring, and the alpha
+  optimizer ride the introduced relus with zero new special cases.
+- bmm crown-side lands as the contracted instance of ONE McCormick
+  engine (_mccormick_planes): mul is the elementwise instance, bmm the
+  (G, m, k) x (G, k, p) instance, and future bilinear ops (attention
+  Q@K) broadcast their bounds into the same term layout. inter carries
+  both factor bounds for bmm exactly like mul; intermediates_crown
+  refines both factor edges.
+
+Nonlinearities now declare mathematical output ranges (sigmoid (0,1),
+tanh/sin/cos/sign (-1,1), relu/exp >= 0) and the interval forward clamps
+into them. vit progresses from 'bmm unimplemented' to an honest unknown
+at its softmax: the exp/sum/reciprocal decomposition hits fp32 infinity
+(exp upper) and (c, r)-form NaNs; the M6 continuation is a MONOLITHIC
+softmax relaxation (output in (0,1), rows sum to 1), not more
+decomposition patching. Regressions: acasxu 6/6, dist_shift 4/4, iso
+35.7s, idx_8945 87.5s, suite 156 passed.

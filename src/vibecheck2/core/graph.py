@@ -80,6 +80,109 @@ class Net:
         return cons
 
 
+def decompose_maxpool(net):
+    """Replace native maxpool ops with the exact pairwise relu tree:
+    max(a, b) = a + relu(b - a), levels until one column remains. Window
+    slots that fall in the padding REPEAT the window's first valid element
+    (max(a, a) = a), so the -inf padding semantics need no special value
+    and PADDED pools decompose exactly too (the ONNX-level rewrite refuses
+    those). The introduced relus ride every bound path, the split scoring,
+    and the alpha optimizer like any other relu.
+    """
+    from .linmap import Scale, Select
+    if not any(net.ops[nm].kind == 'maxpool' for nm in net.order):
+        return net
+    ops = dict(net.ops)
+    order = []
+    for name in net.order:
+        op = net.ops[name]
+        if op.kind != 'maxpool':
+            order.append(name)
+            continue
+        C, H, W = op.params['in_shape']
+        kh, kw = op.params['kernel_shape']
+        sh, sw = op.params['stride']
+        ph, pw = op.params['padding']
+        OH = (H + 2 * ph - kh) // sh + 1
+        OW = (W + 2 * pw - kw) // sw + 1
+        n_out = C * OH * OW
+        src = op.inputs[0]
+        n_src = net.ops[src].n
+        # (n_out, m) window index matrix, invalid slots repeating the
+        # window's first valid element
+        win = np.empty((n_out, kh * kw), dtype=np.int64)
+        o = 0
+        for c in range(C):
+            for oh in range(OH):
+                for ow in range(OW):
+                    idxs = []
+                    for i in range(kh):
+                        for j in range(kw):
+                            r, s = oh * sh - ph + i, ow * sw - pw + j
+                            if 0 <= r < H and 0 <= s < W:
+                                idxs.append(c * H * W + r * W + s)
+                    assert idxs, 'all-padding window'
+                    while len(idxs) < kh * kw:
+                        idxs.append(idxs[0])
+                    win[o] = idxs
+                    o += 1
+
+        def emit(nm, kind, inputs, n, **kw):
+            ops[nm] = Op(nm, kind, tuple(inputs), (n,), n, **kw)
+            order.append(nm)
+
+        cols = kh * kw
+        cur = f'{name}/w'
+        emit(cur, 'linmap', [src], n_out * cols,
+             lm=Select(win.T.reshape(-1), n_src))
+        lvl = 0
+        while cols > 1:
+            P, odd = cols // 2, cols % 2
+            npairs = P * n_out
+            ev = np.concatenate([np.arange(n_out) + 2 * p * n_out
+                                 for p in range(P)])
+            od = ev + n_out
+            u, v = f'{name}/u{lvl}', f'{name}/v{lvl}'
+            emit(u, 'linmap', [cur], npairs,
+                 lm=Select(ev, n_out * cols))
+            emit(v, 'linmap', [cur], npairs,
+                 lm=Select(od, n_out * cols))
+            nu = f'{name}/n{lvl}'
+            emit(nu, 'linmap', [u], npairs, lm=Scale(-1.0, npairs))
+            dd = f'{name}/d{lvl}'
+            emit(dd, 'add', [v, nu], npairs)
+            rr = f'{name}/r{lvl}'
+            emit(rr, 'nonlin', [dd], npairs, fn='relu')
+            done = (P == 1 and not odd)
+            mx = name if done else f'{name}/m{lvl}'
+            emit(mx, 'add', [u, rr], npairs)
+            if odd:
+                tail = f'{name}/t{lvl}'
+                emit(tail, 'linmap', [cur], n_out,
+                     lm=Select(np.arange(n_out) + (cols - 1) * n_out,
+                               n_out * cols))
+                cols = P + 1
+                done = cols == 1
+                cat = name if done else f'{name}/c{lvl}'
+                emit(cat, 'concat', [mx, tail], (P + 1) * n_out,
+                     params={'base': np.zeros((P + 1) * n_out,
+                                              dtype=np.float32),
+                             'positions': [list(range(P * n_out)),
+                                           list(range(P * n_out,
+                                                      (P + 1) * n_out))],
+                             'n_out': (P + 1) * n_out})
+                cur = cat
+            else:
+                cols = P
+                cur = mx
+            lvl += 1
+        if kh * kw == 1:                      # degenerate 1x1 pool
+            emit(name, 'linmap', [cur], n_out,
+                 lm=Select(np.arange(n_out), n_out))
+    return Net(ops, order, net.input_name, net.output_name,
+               onnx_path=net.onnx_path)
+
+
 def _flat(shape):
     n = 1
     for d in shape:
@@ -739,11 +842,13 @@ def load(onnx_path, dtype=np.float32) -> Net:
     try:
         maxpool_to_relu(cg)
     except NotImplementedError as e:
-        # padded MaxPool pads with -inf, which the exact ReLU decomposition
-        # cannot express (v1 refuses loudly). Keep the native maxpool kind:
-        # point eval / attack work; the bound side raises if ever reached.
-        print(f'[vc2] maxpool_to_relu skipped ({e}); keeping native maxpool')
+        # padded MaxPool pads with -inf, which the ONNX-level rewrite
+        # refuses; the Net-level decomposition below handles it exactly
+        # (padded window slots repeat a valid element: max(a, a) = a)
+        print(f'[vc2] onnx maxpool_to_relu skipped ({e}); '
+              f'decomposing at the Net level')
     min_max_to_relu(cg)
     net = from_compute_graph(cg, true_shapes=_onnx_true_shapes(onnx_path))
+    net = decompose_maxpool(net)
     net.onnx_path = onnx_path
     return net

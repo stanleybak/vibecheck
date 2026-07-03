@@ -272,12 +272,11 @@ class Exp:
     (at x* = ln(chord)), the tightest same-slope band."""
 
     def point(self, x, params=None):
-        # clamp keeps softmax decompositions finite where ORT's fused
-        # (max-shifted) Softmax is finite: raw exp of binarized-net logits
-        # overflows fp32 and inf * reciprocal(inf) NaNs every margin the
-        # attack sees. Order-preserving; CE validation stays with the
-        # exact ORT replay chokepoint.
-        return torch.exp(x.clamp(max=87.0))
+        # EXACT: a clamped exp here understates the true upper bound the
+        # interval endpoint eval reads (unsound past x=87). Softmax NaNs
+        # under box extremes are the attack's problem and handled there
+        # (nan_to_num on margins); bounds must stay bracketing.
+        return torch.exp(x)
 
     def planes(self, lo, hi, params=None):
         w = (hi - lo).clamp_min(1e-12)
@@ -396,6 +395,18 @@ class Floor:
         al, bl, au, bu = self.planes(lo, hi, params)
         return al, (bl + bu) / 2, (bu - bl) / 2
 
+
+# mathematical output ranges, used to clamp propagated bounds (exp's
+# interval lower underflows to 0.0 in fp32, which makes a downstream
+# softmax reciprocal look unbounded; in real arithmetic exp > 0)
+OUT_RANGE = {
+    'relu': (0.0, None), 'leaky_relu': (None, None),
+    'sigmoid': (0.0, 1.0), 'tanh': (-1.0, 1.0),
+    'sin': (-1.0, 1.0), 'cos': (-1.0, 1.0),
+    'exp': (0.0, None), 'sign': (-1.0, 1.0),
+    'floor': (None, None), 'reciprocal': (None, None),
+    'pow': (None, None),
+}
 
 REL = {'relu': Relu(), 'leaky_relu': LeakyRelu(), 'sigmoid': Sigmoid(),
        'tanh': Tanh(), 'sin': Sin(), 'cos': Cos(), 'exp': Exp(),
