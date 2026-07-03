@@ -674,3 +674,25 @@ dist_shift 72/72, iso 39/39, anchors 46/46, borderline locals
 index112/safenlp/challenging_certified green; malbeware structurally
 MILP-class (documented); cifar100/tinyimagenet hardware-bound locally
 (v1 OOMs on the 8GB part too); lsnc verdict-correct, 1.8x over budget.
+
+### Day-5: error-class triage (no more error verdicts)
+
+Every `error` row from the 94-row matrix is now a verdict or an honest
+unknown: metaroom's zero-generator zonotope reshape -> **unsat 1.2s**;
+monotonic instance_5 was a case-file artifact (**sat 1.2s** via pair
+files); traffic_signs' binarized nets got sign planes/band + an STE
+gradient + a stable exp point (raw-exp softmax decompositions NaN'd
+every attack margin) -> honest unknown, sat rows need a logit-space
+attack (saturated softmax kills gradients; handlers item); nn4sys
+cardinality-dual OOM -> halve-on-OOM screening, honest timeout (the
+class needs v1's multi-sub batched BaB: screening refutes 0/960 groups);
+ml4acopf errors were collaterally fixed by the robustness batch (sat
+rows need attack quality at the 600s budget); vit's bmm gap and every
+future op-coverage gap now surfaces as a logged `not_implemented`
+unknown at one central boundary in verify().
+
+Also: named94 case file rebuilt with real file resolution (91/94; cgan
+rows reference eps values absent from the local benchmark revision).
+Remaining feature work, in value order: nn4sys multi-sub BaB, patches
+(vgg16 + yolo 308 + the sparse dual state), bmm adjoints (vit),
+ml4acopf/traffic_signs attack quality, lsnc last 1.8x.

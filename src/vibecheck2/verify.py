@@ -93,6 +93,21 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     log(f'[vc2] {net}')
 
     groups = _subbox_groups(spec)
+    try:
+        return _verify_groups(net, spec, groups, onnx_path, timeout,
+                              device, alpha_iters, pgd_budget, log, t0)
+    except NotImplementedError as e:
+        # an op-coverage gap (vit bmm adjoints until M6, etc.) is a
+        # feature boundary, not a crash: log it loudly and return the
+        # honest verdict
+        log(f'[vc2] not implemented: {e}; verdict unknown')
+        return 'unknown', {'reason': f'not_implemented: {e}',
+                           'time': time.time() - t0}
+
+
+def _verify_groups(net, spec, groups, onnx_path, timeout, device,
+                   alpha_iters, pgd_budget, log, t0):
+    from vibecheck.spec import VNNSpec
     if len(groups) == 1:
         return _verify_one(net, spec, onnx_path, timeout, device,
                            alpha_iters, pgd_budget, log, t0)
@@ -129,13 +144,25 @@ def _screen_subbox_groups(net, spec, groups, device, log):
     widest = max(net.ops[o].n for o in net.order)
     per_dom = W_all.shape[0] * widest * 4 * 8
     cs = memory.chunk_size(len(groups), per_dom, dev)
-    for i in range(0, len(groups), cs):
+    i = 0
+    while i < len(groups):
         chunk = groups[i:i + cs]
         lo = torch.tensor(np.stack([g[0] for g in chunk]),
                           dtype=torch.float32, device=dev)
         hi = torch.tensor(np.stack([g[1] for g in chunk]),
                           dtype=torch.float32, device=dev)
-        lbq = backward.crown(net, lo, hi, W_all) + b_all
+        try:
+            lbq = backward.crown(net, lo, hi, W_all) + b_all
+        except torch.cuda.OutOfMemoryError:
+            # the shape-only estimate misses crown internals on mega-row
+            # specs (nn4sys cardinality dual); halve and retry -- the one
+            # sanctioned OOM catch pattern
+            torch.cuda.empty_cache()
+            if cs == 1:
+                raise
+            cs = max(1, cs // 2)
+            continue
+        i += len(chunk)
         for k, (glo, ghi, idxs) in enumerate(chunk):
             refuted = all(
                 bool((lbq[k][di_all == d] > 0).any()) for d in idxs)
