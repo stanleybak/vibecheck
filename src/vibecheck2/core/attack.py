@@ -142,10 +142,13 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         y = forward.point(net, x)
         m = margins(y)                                # (R, D)
         overall = m.min(dim=1).values                 # (R,)
+        overall = torch.nan_to_num(overall, nan=float('inf'))
+        # (a softmax tail can NaN under box-extreme logits: exp overflow
+        # times a zero reciprocal; a NaN margin must never win the argmin)
         improved = overall < best_m
         best_x[improved] = x.detach()[improved]
         best_m = torch.minimum(best_m, overall)
-        if (best_m <= 0).any():        # VNNLIB constraints are NON-strict:
+        if (best_m < 0).any():         # VNNLIB constraints are NON-strict:
             break                      # equality satisfies (sat_relu Y_1<=0)
         loss = m.gather(1, target.unsqueeze(1)).clamp(min=-0.05).sum()
         opt.zero_grad(set_to_none=True)

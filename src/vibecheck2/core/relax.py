@@ -272,7 +272,12 @@ class Exp:
     (at x* = ln(chord)), the tightest same-slope band."""
 
     def point(self, x, params=None):
-        return torch.exp(x)
+        # clamp keeps softmax decompositions finite where ORT's fused
+        # (max-shifted) Softmax is finite: raw exp of binarized-net logits
+        # overflows fp32 and inf * reciprocal(inf) NaNs every margin the
+        # attack sees. Order-preserving; CE validation stays with the
+        # exact ORT replay chokepoint.
+        return torch.exp(x.clamp(max=87.0))
 
     def planes(self, lo, hi, params=None):
         w = (hi - lo).clamp_min(1e-12)
@@ -333,9 +338,41 @@ class Pow(_V1Band):
         return PowRelax((params or {})['exponent'])
 
 
+class _SignSTE(torch.autograd.Function):
+    """Exact sign forward with a clipped straight-through gradient, so
+    PGD stays alive on binarized nets (traffic_signs: v1's sign_attack is
+    the same STE idea; a plain torch.sign zeroes every gradient)."""
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return torch.sign(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        (x,) = ctx.saved_tensors
+        return g * (x.abs() <= 1.0).to(g.dtype)
+
+
 class SignFn:
     def point(self, x, params=None):
-        return torch.sign(x)
+        return _SignSTE.apply(x)
+
+    def planes(self, lo, hi, params=None):
+        """sign(x) in {-1, 0, 1}: constant bounds by pre-activation sign
+        (slope-0 planes; exact when the sign is stable). Sound: sign(x)
+        is within [-1, 1] always, [sign(lo), sign(hi)] brackets it on any
+        interval (sign is monotone)."""
+        zl = torch.zeros_like(lo)
+        return zl, torch.sign(lo), zl, torch.sign(hi)
+
+    def band(self, lo, hi, params=None):
+        # center plane slope 0, mid value; delta = half the output range
+        yl, yh = torch.sign(lo), torch.sign(hi)
+        lam = torch.zeros_like(lo)
+        mu = (yl + yh) / 2
+        delta = (yh - yl) / 2
+        return lam, mu, delta
 
 
 class Floor:

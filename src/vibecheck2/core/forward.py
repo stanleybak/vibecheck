@@ -267,6 +267,14 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
 
     def lin_cols(lmap, G):
         Bv, nv, g = G.shape
+        if g == 0:
+            # a degenerate (point) zonotope has no generators; the mapped
+            # width comes from a zero probe (metaroom's tiny-eps boxes
+            # hit this through the wide-dims optimization)
+            n_out = lmap.point(torch.zeros(Bv, nv, device=G.device,
+                                           dtype=G.dtype)).shape[1]
+            return torch.zeros(Bv, n_out, 0, device=G.device,
+                               dtype=G.dtype)
         cols = G.permute(0, 2, 1).reshape(Bv * g, nv)
         out = lmap.lin(cols)
         return out.reshape(Bv, g, -1).permute(0, 2, 1)

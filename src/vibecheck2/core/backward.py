@@ -42,8 +42,9 @@ def _zono_cost_bytes(net, B):
     for name in net.order:
         op = net.ops[name]
         worst = max(worst, op.n * g)
-        if op.kind == 'nonlin' and op.fn == 'relu':
-            g += op.n                          # worst case: all unstable
+        if op.kind == 'nonlin':
+            g += op.n         # worst case: every element adds a fresh gen
+                              # (relu unstable, sigmoid/sign/exp bands)
     return worst * B * 4
 
 
@@ -75,6 +76,11 @@ def intermediates(net, lo, hi):
             return _inter_from_state(net, lambda e: state[e].bounds())
         except NotImplementedError:
             pass                # an op without a zono relaxation yet
+        except torch.cuda.OutOfMemoryError:
+            # the shape-only cost model missed (band nonlins whose fresh
+            # gens only materialize for crossing elements); interval is
+            # the sanctioned degradation, not a crash
+            torch.cuda.empty_cache()
     state = fwd.interval(net, lo, hi, return_state=True)
     return _inter_from_state(net, lambda e: state[e])
 

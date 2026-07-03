@@ -805,9 +805,18 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             # from the BACKWARD builder (v1 reverse_g port): no forward
             # zonotope, unstable rows only, LinMap-generic.
             if r not in state_cache:
-                state_cache[r] = _state_for(
-                    net, lo, hi, inter, dir_adaptive_slopes(row_pos[r]),
-                    device, proj_rows=proj)
+                try:
+                    state_cache[r] = _state_for(
+                        net, lo, hi, inter,
+                        dir_adaptive_slopes(row_pos[r]),
+                        device, proj_rows=proj)
+                except torch.cuda.OutOfMemoryError:
+                    # the forward fallback builder (bilinear/softmax
+                    # nets) can exceed VRAM on band-gen growth; no dual
+                    # for this row, the BaB fall-through still runs
+                    torch.cuda.empty_cache()
+                    log(f'[vc2/dual] state OOM for row {r}; skipping')
+                    state_cache[r] = ({}, [])
             state, keys = state_cache[r]
             if not keys:
                 continue
