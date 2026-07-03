@@ -418,6 +418,46 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             f'{len(open_d)} open')
         if not open_d:
             return 'unsat', {'time': time.time() - t0}
+    if verdict != 'unsat' and open_d:
+        # exact-MILP escalation for spread-slack nets (malbeware,
+        # challenging_certified): the relaxation split tree cannot
+        # converge when the gap spreads thin over thousands of triangles
+        # (measured: 9.6k splits, zero closures), but the triangle-exact
+        # MILP closes them. Gated to relu-only nets small enough to
+        # encode; leaves a slice for the BaB fall-through.
+        n_nonlin_m = sum(net.ops[nm].n for nm in net.order
+                         if net.ops[nm].kind == 'nonlin')
+        relu_only = all(op.fn == 'relu' for op in net.ops.values()
+                        if op.kind == 'nonlin')
+        if relu_only and n_nonlin_m <= 25_000 and budget.remaining() > 25:
+            from .core.milp import refute_rows_milp
+            rows_open = [r for d in open_d
+                         for r in torch.nonzero(di == d, as_tuple=False)
+                         .flatten().tolist()]
+            try:
+                mrefuted, cand = refute_rows_milp(
+                    net, lo, hi, inter, W, b, rows_open,
+                    deadline=time.time() + 0.8 * budget.remaining(),
+                    log=log)
+            except NotImplementedError as e:
+                log(f'[vc2/milp] skipped: {e}')
+                mrefuted, cand = set(), None
+            if cand is not None and onnx_path is not None:
+                from .core import attack
+                okc, vinfo = attack.validate(onnx_path, spec, cand)
+                if okc:
+                    return 'sat', {'witness': np.asarray(
+                        vinfo.get('witness_inbox', cand)),
+                        'time': time.time() - t0}
+                log('[vc2/milp] incumbent rejected by ORT chokepoint')
+            open_d = [d for d in open_d
+                      if not any(int(r) in mrefuted for r in
+                                 torch.nonzero(di == d, as_tuple=False)
+                                 .flatten().tolist())]
+            log(f'[vc2] milp: {len(mrefuted)} rows refuted, '
+                f'{len(open_d)} disjuncts open')
+            if not open_d:
+                return 'unsat', {'time': time.time() - t0}
     if verdict != 'unsat':
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
