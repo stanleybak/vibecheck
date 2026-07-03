@@ -733,9 +733,23 @@ def range_split_dual(net, lo, hi, inter, qw, qb, extra, ver, deadline,
 
 def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                     deadline, device='cpu', log=lambda m: None):
-    """Refute the still-open disjuncts with the dual-ascent BaB, one query
-    row at a time (sibling rows of the disjunct join as extra halfspaces).
-    Returns the set of disjuncts refuted."""
+    """Refute the still-open disjuncts with the dual-ascent BaB; releases
+    the card on exit -- the dual can leave it nearly full (kernel caches,
+    reserved blocks after host-spilled frontiers) and the BaB
+    fall-through then strangles at B=1 (challenging_certified: bounded=0
+    for 90s where a clean card does 1s/round)."""
+    try:
+        return _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi,
+                                     inter, open_d, deadline, device, log)
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
+                          open_d, deadline, device='cpu',
+                          log=lambda m: None):
+    """(the actual per-row loop; see certify_queries)"""
     import time
     from . import backward
     # per-edge CROWN refinement of the pre-activation bounds first: the LP
