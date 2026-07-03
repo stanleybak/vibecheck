@@ -696,3 +696,24 @@ rows reference eps values absent from the local benchmark revision).
 Remaining feature work, in value order: nn4sys multi-sub BaB, patches
 (vgg16 + yolo 308 + the sparse dual state), bmm adjoints (vit),
 ml4acopf/traffic_signs attack quality, lsnc last 1.8x.
+
+### Day-5 continued: multi-sub BaB + memory robustness ladder
+
+nn4sys cardinality-dual drove two things. The feature: multi-sub mode
+in input_split_bab (roots=(lo, hi, row)) -- 960 single-row subboxes
+share ONE frontier and the batched bound, replacing the serial
+per-group pipeline (0.2s each) and the 90s screening that refuted
+0/960. Query rows dedupe to their unique (w, b) pairs first (960 -> 2;
+a stale q had shrunk pops to 1-2 domains). The robustness ladder found
+en route, each a class not a patch: big dense |W| computed in row
+blocks instead of cached (weights alone are 1.75GB on mscn, and |W|
+doubled it); per_dom sizes by the SUM of edge widths (the reforward
+holds every edge, not the widest); the zono->interval fallback moved
+out of the except block (the live traceback pinned 3GB of partial zono
+state while the fallback then OOM'd); and v1's round-level OOM recovery
+(push the batch back, halve, continue) around both the bound and the
+alpha pass. The mscn run went error -> 17.8k domains bounded over the
+full 200s. Remaining for the class: per-leaf bound quality on
+mul/sigmoid nets (closures ~0; use the compare_debug workflow on mscn
+leaf boxes next). Regressions: acasxu 6/6, dist_shift 4/4, iso 36.2s,
+lsnc 52.4s.

@@ -89,7 +89,15 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
             return try_discrete_enum(onnx_path, vnnlib_path, timeout, log)
         except NotImplementedError:
             raise e
-    spec = load_vnnlib(vnnlib_path)
+    try:
+        spec = load_vnnlib(vnnlib_path)
+    except NotImplementedError as e:
+        # nonlinear v2 specs (ml4acopf 2.0) need the augment transpiler
+        # (handlers); a spec the front end cannot represent is a feature
+        # boundary, not a crash
+        log(f'[vc2] spec not supported: {e}; verdict unknown')
+        return 'unknown', {'reason': f'not_implemented: {e}',
+                           'time': time.time() - t0}
     log(f'[vc2] {net}')
 
     groups = _subbox_groups(spec)
@@ -112,10 +120,42 @@ def _verify_groups(net, spec, groups, onnx_path, timeout, device,
         return _verify_one(net, spec, onnx_path, timeout, device,
                            alpha_iters, pgd_budget, log, t0)
     log(f'[vc2] {len(groups)} input-subbox groups (per-disjunct boxes)')
+    if len(groups) > 16 and all(len(idxs) == 1 for _, _, idxs in groups):
+        # single-row-per-group survivors (nn4sys cardinality: 960 subs
+        # over 2 shared W rows): one MULTI-SUB input-split BaB over the
+        # stacked subboxes -- the batched bound amortizes across subs,
+        # where the serial per-group pipeline got 0.2s each and timed out
+        W, b, di = _spec_queries(spec, net.n_out)
+        per_d = {}
+        for i in range(di.shape[0]):
+            per_d.setdefault(int(di[i]), []).append(i)
+        if all(len(per_d.get(idxs[0], ())) == 1 for _, _, idxs in groups):
+            from .core.search import input_split_bab
+            r_lo = torch.tensor(np.stack([np.asarray(g[0]).ravel()
+                                          for g in groups]),
+                                dtype=torch.float32)
+            r_hi = torch.tensor(np.stack([np.asarray(g[1]).ravel()
+                                          for g in groups]),
+                                dtype=torch.float32)
+            r_row = torch.tensor([per_d[idxs[0]][0]
+                                  for _, _, idxs in groups])
+            verdict, binfo = input_split_bab(
+                net, spec, W, b, di, r_lo.min(dim=0).values,
+                r_hi.max(dim=0).values,
+                deadline=t0 + timeout - 2.0, device=device,
+                onnx_path=onnx_path, roots=(r_lo, r_hi, r_row), log=log)
+            log(f'[vc2] multi-sub bab: {verdict} '
+                f'{ {k: v for k, v in binfo.items() if k != "witness"} }')
+            if verdict == 'sat':
+                return 'sat', {'witness': binfo['witness'],
+                               'time': time.time() - t0}
+            if verdict == 'unsat':
+                return 'unsat', {'time': time.time() - t0}
+            return 'unknown', {'time': time.time() - t0}
     if len(groups) > 16:
-        # mega-disjunct screening (nn4sys-style): one batched CROWN pass
-        # over ALL subboxes refutes the easy mass; only survivors get the
-        # full per-group pipeline
+        # mega-disjunct screening for the SERIAL per-group path (multi-sub
+        # instances never reach here: their BaB's first rounds are the
+        # screen, and this pass burned 90s refuting 0/960 on nn4sys)
         groups = _screen_subbox_groups(net, spec, groups, device, log)
         log(f'[vc2] {len(groups)} groups open after batched screening')
     share = ((timeout - (time.time() - t0)) / max(1, len(groups))

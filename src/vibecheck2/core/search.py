@@ -26,16 +26,36 @@ import torch
 from . import attack, backward, debug, memory
 
 
+def _requeue(f_lo, f_hi, f_worst, f_row, batch, blo, bhi, brow):
+    """Push an OOM'd batch back onto the host frontier and halve the
+    batch size (the sanctioned round-level OOM recovery)."""
+    torch.cuda.empty_cache()
+    f_lo = torch.cat([f_lo, blo.cpu()])
+    f_hi = torch.cat([f_hi, bhi.cpu()])
+    f_worst = torch.cat([f_worst,
+                         torch.full((blo.shape[0],), -torch.inf)])
+    if brow is not None:
+        f_row = torch.cat([f_row, brow.cpu()])
+    return f_lo, f_hi, f_worst, f_row, max(64,
+                                           min(batch, blo.shape[0]) // 2)
+
+
 def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     device='cpu', batch=4096, split_dims=2, alpha_iters=8,
                     onnx_path=None, attack_every=8, heuristic=None,
-                    log=lambda m: None):
+                    roots=None, log=lambda m: None):
     """Returns (verdict, info): 'unsat' | 'sat' (+witness) | 'timeout'.
 
     W (q, n_out), bias (q,), disj_idx (q,): the spec query rows.
     lo, hi: (n_in,) root box. Each open domain splits its top `split_dims`
     scoring dims simultaneously (2^k children); domains whose plain-CROWN
     bound lands near zero get a short per-batch alpha pass before splitting.
+
+    roots=(roots_lo (B0, n), roots_hi (B0, n), root_row (B0,)): multi-sub
+    mode (v1 multi-sub BaB; nn4sys mega-disjunct). Every root box is its
+    own single-row sub-instance -- the domain is refuted when ITS row's lb
+    goes positive -- and they all share one frontier, so the batched bound
+    amortizes across the 960 subs instead of a 0.2s-per-group serial loop.
     """
     dev = torch.device(device)
     dt = torch.float32
@@ -54,18 +74,39 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                      if op.kind == 'nonlin'
                      and op.fn in ('relu', 'leaky_relu'))
         heuristic = 'widest' if n_band > n_relu else 'sb'
-    D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
+    _row_map = None
+    if roots is not None:
+        # dedupe the query rows BEFORE q feeds the memory sizing: nn4sys
+        # carries 960 disjunct rows drawn from 2 unique (w, b) pairs, and
+        # a stale q=960 shrank the pop batch to 1-2 domains per round
+        key = torch.cat([W, bias.unsqueeze(1)], dim=1)
+        uniq, _row_map = torch.unique(key, dim=0, return_inverse=True)
+        W = uniq[:, :-1].contiguous()
+        bias = uniq[:, -1].contiguous()
     q = W.shape[0]
-    # per-disjunct row selector (D, q) for the batched refutation check
-    sel = torch.zeros(D, q, device=dev, dtype=torch.bool)
-    sel[disj_idx, torch.arange(q)] = True
+    if roots is not None:
+        D, sel = 0, None       # per-domain rows replace the disjunct map
+    else:
+        D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
+        # per-disjunct row selector (D, q) for the batched refutation check
+        sel = torch.zeros(D, q, device=dev, dtype=torch.bool)
+        sel[disj_idx, torch.arange(q)] = True
 
     # the frontier lives on HOST: a stuck instance grows it to millions of
     # (n_in,) rows (dist_shift index112 hit 250k x 792 and OOM-crashed the
     # GPU mid-bookkeeping); only the popped batch goes to the device
-    f_lo = lo.reshape(1, -1).to('cpu', dt)
-    f_hi = hi.reshape(1, -1).to('cpu', dt)
-    f_worst = torch.full((1,), -torch.inf)
+    if roots is not None:
+        f_lo = roots[0].to('cpu', dt)
+        f_hi = roots[1].to('cpu', dt)
+        f_row = _row_map.cpu()[roots[2].cpu()]
+        f_worst = torch.full((f_lo.shape[0],), -torch.inf)
+        log(f'[vc2/bab] multi-sub: {f_lo.shape[0]} roots over '
+            f'{W.shape[0]} unique rows')
+    else:
+        f_lo = lo.reshape(1, -1).to('cpu', dt)
+        f_hi = hi.reshape(1, -1).to('cpu', dt)
+        f_row = torch.zeros(1, dtype=torch.long)
+        f_worst = torch.full((1,), -torch.inf)
     n_bounded = n_split = rounds = 0
     _round_wall, _round_B = 1.0, 1
     t0 = time.time()
@@ -76,6 +117,10 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     # a cheap reforward intersected with the root bounds (subbox is a
     # subset, so the intersection is sound) -- the abcrown cost model.
     full_refine = n_nonlin <= 1200
+    if roots is not None:
+        full_refine = False              # per-sub boxes vary; root_ref on
+                                         # the UNION box, cheap reforward
+                                         # per batch (still sound)
     if full_refine:
         # identity-CROWN vs forward-zono planes flips by net class (acasxu
         # amplifying weights favor backward refinement; dist_shift sigmoid
@@ -100,14 +145,20 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         except (NotImplementedError, torch.cuda.OutOfMemoryError):
             pass                       # no zono for this net: keep crown
     root_ref = None
-    if not full_refine:
+    if not full_refine and roots is None:
+        # (multi-sub skips this: the union of 960 scattered subboxes is
+        # nearly the whole space, so refining it is GBs of pure cost;
+        # the per-subbox reforward below is the tight part there)
         root_ref = backward.intermediates_crown(
             net, f_lo.to(dev), f_hi.to(dev),
             alpha_iters=(12 if n_nonlin <= 20000 else 0))
 
-    def domain_refuted(lbq):
-        """(B, q) query lbs -> (B, D) refutation matrix."""
+    def domain_refuted(lbq, brow=None):
+        """(B, q) query lbs -> (B, D) refutation matrix; in multi-sub
+        mode a (B, 1) matrix from each domain's OWN row."""
         pos = (lbq + bias) > 0                       # refuting rows
+        if brow is not None:
+            return pos.gather(1, brow.unsqueeze(1))
         refuted = torch.zeros(lbq.shape[0], D, device=dev, dtype=torch.bool)
         for dd in range(D):
             refuted[:, dd] = (pos & sel[dd]).any(dim=1)
@@ -144,8 +195,13 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 and _round_wall / max(_round_B, 1) < 2e-5):
             batch *= 2
         _round_t0 = time.time()
-        # pick the worst-first batch, sized by the memory budget
-        per_dom = q * max(net.ops[o].n for o in net.order) * 4 * 8
+        # pick the worst-first batch, sized by the memory budget: the
+        # reforward holds (lo, hi) for EVERY edge (sum, not max -- mscn's
+        # 116 edges held 3GB at the max-based estimate), the crown adjoint
+        # scales with q x widest
+        total_n = sum(net.ops[o].n for o in net.order)
+        per_dom = (q * max(net.ops[o].n for o in net.order) * 8
+                   + total_n * 4) * 4
         bs = min(batch, memory.chunk_size(f_lo.shape[0], per_dom, dev))
         # worst-first pop via topk (a full argsort over a multi-million
         # frontier cost ~12s of lsnc's 39s run)
@@ -153,49 +209,77 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         keep = torch.ones(f_worst.shape[0], dtype=torch.bool)
         keep[take] = False
         blo, bhi = f_lo[take].to(dev), f_hi[take].to(dev)
+        brow = f_row[take].to(dev) if roots is not None else None
         f_lo, f_hi, f_worst = f_lo[keep], f_hi[keep], f_worst[keep]
+        f_row = f_row[keep]
 
-        if full_refine:
-            # zono-SEEDED identity-CROWN refinement: seeding from forward
-            # zono instead of interval reproduces v1's per-leaf bounds AND
-            # its input linearization A exactly (measured 72/72 split-dim
-            # agreement on iso leaf boxes vs 62/72 interval-seeded; the
-            # equally-tight-but-different A compounded into a 2.3x tree)
-            try:
-                _l, _h, zst = backward.fwd.zono(net, blo, bhi,
-                                                return_state=True)
-                zi = backward._inter_from_state(
-                    net, lambda e: zst[e].bounds())
-                inter = backward.intermediates_crown(net, blo, bhi,
-                                                     base_inter=zi)
-            except (NotImplementedError, torch.cuda.OutOfMemoryError):
-                inter = backward.intermediates_crown(net, blo, bhi)
-        else:
-            B = blo.shape[0]
-            try:
-                # true per-subbox planes from the wide-dims zonotope
-                _l, _h, zst = backward.fwd.zono(net, blo, bhi,
-                                                return_state=True)
-                ib = backward._inter_from_state(
-                    net, lambda e: zst[e].bounds())
-            except (NotImplementedError, torch.cuda.OutOfMemoryError):
-                ib_state = backward.fwd.interval(net, blo, bhi,
-                                                 return_state=True)
-                ib = backward._inter_from_state(net,
-                                                lambda e: ib_state[e])
-            inter = {}
-            for k2, v in root_ref.items():
-                rv = tuple(t.expand(B, -1) for t in v)
-                iv = ib[k2]
-                merged = []
-                for j2 in range(0, len(rv), 2):
-                    merged.append(torch.maximum(rv[j2], iv[j2]))
-                    merged.append(torch.minimum(rv[j2 + 1],
-                                                torch.maximum(iv[j2 + 1],
-                                                              merged[-1])))
-                inter[k2] = tuple(merged)
-        lbq, Ain = backward.crown(net, blo, bhi, W, inter,
-                                  return_input_adjoint=True)
+        try:
+            if full_refine:
+                # zono-SEEDED identity-CROWN refinement: seeding from forward
+                # zono instead of interval reproduces v1's per-leaf bounds AND
+                # its input linearization A exactly (measured 72/72 split-dim
+                # agreement on iso leaf boxes vs 62/72 interval-seeded; the
+                # equally-tight-but-different A compounded into a 2.3x tree)
+                try:
+                    _l, _h, zst = backward.fwd.zono(net, blo, bhi,
+                                                    return_state=True)
+                    zi = backward._inter_from_state(
+                        net, lambda e: zst[e].bounds())
+                    inter = backward.intermediates_crown(net, blo, bhi,
+                                                         base_inter=zi)
+                except (NotImplementedError, torch.cuda.OutOfMemoryError):
+                    inter = backward.intermediates_crown(net, blo, bhi)
+            else:
+                B = blo.shape[0]
+                zst = None
+                try:
+                    # true per-subbox planes from the wide-dims zonotope
+                    _l, _h, zst = backward.fwd.zono(net, blo, bhi,
+                                                    return_state=True)
+                except (NotImplementedError, torch.cuda.OutOfMemoryError):
+                    pass    # fall back BELOW: running the fallback inside
+                            # this handler would pin the zono's partial state
+                            # via the live traceback (mscn: 3GB held while
+                            # the interval pass then OOMs)
+                if zst is not None:
+                    ib = backward._inter_from_state(
+                        net, lambda e: zst[e].bounds())
+                else:
+                    if dev.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    ib_state = backward.fwd.interval(net, blo, bhi,
+                                                     return_state=True)
+                    ib = backward._inter_from_state(net,
+                                                    lambda e: ib_state[e])
+                if root_ref is None:
+                    inter = ib
+                else:
+                    inter = {}
+                    for k2, v in root_ref.items():
+                        rv = tuple(t.expand(B, -1) for t in v)
+                        iv = ib[k2]
+                        merged = []
+                        for j2 in range(0, len(rv), 2):
+                            merged.append(torch.maximum(rv[j2], iv[j2]))
+                            merged.append(torch.minimum(rv[j2 + 1],
+                                                        torch.maximum(iv[j2 + 1],
+                                                                      merged[-1])))
+                        inter[k2] = tuple(merged)
+            lbq, Ain = backward.crown(net, blo, bhi, W, inter,
+                                      return_input_adjoint=True)
+        except torch.cuda.OutOfMemoryError:
+            # v1's round-level pattern: push the popped batch back, halve
+            # the batch, retry (one guard covers every stage of the bound;
+            # per-site chunking got mscn from 1-2 to 366 domains/round,
+            # this catches whatever stage trips next)
+            if batch <= 64:
+                return 'timeout', {'frontier': int(f_lo.shape[0]),
+                                   'bounded': n_bounded,
+                                   'splits': n_split,
+                                   'reason': 'oom_floor'}
+            f_lo, f_hi, f_worst, f_row, batch = _requeue(
+                f_lo, f_hi, f_worst, f_row, batch, blo, bhi, brow)
+            continue
         _round_wall, _round_B = time.time() - _round_t0, blo.shape[0]
         if debug.enabled() and rounds == 1:
             debug.add('bab_root_lb', lbq[0] + bias)
@@ -208,53 +292,71 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         # (cutting real counterexamples: unsound)
         lbq_lin = lbq.clone()
         n_bounded += blo.shape[0]
-        refuted = domain_refuted(lbq)
+        refuted = domain_refuted(lbq, brow)
         open_mask = ~refuted.all(dim=1)
         if os.environ.get('VC2_DEBUG_CLIP') and rounds <= 60:
+            _alloc = (torch.cuda.memory_allocated(dev) / 1e9
+                      if dev.type == 'cuda' else 0)
             log(f'[vc2/round] round={rounds} popped={blo.shape[0]} '
                 f'closed_crown={int(refuted.all(dim=1).sum())} '
-                f'queue={f_lo.shape[0]}')
-        if open_mask.any() and alpha_iters > 0:
-            # alpha on BOUNDARY domains only (v1 boundary_eps=10 with a
-            # 2048 cap): a domain whose worst row is far below zero will
-            # split anyway, and alpha on the whole batch halves the loop
-            # throughput (iso: 33k -> 75k leaves/s)
-            margin = (lbq + bias).max(dim=1).values
-            bmask = open_mask & (margin > -10.0)
-            oi = torch.nonzero(bmask, as_tuple=False).flatten()
-            if oi.numel() > 2048:
-                oi = oi[margin[oi].argsort(descending=True)[:2048]]
-        if open_mask.any() and alpha_iters > 0 and oi.numel():
-            inter_o = {k2: tuple(t[oi] for t in v)
-                       for k2, v in inter.items()}
-            lb_a, al = backward.alpha_crown(net, blo[oi], bhi[oi], W,
-                                            inter_o, iters=alpha_iters,
-                                            thresholds=-bias,
-                                            return_alpha=True)
-            # one extra pass with the final alphas yields a linearization
-            # whose exact concretization is its own bound -- a SOUND
-            # (A, b) upgrade for the clip below (the plain-CROWN pair is
-            # much weaker; pairing alpha bounds with the plain-CROWN A
-            # would over-clip and was the unsound variant)
-            lb_al, Ain_a = backward.crown(net, blo[oi], bhi[oi], W, inter_o,
-                                          al, return_input_adjoint=True)
-            # adopt the alpha linearization ONLY where it beats the plain
-            # one, rowwise (each row's (A_r, b_r) is an independent valid
-            # pair). The final alpha iterate can be WORSE than the plain
-            # slopes (dist_shift: zono-informed chords beat 8-iter alpha);
-            # overwriting unconditionally weakened the clip there and blew
-            # the frontier from 1 split to an OOM.
-            better = lb_al > lbq_lin[oi]
-            lbq_lin[oi] = torch.where(better, lb_al, lbq_lin[oi])
-            Ain[oi] = torch.where(better.unsqueeze(-1), Ain_a, Ain[oi])
-            lbq[oi] = torch.maximum(lbq[oi],
-                                    torch.maximum(lb_a, lb_al))
-            refuted = domain_refuted(lbq)
-            if os.environ.get('VC2_DEBUG_CLIP') and rounds % 16 == 1:
-                log(f'[vc2/alpha] round={rounds} open_pre={oi.numel()} '
-                    f'flipped={int(oi.numel() - (~refuted.all(dim=1)).sum())} '
-                    f'gain={float((lb_a - lbq[oi]).abs().max()):.4f}')
-            open_mask = ~refuted.all(dim=1)
+                f'queue={f_lo.shape[0]} gpu={_alloc:.2f}GB')
+        try:
+            if open_mask.any() and alpha_iters > 0:
+                # alpha on BOUNDARY domains only (v1 boundary_eps=10 with a
+                # 2048 cap): a domain whose worst row is far below zero will
+                # split anyway, and alpha on the whole batch halves the loop
+                # throughput (iso: 33k -> 75k leaves/s)
+                if brow is not None:
+                    margin = (lbq + bias).gather(1,
+                                                 brow.unsqueeze(1)).squeeze(1)
+                else:
+                    margin = (lbq + bias).max(dim=1).values
+                bmask = open_mask & (margin > -10.0)
+                oi = torch.nonzero(bmask, as_tuple=False).flatten()
+                if oi.numel() > 2048:
+                    oi = oi[margin[oi].argsort(descending=True)[:2048]]
+            if open_mask.any() and alpha_iters > 0 and oi.numel():
+                inter_o = {k2: tuple(t[oi] for t in v)
+                           for k2, v in inter.items()}
+                lb_a, al = backward.alpha_crown(net, blo[oi], bhi[oi], W,
+                                                inter_o, iters=alpha_iters,
+                                                thresholds=-bias,
+                                                return_alpha=True)
+                # one extra pass with the final alphas yields a linearization
+                # whose exact concretization is its own bound -- a SOUND
+                # (A, b) upgrade for the clip below (the plain-CROWN pair is
+                # much weaker; pairing alpha bounds with the plain-CROWN A
+                # would over-clip and was the unsound variant)
+                lb_al, Ain_a = backward.crown(net, blo[oi], bhi[oi], W, inter_o,
+                                              al, return_input_adjoint=True)
+                # adopt the alpha linearization ONLY where it beats the plain
+                # one, rowwise (each row's (A_r, b_r) is an independent valid
+                # pair). The final alpha iterate can be WORSE than the plain
+                # slopes (dist_shift: zono-informed chords beat 8-iter alpha);
+                # overwriting unconditionally weakened the clip there and blew
+                # the frontier from 1 split to an OOM.
+                better = lb_al > lbq_lin[oi]
+                lbq_lin[oi] = torch.where(better, lb_al, lbq_lin[oi])
+                Ain[oi] = torch.where(better.unsqueeze(-1), Ain_a, Ain[oi])
+                lbq[oi] = torch.maximum(lbq[oi],
+                                        torch.maximum(lb_a, lb_al))
+                refuted = domain_refuted(lbq, brow)
+                if os.environ.get('VC2_DEBUG_CLIP') and rounds % 16 == 1:
+                    log(f'[vc2/alpha] round={rounds} open_pre={oi.numel()} '
+                        f'flipped={int(oi.numel() - (~refuted.all(dim=1)).sum())} '
+                        f'gain={float((lb_a - lbq[oi]).abs().max()):.4f}')
+                open_mask = ~refuted.all(dim=1)
+        except torch.cuda.OutOfMemoryError:
+            # same round-level recovery for the alpha pass (autograd
+            # graphs over the boundary subset)
+            if batch <= 64:
+                return 'timeout', {'frontier': int(f_lo.shape[0]),
+                                   'bounded': n_bounded,
+                                   'splits': n_split,
+                                   'reason': 'oom_floor'}
+            f_lo, f_hi, f_worst, f_row, batch = _requeue(
+                f_lo, f_hi, f_worst, f_row, batch, blo, bhi, brow)
+            continue
         if open_mask.any():
             olo, ohi = blo[open_mask], bhi[open_mask]
             oA = Ain[open_mask]
@@ -267,20 +369,33 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             # it timeout -- it is the load-bearing certifier, not the alpha)
             oref = refuted[open_mask]
             lbb = (lbq_lin + bias)[open_mask]
-            xl_u = torch.full_like(olo, torch.inf)
-            xh_u = torch.full_like(ohi, -torch.inf)
-            feas_any = torch.zeros(olo.shape[0], dtype=torch.bool,
-                                   device=dev)
-            for dd in range(D):
-                rows = torch.nonzero(sel[dd], as_tuple=False).flatten()
-                clo, chi = clip_domains(olo, ohi, oA, lbb, rows.tolist())
-                feas_d = (((chi - clo).min(dim=1).values >= 0)
-                          & ~oref[:, dd])
-                xl_u = torch.where(feas_d.unsqueeze(1),
-                                   torch.minimum(xl_u, clo), xl_u)
-                xh_u = torch.where(feas_d.unsqueeze(1),
-                                   torch.maximum(xh_u, chi), xh_u)
-                feas_any |= feas_d
+            if brow is not None:
+                # multi-sub: each domain's CE must satisfy exactly ITS
+                # row's halfspace -- a pure conjunction, no union step
+                orow = brow[open_mask]
+                xl_u, xh_u = olo.clone(), ohi.clone()
+                for rr in orow.unique().tolist():
+                    m = orow == rr
+                    clo, chi = clip_domains(olo[m], ohi[m], oA[m],
+                                            lbb[m], [rr])
+                    xl_u[m], xh_u[m] = clo, chi
+                feas_any = (xh_u - xl_u).min(dim=1).values >= 0
+            else:
+                xl_u = torch.full_like(olo, torch.inf)
+                xh_u = torch.full_like(ohi, -torch.inf)
+                feas_any = torch.zeros(olo.shape[0], dtype=torch.bool,
+                                       device=dev)
+                for dd in range(D):
+                    rows = torch.nonzero(sel[dd], as_tuple=False).flatten()
+                    clo, chi = clip_domains(olo, ohi, oA, lbb,
+                                            rows.tolist())
+                    feas_d = (((chi - clo).min(dim=1).values >= 0)
+                              & ~oref[:, dd])
+                    xl_u = torch.where(feas_d.unsqueeze(1),
+                                       torch.minimum(xl_u, clo), xl_u)
+                    xh_u = torch.where(feas_d.unsqueeze(1),
+                                       torch.maximum(xh_u, chi), xh_u)
+                    feas_any |= feas_d
             if os.environ.get('VC2_DEBUG_CLIP') and rounds % 16 == 1:
                 w_pre = (ohi - olo).sum()
                 w_post = ((torch.where(feas_any.unsqueeze(1), xh_u, ohi)
@@ -293,6 +408,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             olo = torch.where(feas_any.unsqueeze(1), xl_u, olo)
             ohi = torch.where(feas_any.unsqueeze(1), xh_u, ohi)
             olo, ohi, oA = olo[feas_any], ohi[feas_any], oA[feas_any]
+            if brow is not None:
+                orow = orow[feas_any]
             lbq_open = (lbq + bias)[open_mask][feas_any]
             if not olo.shape[0]:
                 continue
@@ -329,7 +446,16 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                    'reason': 'host_ram_cap'}
             f_lo = torch.cat([f_lo, ch_lo.cpu()])
             f_hi = torch.cat([f_hi, ch_hi.cpu()])
-            w = lbq_open.min(dim=1).values
+            if brow is not None:
+                w = lbq_open.gather(1, orow.unsqueeze(1)).squeeze(1)
+                f_row = torch.cat([f_row,
+                                   orow.repeat(ch_lo.shape[0]
+                                               // orow.shape[0]).cpu()])
+            else:
+                w = lbq_open.min(dim=1).values
+                f_row = torch.cat([f_row,
+                                   torch.zeros(ch_lo.shape[0],
+                                               dtype=torch.long)])
             f_worst = torch.cat([f_worst,
                                  w.repeat(ch_lo.shape[0] // w.shape[0])
                                  .cpu()])

@@ -79,6 +79,19 @@ class Dense(LinMap):
         return Y @ self._p(self.W, Y)
 
     def lin_abs(self, X):
+        if self.W.size > 25_000_000:
+            # a 12k x 12k dense weight is 576MB on device; caching |W|
+            # doubles the net's resident footprint (mscn_2048d: weights
+            # alone are ~4GB of an 8GB card), and even one transient
+            # full-matrix abs cannot fit next to them -- abs in ~32MB
+            # row blocks instead.
+            Wd = self._p(self.W, X)
+            out = torch.empty(X.shape[0], self.n_out, device=X.device,
+                              dtype=X.dtype)
+            step = max(1, 8_000_000 // max(1, self.n_in))
+            for i in range(0, self.n_out, step):
+                out[:, i:i + step] = X @ Wd[i:i + step].abs().T
+            return out
         if self._absW is None:
             self._absW = np.abs(self.W)
         return X @ self._p(self._absW, X).T
