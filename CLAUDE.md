@@ -73,3 +73,14 @@ taskset -c 0,1 .venv/bin/python -m pytest tests/ -k "not vnncomp" -m "not integr
 Benchmarks live at `~/repositories/vnncomp2026_benchmarks` (see
 `tests/paths.yaml`); parity targets are
 `~/repositories/vnncomp2026_results_official/{vibecheck,alpha_beta_crown}/results.csv`.
+
+## AWS campaign strategy (big-GPU runs)
+
+- GPU work runs on the AWS A10G box, not the local 8GB card (ssh via
+  `scratch/aws_host.txt`; discipline in the aws-g5-box memory note).
+- Sweeps use OFFICIAL competition timeouts (per-instance from
+  `instances.csv`) and run FAIL-FAST: the on-box driver halts at the
+  first MISS; fix the miss locally, rsync `src/` up, relaunch (the
+  durable log at `~/persistent_runs/campaign.log` skips solved rows).
+  Never wait hours for a full pass to see the first failure.
+- Commit locally at each milestone; never push without approval.
