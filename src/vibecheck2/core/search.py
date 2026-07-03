@@ -142,8 +142,9 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             full_refine = c_lb >= z_lb
             log(f'[vc2/bab] refine probe: crown={c_lb:.3f} zono={z_lb:.3f} '
                 f'-> full_refine={full_refine}')
-        except (NotImplementedError, torch.cuda.OutOfMemoryError):
-            pass                       # no zono for this net: keep crown
+        except (NotImplementedError, torch.cuda.OutOfMemoryError) as _pe:
+            backward._warn_once(f'refine probe zono unavailable '
+                                f'({type(_pe).__name__}); keeping crown')
     root_ref = None
     if not full_refine and roots is None:
         # (multi-sub skips this: the union of 960 scattered subboxes is
@@ -155,8 +156,10 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
     def domain_refuted(lbq, brow=None):
         """(B, q) query lbs -> (B, D) refutation matrix; in multi-sub
-        mode a (B, 1) matrix from each domain's OWN row."""
-        pos = (lbq + bias) > 0                       # refuting rows
+        mode a (B, 1) matrix from each domain's OWN row. Only FINITE
+        positive bounds refute (+inf is an artifact, never a proof)."""
+        lbb = lbq + bias
+        pos = (lbb > 0) & torch.isfinite(lbb)        # refuting rows
         if brow is not None:
             return pos.gather(1, brow.unsqueeze(1))
         refuted = torch.zeros(lbq.shape[0], D, device=dev, dtype=torch.bool)
@@ -236,8 +239,13 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     # true per-subbox planes from the wide-dims zonotope
                     _l, _h, zst = backward.fwd.zono(net, blo, bhi,
                                                     return_state=True)
-                except (NotImplementedError, torch.cuda.OutOfMemoryError):
-                    pass    # fall back BELOW: running the fallback inside
+                except (NotImplementedError,
+                        torch.cuda.OutOfMemoryError) as _ze:
+                    backward._warn_once(
+                        f'input-split per-batch zono unavailable '
+                        f'({type(_ze).__name__}: {str(_ze)[:60]}); '
+                        f'interval reforward only')
+                    # fall back BELOW: running the fallback inside
                             # this handler would pin the zono's partial state
                             # via the live traceback (mscn: 3GB held while
                             # the interval pass then OOMs)
@@ -521,7 +529,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
 
     def refuted_of(lbq):
-        pos = (lbq + bias) > 0
+        lbb = lbq + bias
+        pos = (lbb > 0) & torch.isfinite(lbb)
         r = torch.zeros(lbq.shape[0], D, device=dev, dtype=torch.bool)
         for dd in range(D):
             r[:, dd] = (pos & sel[dd]).any(dim=1)

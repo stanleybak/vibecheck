@@ -32,11 +32,15 @@ def _spec_queries(spec, n_out, dtype=torch.float32):
 
 
 def _verdict_from_lbs(lb_plus_bias, disj_idx, n_disjuncts):
-    """'unsat' iff every disjunct has some strictly-positive query row."""
+    """'unsat' iff every disjunct has some strictly-positive FINITE query
+    row (a +inf lower bound is always an arithmetic artifact, never a
+    proof; NaN already fails the comparison)."""
+    import torch as _t
     refuted = set()
     for d in range(n_disjuncts):
         rows = lb_plus_bias[disj_idx == d]
-        if rows.numel() and rows.max() > 0:
+        if rows.numel() and bool(((rows > 0)
+                                  & _t.isfinite(rows)).any()):
             refuted.add(d)
     open_d = [d for d in range(n_disjuncts) if d not in refuted]
     return ('unsat' if not open_d else 'unknown'), open_d

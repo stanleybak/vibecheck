@@ -531,7 +531,7 @@ def _make_host_frontier_verifier(base_cls):
                     # False for NaN, which silently counted garbage nodes
                     # as certified (vit: a NaN-state dual "refuted" all 9
                     # disjuncts in 2 nodes -- a false-unsat generator)
-                    keep = ~(best > _TOL)
+                    keep = ~((best > _TOL) & torch.isfinite(best))
                     ss = sides[keep]
                     l0, l1, nk = o0[keep], o1[keep], onu[keep]
                     pb = best[keep]

@@ -32,6 +32,18 @@ def _pos_part(A):
     return A.clamp(min=0)
 
 
+_WARNED = set()
+
+
+def _warn_once(msg):
+    """Loud, non-spamming: every silent degradation prints ONCE per
+    process so the run log always says what quality level produced the
+    verdict (fail-loud policy; never eat an exception quietly)."""
+    if msg not in _WARNED:
+        _WARNED.add(msg)
+        print(f'[vc2/degrade] {msg}', flush=True)
+
+
 def _zono_cost_bytes(net, B):
     """Projected peak cost of a dense forward zonotope: max over edges of
     B * n_edge * (n_in + #relu elements so far) * 4 bytes. Cheap shape-only
@@ -117,8 +129,9 @@ def intermediates(net, lo, hi):
                     merged.append(torch.maximum(hi2, lo2))
                 out[k2] = tuple(merged)
             return out
-        except NotImplementedError:
-            pass                # an op without a zono relaxation yet
+        except NotImplementedError as e:
+            _warn_once(f'intermediates: zono unavailable ({e}); '
+                       f'interval bounds only')
         except torch.cuda.OutOfMemoryError:
             # the shape-only cost model missed (band nonlins whose fresh
             # gens only materialize for crossing elements); interval is
