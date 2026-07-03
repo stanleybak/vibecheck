@@ -12981,6 +12981,22 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
             _wdb_root = torch.stack(_bpd_root, dim=1).min(dim=1).values
             print(f'[is-batched ROOT] closure_lb={float(_wdb_root.min()):.4f} '
                   f'crown_intermediate={crown_intermediate}', flush=True)
+        # step-debug dump (VC_DEBUG_DUMP): root spec lbs, input
+        # linearization, intermediate bounds, query rows -- the same
+        # schema vc2 writes under VC2_DEBUG_DUMP (compare_debug.py)
+        from .debug_dump import enabled as _dd_on, add as _dd_add
+        if _dd_on() and n_iters == 0:
+            _dd_add('W', torch.stack([spec_ew[k][0] for k in
+                                      sorted(spec_ew)]))
+            _dd_add('bias', torch.tensor([float(spec_ew[k][1])
+                                          for k in sorted(spec_ew)]))
+            _dd_add('spec_lb', spec_lbs_b[0])
+            if A_lin is not None:
+                _dd_add('bab_root_A', A_lin[0])
+                _dd_add('bab_root_lb', spec_lbs_b[0])
+            _dd_add('inter', {k: (v[0][0], v[1][0])
+                              for k, v in sb_b.items()
+                              if isinstance(k, int)})
         if _phase_timing:
             _pt_ts = _pt_mark('bound', _pt_tb)
         unclosed = (~all_disj_closed).nonzero(as_tuple=True)[0]
@@ -13301,6 +13317,10 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                       + (f' ({_branch_why})' if _branch_why else '')
                       + f'  free_dims={int((widths[0] > 0).sum())}'
                       + f'  boost={_branch_boost is not None}', flush=True)
+            from .debug_dump import enabled as _dd_on2, add_seq as _dd_seq
+            if _dd_on2() and n_iters <= 64:
+                _dd_seq('bab_split_dim', int(ax[0].item()))
+                _dd_seq('bab_queue', int(_wl_size(worklist_xl)))
             # Per-iteration split-dim trace (rate-limited) under verbose.
             if (_pp_isb or _dbg_isb) and (n_iters < 8 or n_iters % 50 == 0):
                 _ax0 = int(ax[0].item())

@@ -214,6 +214,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         worst = float((lb + b).min())
         n_nonlin = sum(net.ops[nm].n for nm in net.order
                        if net.ops[nm].kind == 'nonlin')
+    from .core import debug as _dbg
+    if _dbg.enabled():
+        _dbg.add('W', W)
+        _dbg.add('bias', b)
+        _dbg.add('spec_lb', (lb + b) if alpha_iters > 0 else (lb0 + b))
+        _dbg.add('inter', {k: (v[0], v[1]) for k, v in inter.items()
+                           if isinstance(v, tuple) and len(v) == 2})
     if verdict != 'unsat' and wide_route:
         # wide route: most such instances close under input splits with
         # per-leaf zono planes in seconds (dist_shift, acasxu), so try

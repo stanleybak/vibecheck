@@ -23,7 +23,7 @@ import time
 import numpy as np
 import torch
 
-from . import attack, backward, memory
+from . import attack, backward, debug, memory
 
 
 def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
@@ -197,6 +197,11 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         lbq, Ain = backward.crown(net, blo, bhi, W, inter,
                                   return_input_adjoint=True)
         _round_wall, _round_B = time.time() - _round_t0, blo.shape[0]
+        if debug.enabled() and rounds == 1:
+            debug.add('bab_root_lb', lbq[0] + bias)
+            debug.add('bab_root_A', Ain[0])
+        if debug.enabled() and rounds <= 64:
+            debug.add_seq('bab_queue', int(f_lo.shape[0]))
         # the clip bias reconstruction below must use THIS lbq -- it is the
         # exact concretization of Ain; the alpha-improved bound has no
         # matching linearization and an inflated bias would over-clip
@@ -300,6 +305,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 score = oA.abs().sum(dim=1) * (ohi - olo) / 2
             kdims = min(split_dims, olo.shape[1])
             topk = score.topk(kdims, dim=1).indices          # (B, kdims)
+            if debug.enabled() and rounds <= 64:
+                debug.add_seq('bab_split_dim', int(topk[0, 0]))
             ch_lo, ch_hi = olo, ohi
             for j in range(kdims):
                 reps = ch_lo.shape[0] // olo.shape[0]
