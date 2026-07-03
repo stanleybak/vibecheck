@@ -345,16 +345,6 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     dt = torch.float32
     W = W.to(dev, dt)
     bias = bias.to(dev, dt)
-    if heuristic is None:
-        # |A|-sensitivity scoring is informative through relu adjoints but
-        # actively misleading through smooth bands (dist_shift index112:
-        # widest closes in 53 splits where sb dies at 450k domains; v1
-        # ships sb disabled for exactly that class and enabled for the
-        # relu families)
-        banded = any(op.kind == 'nonlin'
-                     and op.fn not in ('relu', 'leaky_relu')
-                     for op in net.ops.values())
-        heuristic = 'widest' if banded else 'sb'
     q = W.shape[0]
     D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
     sel = torch.zeros(D, q, device=dev, dtype=torch.bool)
