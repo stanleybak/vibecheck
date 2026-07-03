@@ -816,6 +816,7 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
         # growing, relu BaB got 40s and bounded nothing)
         per_q = max(2.0, min(left / max(1, len(open_d)) / max(1, len(rows)),
                              0.5 * left))
+        row_t0 = time.time()
         for r in rows:
             # thin state: obj rows are the query + sibling COMBINATIONS
             # already projected (row 0 = this query), so qw/extra_hs are
@@ -887,7 +888,9 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                 try:
                     verdict, info = ver.verify_query(
                         g_state, qw, qb, sk2,
-                        time_limit=min(per_q, deadline - time.time()),
+                        time_limit=min(
+                            max(2.0, per_q - (time.time() - row_t0)),
+                            deadline - time.time()),
                         extra_hs=extra)
                 except (torch._inductor.exc.InductorError,
                         torch.AcceleratorError) as e:

@@ -553,6 +553,9 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         bs = min(batch, memory.chunk_size(len(heap), per_dom, dev))
         batch_doms = [heapq.heappop(heap) for _ in range(min(bs, len(heap)))]
         B = len(batch_doms)
+        if os.environ.get('VC2_DEBUG_CLIP') and rounds <= 6:
+            log(f'[vc2/rbab] round={rounds} start B={B} bs={bs} '
+                f'heap={len(heap)} t={time.time() - t0:.1f}s')
         try:
             blo = lo1.expand(B, -1)
             bhi = hi1.expand(B, -1)

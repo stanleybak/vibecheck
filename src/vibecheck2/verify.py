@@ -349,8 +349,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             worst = float((lb + b).min())
         if verdict != 'unsat' and -1.0 < worst <= 0 and budget.remaining() > 20:
             # near-zero gap: a longer, lower-lr polish often closes it
-            # outright (abcrown runs ~100 root iters; the quick pass is 20)
-            lb2 = backward.alpha_crown(net, lo, hi, W, inter, iters=150,
+            # outright (abcrown runs ~100 root iters; the quick pass is
+            # 20). Iterations scale with the net: 150 crown passes on a
+            # 460k-neuron conv net is ~2.5 minutes -- it silently ate the
+            # whole budget on challenging_certified and the dual + BaB
+            # got literally zero seconds.
+            p_iters = 150 if n_nonlin <= 50_000 else 30
+            lb2 = backward.alpha_crown(net, lo, hi, W, inter, iters=p_iters,
                                        lr=0.1, thresholds=-b,
                                        budget=budget)[0]
             lb = torch.maximum(lb, lb2)
@@ -387,7 +392,9 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                 # the pre-lift polish never saw the lifted intermediates;
                 # a near-zero post-lift gap often closes under the same
                 # long low-lr pass (cifar100 idx_8945: -0.23 after lift)
-                lb2 = backward.alpha_crown(net, lo, hi, W, inter, iters=150,
+                lb2 = backward.alpha_crown(net, lo, hi, W, inter,
+                                           iters=(150 if n_nonlin <= 50_000
+                                                  else 30),
                                            lr=0.1, thresholds=-b,
                                            budget=budget)[0]
                 lb0 = torch.maximum(lb0, lb2)
