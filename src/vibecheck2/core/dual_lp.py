@@ -447,15 +447,39 @@ def _make_host_frontier_verifier(base_cls):
             nodes_total = 0
             depth = 1
             peak = 2
+            # segment stash: survivors awaiting their split, parked on CPU
+            # when building all children at once would blow RAM. BFS breadth
+            # doubles per depth, but it need not be RESIDENT: resolve one
+            # segment to exhaustion (its subtrees certify and free), then
+            # pop the next. Peak memory = segment size, not tree breadth.
+            stash = []
 
             def _unknown(open_n, reason):
                 return 'unknown', dict(nodes=nodes_total, depth=depth,
                                        peak_frontier=peak, open=int(open_n),
                                        reason=reason, wall=elapsed())
 
-            while sides.shape[0] > 0:
+            def _open_total():
+                return sides.shape[0] + sum(s[1].shape[0] * 2
+                                            for s in stash)
+
+            while sides.shape[0] > 0 or stash:
+                if sides.shape[0] == 0:
+                    d0, ss, l0, l1, nk, pb = stash.pop()
+                    z8 = torch.zeros(ss.shape[0], 1, dtype=torch.int8)
+                    zf = torch.zeros(ss.shape[0], 1)
+                    sides = torch.cat([torch.cat([ss, z8], 1),
+                                       torch.cat([ss, z8 + 1], 1)], 0)
+                    lam0 = torch.cat([torch.cat([l0, zf], 1),
+                                      torch.cat([l0, zf], 1)], 0)
+                    lam1 = torch.cat([torch.cat([l1, zf], 1),
+                                      torch.cat([l1, zf], 1)], 0)
+                    nu = torch.cat([nk, nk], 0)
+                    floor = torch.cat([pb, pb])
+                    depth = d0 + 1
+                    on_host = True
                 if elapsed() > time_limit:
-                    return _unknown(sides.shape[0], 'time_limit')
+                    return _unknown(_open_total(), 'time_limit')
                 if stop_event is not None and stop_event.is_set():
                     return _unknown(sides.shape[0], 'stopped')
                 nodes_total += sides.shape[0]
@@ -485,11 +509,22 @@ def _make_host_frontier_verifier(base_cls):
                             ss, l0, l1 = ss.cpu(), l0.cpu(), l1.cpu()
                             nk, pb = nk.cpu(), pb.cpu()
                             on_host = True
-                    if on_host and need > _host_ram_room() * 0.6:
-                        # graceful RAM ceiling, re-read per depth: 'unknown'
-                        # beats the scope's OOM kill, which loses the
-                        # verdict entirely
-                        return _unknown(2 * ss.shape[0], 'host_ram_cap')
+                    if on_host and need > _host_ram_room() * 0.4:
+                        # split the survivors instead of bailing: build
+                        # children for a RAM-sized head, stash the tail
+                        # (bounded parents; their split is a cheap cat on
+                        # resume). Bail only when even a minimal segment
+                        # cannot fit.
+                        per_node = 2 * 2 * (9 * (depth + 1) + 4 * M + 4)
+                        h = int(_host_ram_room() * 0.4 // per_node)
+                        if h < 1024:
+                            return _unknown(_open_total(), 'host_ram_cap')
+                        if h < ss.shape[0]:
+                            stash.append((depth, ss[h:].cpu(), l0[h:].cpu(),
+                                          l1[h:].cpu(), nk[h:].cpu(),
+                                          pb[h:].cpu()))
+                            ss, l0, l1 = ss[:h], l0[:h], l1[:h]
+                            nk, pb = nk[:h], pb[:h]
                     z8 = torch.zeros(ss.shape[0], 1, device=ss.device,
                                      dtype=torch.int8)
                     zf = torch.zeros(ss.shape[0], 1, device=ss.device)
