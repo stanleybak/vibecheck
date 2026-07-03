@@ -368,6 +368,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     n_bounded = rounds = 0
     t0 = time.time()
 
+
     def refuted_of(lbq):
         pos = (lbq + bias) > 0
         r = torch.zeros(lbq.shape[0], D, device=dev, dtype=torch.bool)
@@ -420,9 +421,12 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 merged.append(torch.maximum(rv[j2], iv[j2]))
                 merged.append(torch.minimum(rv[j2 + 1], iv[j2 + 1]))
             inter[k2] = tuple(merged)
-        if n_relu_total <= 20000:
-            # small net: per-batch CROWN refinement of the merged bounds
-            # under the clamps (the tightener that carried input-split)
+        if n_relu_total <= 2000:
+            # small net (acasxu class): per-batch CROWN refinement of the
+            # merged bounds under the clamps. NOT for wide layers: the
+            # identity blocks scale with unstable count x batch (malbeware,
+            # 7842 unstable: 6 domains/s vs the fixed-root regime; abcrown
+            # runs fixed root intermediates + beta only on this class)
             inter = backward.intermediates_crown(net, blo, bhi,
                                                  base_inter=inter,
                                                  clamps=clamps,

@@ -628,3 +628,28 @@ costs nothing when it wins), then alpha=20 with the rest. instance_3
 Category sweeps at official budgets after the whole diagnosis arc:
 **iso 39/39, dist_shift 72/72, anchors 46/46** (previous session state:
 iso untested, dist_shift 70/72 with two unsound-clip artifacts).
+
+### Day-4 continued: malbeware diagnosed to its structure
+
+The malbeware borderline row (v1 17s local) exposed two things. First a
+real fix: relu-split BaB ran per-batch identity-CROWN refinement on a
+7842-unstable single-hidden-layer net (6 domains/s); that tightener is
+for the acasxu class, and the gate now cuts off at 2000 relus (30x
+throughput, abcrown's fixed-root + beta regime). Second, a measured
+dead end: the query's slack (gap 1.43 of 8.85 total triangle slack) is
+spread evenly over 7842 near-orthogonal neurons -- the best BaBSR split
+is worth 0.007, so any split tree needs depth ~200. The zonotope-band
+dual saturates at -1.69 (kernel ascent flatlines), and a batched
+box+halfspace Lagrangian tightening of the layer under first-layer
+clamp halfspaces (implemented, validated sound against the exact LP,
+then removed) tightened only 9/7842 neurons: in 4096 dimensions one
+halfspace is near-orthogonal to every other weight row. v1 closes this
+class with its legacy phase-8 (converged per-node dual / Gurobi MILP
+racing with all-binary encodings). Honest status: wide-shallow
+MILP-class instances stay open in vc2 pending an escalation decision
+(vc2 core stays Gurobi-free by design; a handlers/ MILP escalation via
+the v1 machinery is the candidate).
+
+Locally-feasible borderline set otherwise: index112 3.1s, safenlp 2.4s,
+challenging_certified 14.8s all green; cifar100/tinyimagenet rows are
+hardware-bound locally (v1 OOMs on the 8GB part too).
