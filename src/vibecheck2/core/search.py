@@ -488,7 +488,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
 
 def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
-                   device='cpu', batch=256, beta_iters=12, onnx_path=None,
+                   device='cpu', batch=256, beta_iters=None, onnx_path=None,
                    attack_every=16, root_inter=None, log=lambda m: None):
     """ReLU-phase splitting BaB (no-reforward): intermediates stay ROOT
     bounds; each domain carries sign clamps, and the bound comes from
@@ -510,6 +510,13 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     sel[disj_idx, torch.arange(q)] = True
     lo1 = lo.reshape(1, -1).to(dev, dt)
     hi1 = hi.reshape(1, -1).to(dev, dt)
+    if beta_iters is None:
+        # each beta iteration is a full backward pass; on a 460k-neuron
+        # conv net 12 iterations make ONE round cost ~40s (bounded=0 at
+        # the halt). Scale effort to the net so rounds complete.
+        n_nl = sum(net.ops[nm].n for nm in net.order
+                   if net.ops[nm].kind == 'nonlin')
+        beta_iters = 12 if n_nl <= 50_000 else 4
 
     if root_inter is None:
         root_inter = backward.intermediates(net, lo1, hi1)

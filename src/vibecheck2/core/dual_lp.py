@@ -797,7 +797,11 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
         left = deadline - time.time()
         if left <= 1.0:
             break
-        per_q = max(2.0, left / max(1, len(open_d)) / max(1, len(rows)))
+        # cap the dual's share: a diverging frontier must not starve the
+        # BaB fall-through (challenging_certified: 490s at 19M open and
+        # growing, relu BaB got 40s and bounded nothing)
+        per_q = max(2.0, min(left / max(1, len(open_d)) / max(1, len(rows)),
+                             0.5 * left))
         for r in rows:
             # thin state: obj rows are the query + sibling COMBINATIONS
             # already projected (row 0 = this query), so qw/extra_hs are
