@@ -17,6 +17,7 @@ validated hit ends the search with 'sat'.
 """
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -27,7 +28,8 @@ from . import attack, backward, memory
 
 def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     device='cpu', batch=4096, split_dims=2, alpha_iters=8,
-                    onnx_path=None, attack_every=8, log=lambda m: None):
+                    onnx_path=None, attack_every=8, heuristic=None,
+                    log=lambda m: None):
     """Returns (verdict, info): 'unsat' | 'sat' (+witness) | 'timeout'.
 
     W (q, n_out), bias (q,), disj_idx (q,): the spec query rows.
@@ -39,15 +41,28 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     dt = torch.float32
     W = W.to(dev, dt)
     bias = bias.to(dev, dt)
+    if heuristic is None:
+        # |A|-sensitivity scoring is informative through relu adjoints but
+        # actively misleading through smooth bands (dist_shift index112:
+        # widest closes in 53 splits where sb dies at 450k domains; v1
+        # ships sb disabled for exactly that class and enabled for the
+        # relu families)
+        banded = any(op.kind == 'nonlin'
+                     and op.fn not in ('relu', 'leaky_relu')
+                     for op in net.ops.values())
+        heuristic = 'widest' if banded else 'sb'
     D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
     q = W.shape[0]
     # per-disjunct row selector (D, q) for the batched refutation check
     sel = torch.zeros(D, q, device=dev, dtype=torch.bool)
     sel[disj_idx, torch.arange(q)] = True
 
-    f_lo = lo.reshape(1, -1).to(dev, dt)
-    f_hi = hi.reshape(1, -1).to(dev, dt)
-    f_worst = torch.full((1,), -torch.inf, device=dev)
+    # the frontier lives on HOST: a stuck instance grows it to millions of
+    # (n_in,) rows (dist_shift index112 hit 250k x 792 and OOM-crashed the
+    # GPU mid-bookkeeping); only the popped batch goes to the device
+    f_lo = lo.reshape(1, -1).to('cpu', dt)
+    f_hi = hi.reshape(1, -1).to('cpu', dt)
+    f_worst = torch.full((1,), -torch.inf)
     n_bounded = n_split = rounds = 0
     t0 = time.time()
     n_nonlin = sum(net.ops[nm].n for nm in net.order
@@ -65,14 +80,15 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         # children and keep the winner.
         wax = int((f_hi - f_lo).argmax())
         mid = (f_lo[0, wax] + f_hi[0, wax]) / 2
-        plo, phi = f_lo.repeat(2, 1), f_hi.repeat(2, 1)
+        plo = f_lo.repeat(2, 1).to(dev)
+        phi = f_hi.repeat(2, 1).to(dev)
         phi[0, wax] = mid
         plo[1, wax] = mid
         try:
             _l, _h, zst = backward.fwd.zono(net, plo, phi, return_state=True)
             zi = backward._inter_from_state(net, lambda e: zst[e].bounds())
             z_lb = float((backward.crown(net, plo, phi, W, zi) + bias).min())
-            ci = backward.intermediates_crown(net, plo, phi)
+            ci = backward.intermediates_crown(net, plo, phi, base_inter=zi)
             c_lb = float((backward.crown(net, plo, phi, W, ci) + bias).min())
             full_refine = c_lb >= z_lb
             log(f'[vc2/bab] refine probe: crown={c_lb:.3f} zono={z_lb:.3f} '
@@ -82,7 +98,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     root_ref = None
     if not full_refine:
         root_ref = backward.intermediates_crown(
-            net, f_lo, f_hi, alpha_iters=(12 if n_nonlin <= 20000 else 0))
+            net, f_lo.to(dev), f_hi.to(dev),
+            alpha_iters=(12 if n_nonlin <= 20000 else 0))
 
     def domain_refuted(lbq):
         """(B, q) query lbs -> (B, D) refutation matrix."""
@@ -118,11 +135,24 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         bs = min(batch, memory.chunk_size(f_lo.shape[0], per_dom, dev))
         order = torch.argsort(f_worst)                # least-verified first
         take, keep = order[:bs], order[bs:]
-        blo, bhi = f_lo[take], f_hi[take]
+        blo, bhi = f_lo[take].to(dev), f_hi[take].to(dev)
         f_lo, f_hi, f_worst = f_lo[keep], f_hi[keep], f_worst[keep]
 
         if full_refine:
-            inter = backward.intermediates_crown(net, blo, bhi)
+            # zono-SEEDED identity-CROWN refinement: seeding from forward
+            # zono instead of interval reproduces v1's per-leaf bounds AND
+            # its input linearization A exactly (measured 72/72 split-dim
+            # agreement on iso leaf boxes vs 62/72 interval-seeded; the
+            # equally-tight-but-different A compounded into a 2.3x tree)
+            try:
+                _l, _h, zst = backward.fwd.zono(net, blo, bhi,
+                                                return_state=True)
+                zi = backward._inter_from_state(
+                    net, lambda e: zst[e].bounds())
+                inter = backward.intermediates_crown(net, blo, bhi,
+                                                     base_inter=zi)
+            except (NotImplementedError, torch.cuda.OutOfMemoryError):
+                inter = backward.intermediates_crown(net, blo, bhi)
         else:
             B = blo.shape[0]
             try:
@@ -149,47 +179,107 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 inter[k2] = tuple(merged)
         lbq, Ain = backward.crown(net, blo, bhi, W, inter,
                                   return_input_adjoint=True)
+        # the clip bias reconstruction below must use THIS lbq -- it is the
+        # exact concretization of Ain; the alpha-improved bound has no
+        # matching linearization and an inflated bias would over-clip
+        # (cutting real counterexamples: unsound)
+        lbq_lin = lbq.clone()
         n_bounded += blo.shape[0]
         refuted = domain_refuted(lbq)
         open_mask = ~refuted.all(dim=1)
+        if os.environ.get('VC2_DEBUG_CLIP') and rounds <= 60:
+            log(f'[vc2/round] round={rounds} popped={blo.shape[0]} '
+                f'closed_crown={int(refuted.all(dim=1).sum())} '
+                f'queue={f_lo.shape[0]}')
         if open_mask.any() and alpha_iters > 0:
-            # short alpha pass on the still-open domains only
-            oi = torch.nonzero(open_mask, as_tuple=False).flatten()
+            # alpha on BOUNDARY domains only (v1 boundary_eps=10 with a
+            # 2048 cap): a domain whose worst row is far below zero will
+            # split anyway, and alpha on the whole batch halves the loop
+            # throughput (iso: 33k -> 75k leaves/s)
+            margin = (lbq + bias).max(dim=1).values
+            bmask = open_mask & (margin > -10.0)
+            oi = torch.nonzero(bmask, as_tuple=False).flatten()
+            if oi.numel() > 2048:
+                oi = oi[margin[oi].argsort(descending=True)[:2048]]
+        if open_mask.any() and alpha_iters > 0 and oi.numel():
             inter_o = {k2: tuple(t[oi] for t in v)
                        for k2, v in inter.items()}
-            lb_a = backward.alpha_crown(net, blo[oi], bhi[oi], W, inter_o,
-                                        iters=alpha_iters, thresholds=-bias)
-            lbq[oi] = torch.maximum(lbq[oi], lb_a)
+            lb_a, al = backward.alpha_crown(net, blo[oi], bhi[oi], W,
+                                            inter_o, iters=alpha_iters,
+                                            thresholds=-bias,
+                                            return_alpha=True)
+            # one extra pass with the final alphas yields a linearization
+            # whose exact concretization is its own bound -- a SOUND
+            # (A, b) upgrade for the clip below (the plain-CROWN pair is
+            # much weaker; pairing alpha bounds with the plain-CROWN A
+            # would over-clip and was the unsound variant)
+            lb_al, Ain_a = backward.crown(net, blo[oi], bhi[oi], W, inter_o,
+                                          al, return_input_adjoint=True)
+            # adopt the alpha linearization ONLY where it beats the plain
+            # one, rowwise (each row's (A_r, b_r) is an independent valid
+            # pair). The final alpha iterate can be WORSE than the plain
+            # slopes (dist_shift: zono-informed chords beat 8-iter alpha);
+            # overwriting unconditionally weakened the clip there and blew
+            # the frontier from 1 split to an OOM.
+            better = lb_al > lbq_lin[oi]
+            lbq_lin[oi] = torch.where(better, lb_al, lbq_lin[oi])
+            Ain[oi] = torch.where(better.unsqueeze(-1), Ain_a, Ain[oi])
+            lbq[oi] = torch.maximum(lbq[oi],
+                                    torch.maximum(lb_a, lb_al))
             refuted = domain_refuted(lbq)
+            if os.environ.get('VC2_DEBUG_CLIP') and rounds % 16 == 1:
+                log(f'[vc2/alpha] round={rounds} open_pre={oi.numel()} '
+                    f'flipped={int(oi.numel() - (~refuted.all(dim=1)).sum())} '
+                    f'gain={float((lb_a - lbq[oi]).abs().max()):.4f}')
             open_mask = ~refuted.all(dim=1)
         if open_mask.any():
             olo, ohi = blo[open_mask], bhi[open_mask]
             oA = Ain[open_mask]
-            # clip each single-open-disjunct domain to the halfspaces its
-            # counterexample must satisfy (sound; often empties the box)
+            # ABC clip, per disjunct (v1 / abcrown clip_input_domain): a CE
+            # satisfying disjunct d must lie in ALL of d's halfspaces
+            # L_r(x) <= 0, so clip the box against each open disjunct's
+            # rows; the domain shrinks to the UNION of the per-disjunct
+            # boxes and is VERIFIED outright when every polytope is empty
+            # (iso instance_3: v1 with this clip 55s / ~2.5k queue, without
+            # it timeout -- it is the load-bearing certifier, not the alpha)
             oref = refuted[open_mask]
-            single = (~oref).sum(dim=1) == 1
-            if single.any():
-                dd_open = (~oref[single]).float().argmax(dim=1)
-                lbb = (lbq + bias)[open_mask][single]
-                slo, shi = olo[single], ohi[single]
-                for dd in dd_open.unique().tolist():
-                    m = dd_open == dd
-                    rows = torch.nonzero(sel[dd], as_tuple=False).flatten()
-                    clo, chi = clip_domains(slo[m], shi[m], oA[single][m],
-                                            lbb[m], rows.tolist())
-                    slo[m], shi[m] = clo, chi
-                olo[single], ohi[single] = slo, shi
-                nonempty = (ohi - olo).min(dim=1).values >= 0
-                olo, ohi, oA = olo[nonempty], ohi[nonempty], oA[nonempty]
-                lbq_open = (lbq + bias)[open_mask][nonempty]
-            else:
-                lbq_open = (lbq + bias)[open_mask]
+            lbb = (lbq_lin + bias)[open_mask]
+            xl_u = torch.full_like(olo, torch.inf)
+            xh_u = torch.full_like(ohi, -torch.inf)
+            feas_any = torch.zeros(olo.shape[0], dtype=torch.bool,
+                                   device=dev)
+            for dd in range(D):
+                rows = torch.nonzero(sel[dd], as_tuple=False).flatten()
+                clo, chi = clip_domains(olo, ohi, oA, lbb, rows.tolist())
+                feas_d = (((chi - clo).min(dim=1).values >= 0)
+                          & ~oref[:, dd])
+                xl_u = torch.where(feas_d.unsqueeze(1),
+                                   torch.minimum(xl_u, clo), xl_u)
+                xh_u = torch.where(feas_d.unsqueeze(1),
+                                   torch.maximum(xh_u, chi), xh_u)
+                feas_any |= feas_d
+            if os.environ.get('VC2_DEBUG_CLIP') and rounds % 16 == 1:
+                w_pre = (ohi - olo).sum()
+                w_post = ((torch.where(feas_any.unsqueeze(1), xh_u, ohi)
+                           - torch.where(feas_any.unsqueeze(1), xl_u, olo))
+                          .clamp(min=0).sum())
+                log(f'[vc2/clip] round={rounds} open={olo.shape[0]} '
+                    f'clip_closed={int((~feas_any).sum())} '
+                    f'shrink={float(w_post / w_pre.clamp(min=1e-30)):.4f} '
+                    f'open_disj_mean={float((~oref).float().sum(1).mean()):.2f}')
+            olo = torch.where(feas_any.unsqueeze(1), xl_u, olo)
+            ohi = torch.where(feas_any.unsqueeze(1), xh_u, ohi)
+            olo, ohi, oA = olo[feas_any], ohi[feas_any], oA[feas_any]
+            lbq_open = (lbq + bias)[open_mask][feas_any]
             if not olo.shape[0]:
                 continue
             # Smart-Branching: estimated improvement per input dim; split the
-            # top `split_dims` dims simultaneously -> 2^k children
-            score = oA.abs().sum(dim=1) * (ohi - olo) / 2
+            # top `split_dims` dims simultaneously -> 2^k children.
+            # 'widest' ignores sensitivity (v1's dist_shift setting).
+            if heuristic == 'widest':
+                score = ohi - olo
+            else:
+                score = oA.abs().sum(dim=1) * (ohi - olo) / 2
             kdims = min(split_dims, olo.shape[1])
             topk = score.topk(kdims, dim=1).indices          # (B, kdims)
             ch_lo, ch_hi = olo, ohi
@@ -203,11 +293,21 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 right_lo.scatter_(1, kk, mid)
                 ch_lo = torch.cat([ch_lo, right_lo])
                 ch_hi = torch.cat([left_hi, ch_hi])
-            f_lo = torch.cat([f_lo, ch_lo])
-            f_hi = torch.cat([f_hi, ch_hi])
+            from .dual_lp import _host_ram_room
+            need = 2 * 4 * (f_lo.shape[0] + ch_lo.shape[0]) * ch_lo.shape[1]
+            if need > _host_ram_room() * 0.5:
+                # graceful stop beats the cgroup OOM kill (which loses the
+                # verdict); the caller treats timeout as unknown
+                return 'timeout', {'frontier': int(f_lo.shape[0]),
+                                   'bounded': n_bounded,
+                                   'splits': n_split,
+                                   'reason': 'host_ram_cap'}
+            f_lo = torch.cat([f_lo, ch_lo.cpu()])
+            f_hi = torch.cat([f_hi, ch_hi.cpu()])
             w = lbq_open.min(dim=1).values
             f_worst = torch.cat([f_worst,
-                                 w.repeat(ch_lo.shape[0] // w.shape[0])])
+                                 w.repeat(ch_lo.shape[0] // w.shape[0])
+                                 .cpu()])
             n_split += int(w.shape[0])
 
             if onnx_path is not None and rounds % attack_every == 1:
@@ -245,6 +345,16 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     dt = torch.float32
     W = W.to(dev, dt)
     bias = bias.to(dev, dt)
+    if heuristic is None:
+        # |A|-sensitivity scoring is informative through relu adjoints but
+        # actively misleading through smooth bands (dist_shift index112:
+        # widest closes in 53 splits where sb dies at 450k domains; v1
+        # ships sb disabled for exactly that class and enabled for the
+        # relu families)
+        banded = any(op.kind == 'nonlin'
+                     and op.fn not in ('relu', 'leaky_relu')
+                     for op in net.ops.values())
+        heuristic = 'widest' if banded else 'sb'
     q = W.shape[0]
     D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
     sel = torch.zeros(D, q, device=dev, dtype=torch.bool)

@@ -214,7 +214,28 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         worst = float((lb + b).min())
         n_nonlin = sum(net.ops[nm].n for nm in net.order
                        if net.ops[nm].kind == 'nonlin')
-        if verdict != 'unsat' and not wide_route and n_nonlin <= 20000 \
+    if verdict != 'unsat' and wide_route:
+        # wide route: most such instances close under input splits with
+        # per-leaf zono planes in seconds (dist_shift, acasxu), so try
+        # that FIRST on a budget slice; the borderline rows that instead
+        # need lift + dual (index112: v1 spends 96.8s there) fall through
+        # to the normal heavy pipeline below on a miss
+        from .core.search import input_split_bab
+        slice_end = time.time() + max(20.0, 0.75 * budget.remaining())
+        verdict, binfo = input_split_bab(
+            net, spec, W, b, di, lo[0], hi[0],
+            deadline=min(t0 + timeout - 2.0, slice_end), device=device,
+            onnx_path=onnx_path, log=log)
+        log(f'[vc2] input_split_bab (wide slice): {verdict} '
+            f'{ {k: v for k, v in binfo.items() if k != "witness"} }')
+        if verdict == 'sat':
+            return 'sat', {'witness': binfo['witness'],
+                           'time': time.time() - t0}
+        if verdict == 'unsat':
+            return 'unsat', {'time': time.time() - t0}
+        verdict = 'unknown'
+    if verdict != 'unsat' and alpha_iters > 0:
+        if verdict != 'unsat' and n_nonlin <= 20000 \
                 and budget.remaining() > 15:
             # joint-intermediate alpha refresh (v1 phase-0.5): re-derive the
             # intermediate bounds with alpha-optimized identity rows, then
@@ -245,7 +266,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                                 len(spec.disjuncts))
             log(f'[vc2] alpha-polish: worst={float((lb + b).min()):.4f} '
                 f'open={len(open_d)}/{len(spec.disjuncts)}')
-    if verdict != 'unsat' and not wide_route and len(open_d) == 1:
+    if verdict != 'unsat' and len(open_d) == 1:
         # zono-lift (v1 phase 2.5): exact box+halfspace LP tightening of
         # every pre-activation under the open disjunct's own output rows.
         # Region-conditional, hence scoped to the single-open-disjunct case
@@ -284,7 +305,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     f'open={len(open_d)}/{len(spec.disjuncts)}')
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
-    if verdict != 'unsat' and not wide_route:
+    if verdict != 'unsat':
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
         # refuter. The state builds BACKWARD (unstable rows only, chunked),
@@ -304,7 +325,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # target; the two loops share bound/attack machinery meanwhile)
         from .core.search import input_split_bab, relu_split_bab
         kw = {}
-        if wide_route:
+        if n_wide <= 32:
             bab = input_split_bab
         else:
             bab = relu_split_bab
