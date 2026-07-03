@@ -221,18 +221,25 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # need lift + dual (index112: v1 spends 96.8s there) fall through
         # to the normal heavy pipeline below on a miss
         from .core.search import input_split_bab
-        slice_end = time.time() + max(20.0, 0.75 * budget.remaining())
-        verdict, binfo = input_split_bab(
-            net, spec, W, b, di, lo[0], hi[0],
-            deadline=min(t0 + timeout - 2.0, slice_end), device=device,
-            onnx_path=onnx_path, log=log)
-        log(f'[vc2] input_split_bab (wide slice): {verdict} '
-            f'{ {k: v for k, v in binfo.items() if k != "witness"} }')
-        if verdict == 'sat':
-            return 'sat', {'witness': binfo['witness'],
-                           'time': time.time() - t0}
-        if verdict == 'unsat':
-            return 'unsat', {'time': time.time() - t0}
+        # two-stage alpha escalation: the boundary-alpha depth is a
+        # knife-edge lever (iso instance_3 closes at 8 iters and dies at
+        # 20; instance_31 the exact opposite -- deeper alpha both closes
+        # marginal leaves AND steers splits off-tree via the adopted
+        # linearizations). Stage 1 costs nothing when it wins.
+        for ai, frac in ((8, 0.7), (20, 0.9)):
+            slice_end = time.time() + max(20.0, frac * budget.remaining())
+            verdict, binfo = input_split_bab(
+                net, spec, W, b, di, lo[0], hi[0],
+                deadline=min(t0 + timeout - 2.0, slice_end), device=device,
+                alpha_iters=ai, onnx_path=onnx_path, log=log)
+            log(f'[vc2] input_split_bab (wide slice, alpha={ai}): '
+                f'{verdict} '
+                f'{ {k: v for k, v in binfo.items() if k != "witness"} }')
+            if verdict == 'sat':
+                return 'sat', {'witness': binfo['witness'],
+                               'time': time.time() - t0}
+            if verdict == 'unsat':
+                return 'unsat', {'time': time.time() - t0}
         verdict = 'unknown'
     if verdict != 'unsat' and alpha_iters > 0:
         if verdict != 'unsat' and n_nonlin <= 20000 \

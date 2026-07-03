@@ -533,3 +533,98 @@ Three durable fixes, all measured:
 Results: index7901 timeout -> **unsat 1.8s (1 split, 5 domains)**;
 index112 (v1's border-vcslow row: 96.8s, abcrown 11.1s) -> **unsat
 2.0s**; easy sat/unsat rows stay green at ~1.1s.
+
+### Day-3 continued: cora img100 closes; input-split clip rebuilt; iso diagnosed
+
+The hybrid GPU/host dual frontier (spill to RAM near VRAM pressure,
+cgroup-aware graceful cap) closed cora img100 cifar10-set (**unsat 6.4s
+vs v1 12.3s**; previously frontier-OOM). cifar100 idx_8945 doubles its
+node ceiling (23.5M) but needs ~100M+: hardware-limited locally (v1
+closed it at 87.9s only on competition hardware; abcrown missed).
+
+Input-split BaB clip work, driven by iso instance_3 (v1 55s local, mine
+timeout):
+
+- **Soundness fix**: the clip's bias reconstruction used the
+  alpha-improved lbq against the plain-CROWN input adjoint; the inflated
+  bias over-clips and can cut real counterexamples. The sound and
+  STRONGER replacement derives the linearization from the final alphas
+  (one extra crown pass): the (A, b) pair is exact for its own bound.
+  acasxu 3_3 prop_2, which had silently been riding the unsound clip,
+  now closes soundly in 4.4s.
+- **Per-disjunct clip** (v1/abcrown form): clip against every open
+  disjunct's halfspaces, union the boxes, drop the domain when all
+  disjunct polytopes are empty. Subsumes the old single-open-disjunct
+  special case.
+- **Serial disjuncts** (v1 acasxu-family recipe): D>1 input-split specs
+  run one disjunct per tree, making the clip a pure conjunction.
+
+iso instance_3 remains open with a precise diagnosis: root bounds match
+v1 (-9.9k vs -10.0k), clip math verified identical on shared data
+(0.84 shrink on a synthetic leaf), pop order exonerated (worst-first,
+LIFO, easiest-first all explode), alpha exonerated. The gap is per-leaf
+bound quality at depth on the merged PAIR net: v1 certifies ~50% of
+visited leaves (queue ~2.5k, 1.1M leaves/55s), vc2 ~36% -> exponential
+frontier. Next lever: compare v1's _spec_backward_graph_batched row
+bounds against vc2 crown on identical mid-depth leaf boxes.
+
+### Day-3 close: the input-split gap vs v1 falls (split parity)
+
+Systematic elimination on iso instance_3 and dist_shift index112, always
+comparing against v1 on identical inputs:
+
+1. Raw per-leaf bounds: EQUAL (zono-seeded identity-CROWN reproduces
+   v1's _crown_intermediate_batched worst-lb to the last digit on 64
+   random leaf boxes; interval-seeded within 5-8%).
+2. Clip formula: EQUAL (same 0.84 shrink on a shared synthetic leaf).
+3. Pop order: exonerated (worst-first, LIFO, easiest-first all explode).
+4. Alpha: exonerated (v1 closes iso with alpha disabled).
+5. Round throughput: comparable once alpha is boundary-gated.
+
+The real causes, both invisible to bound-value comparisons:
+
+- **Same tightness, different A.** Interval-seeded refinement yields a
+  linearization A that differs from v1's despite equal bound values;
+  the sb split score width x sum|A| then disagrees on ~14% of leaves
+  (62/72), and split divergence compounds multiplicatively: 2.3x tree,
+  which crosses the queue-vs-batch starvation threshold and explodes.
+  Zono-seeding restores 72/72 split agreement, and the tree collapses
+  to v1's shape (iso: 1.7M leaves / 51s vs v1 ~1M / 50.5s).
+- **Sensitivity scores lie through smooth bands.** On the sigmoid net,
+  widest-axis closes index112 in 53 splits / 2.0s where sb dies at 450k
+  domains; v1 ships sb disabled for dist_shift. vc2 now auto-picks:
+  widest when the net has non-relu nonlinearities, sb otherwise.
+
+Also learned: dist_shift index112/index5291's earlier "2s closes" were
+riding the unsound alpha-bias clip (both are border-vcslow rows v1
+needs ~100s for). After the soundness fix they re-close honestly at
+~2s via the widest heuristic: better than v1 by 50x, soundly this time.
+Loop consolidation (the design's "one BaB") now has its cost model:
+boundary-gated alpha (eps=10, cap 2048), auto split heuristic,
+zono-seeded refinement below 1200 nonlins, host-RAM frontier.
+
+vc2 vs v1 scoreboard on the diagnosed rows: iso instance_3 50s vs 98.6s
+official; index112 ~2s vs 96.8s; img100-set 6.4s vs 12.3s; index7901
+1.8s vs 1.4s; idx_8945 open locally (hardware-bound, needs ~100M dual
+nodes).
+
+### Day-4: instance_31 and the alpha-depth knife edge (iso 39/39)
+
+The one iso straggler (instance_31: v1 8.8s / 95k leaves, vc2 9.4M
+leaves and diverging) re-ran the whole elimination: bounds equal,
+splits 72/72 equal. The remaining lever was boundary-alpha DEPTH:
+8 iters leaves instance_31's marginal leaves unclosed (100x tree);
+20 iters closes them in 113k leaves but blows up instance_3 (the
+deeper alpha adopts more alpha linearizations into the clip/split
+pair and walks off v1's tree). alpha=12 closes both but leaves no
+budget margin, and the sensitivity is clearly instance-shaped, not a
+tunable constant.
+
+Scheduler answer instead of a magic number: the wide-route slice runs
+input-split twice -- alpha=8 at 70% of remaining budget (common case,
+costs nothing when it wins), then alpha=20 with the rest. instance_3
+51.0s, instance_31 79.8s, both under the 100s official budget.
+
+Category sweeps at official budgets after the whole diagnosis arc:
+**iso 39/39, dist_shift 72/72, anchors 46/46** (previous session state:
+iso untested, dist_shift 70/72 with two unsound-clip artifacts).
