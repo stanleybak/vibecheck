@@ -653,3 +653,24 @@ the v1 machinery is the candidate).
 Locally-feasible borderline set otherwise: index112 3.1s, safenlp 2.4s,
 challenging_certified 14.8s all green; cifar100/tinyimagenet rows are
 hardware-bound locally (v1 OOMs on the 8GB part too).
+
+### Day-4 close: lsnc cracked to verdict-parity; loop cost work
+
+lsnc quadrotor2d_state_33 (v1 20.3s, abcrown 10.7s, official budget
+25s): vc2 now proves it in 44.5s (was: pure timeout with the frontier
+at 400k+). Levers, all measured: adaptive batch growth (double the
+batch when per-leaf wall < 20us and the frontier dwarfs it -- the lsnc
+class runs 350k leaves/s at 64k batch vs 7k/s at 4096; expensive-leaf
+nets like iso never trigger), banded-MAJORITY heuristic (lsnc's two pow
+ops must not force widest-axis over its hundreds of relus: sb closes in
+13.8M leaves vs 28.7M), topk pop instead of full-frontier argsort, and
+per-(op, device) caches for concat constants. The remaining 1.8x to the
+official budget is per-leaf GPU cost or tree size (v1's sb-margin
+score) -- follow-up optimization, verdict already correct. Side effect:
+iso instances got 30-40% faster (36.6s / 46.6s).
+
+Diagnosis campaign scoreboard (all vs v1 local at official budgets):
+dist_shift 72/72, iso 39/39, anchors 46/46, borderline locals
+index112/safenlp/challenging_certified green; malbeware structurally
+MILP-class (documented); cifar100/tinyimagenet hardware-bound locally
+(v1 OOMs on the 8GB part too); lsnc verdict-correct, 1.8x over budget.

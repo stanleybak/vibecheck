@@ -21,6 +21,20 @@ import torch.nn.functional as F
 from .relax import REL
 
 
+
+def _op_const(op, key, dev, build):
+    """Per-(op, key, device) tensor cache for concat bases/positions: these
+    numpy constants were re-uploaded on every forward call, which dominated
+    tight BaB loops (lsnc: 3.2s of a 20s slice in torch.as_tensor)."""
+    cache = getattr(op, '_tcache', None)
+    if cache is None:
+        cache = {}
+        op._tcache = cache
+    k = (key, str(dev))
+    if k not in cache:
+        cache[k] = build()
+    return cache[k]
+
 def _as2d(x):
     return x if x.dim() == 2 else x.unsqueeze(0)
 
@@ -64,10 +78,15 @@ def point(net, x: torch.Tensor) -> torch.Tensor:
             state[name] = state[op.inputs[0]] * state[op.inputs[1]]
         elif op.kind == 'concat':
             B = x.shape[0]
-            out = torch.as_tensor(op.params['base'], device=x.device,
-                                  dtype=x.dtype).expand(B, -1).clone()
-            for src, pos in zip(op.inputs, op.params['positions']):
-                out[:, torch.as_tensor(pos, device=x.device)] = state[src]
+            out = _op_const(op, 'base', x.device,
+                            lambda: torch.as_tensor(
+                                op.params['base'], device=x.device,
+                                dtype=x.dtype)).expand(B, -1).clone()
+            for si, (src, pos) in enumerate(zip(op.inputs,
+                                                op.params['positions'])):
+                p = _op_const(op, ('pos', si), x.device,
+                              lambda: torch.as_tensor(pos, device=x.device))
+                out[:, p] = state[src]
             state[name] = out
         elif op.kind == 'maxpool':
             state[name] = _maxpool_point(op, state[op.inputs[0]])
@@ -131,11 +150,15 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
             state[name] = ((mhi + mlo) / 2, (mhi - mlo) / 2)
         elif op.kind == 'concat':
             B = c.shape[0]
-            bc = torch.as_tensor(op.params['base'], device=c.device,
-                                 dtype=c.dtype).expand(B, -1).clone()
+            bc = _op_const(op, 'base', c.device,
+                           lambda: torch.as_tensor(
+                               op.params['base'], device=c.device,
+                               dtype=c.dtype)).expand(B, -1).clone()
             br = torch.zeros_like(bc)
-            for src, pos in zip(op.inputs, op.params['positions']):
-                p = torch.as_tensor(pos, device=c.device)
+            for si, (src, pos) in enumerate(zip(op.inputs,
+                                                op.params['positions'])):
+                p = _op_const(op, ('pos', si), c.device,
+                              lambda: torch.as_tensor(pos, device=c.device))
                 bc[:, p], br[:, p] = state[src][0], state[src][1]
             state[name] = (bc, br)
         elif op.kind == 'maxpool':
@@ -313,7 +336,9 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
             state[name] = ZonoState(c2, G2, sym)
         elif op.kind == 'concat':
             z_parts = [state[s] for s in op.inputs]
-            base = torch.as_tensor(op.params['base'], device=dev, dtype=dt)
+            base = _op_const(op, 'base', dev,
+                             lambda: torch.as_tensor(op.params['base'],
+                                                     device=dev, dtype=dt))
             n_out = op.params['n_out']
             # union the symbol lists (shared prefix + tails, as in add)
             syms, gmap = [], []

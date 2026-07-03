@@ -47,10 +47,13 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         # widest closes in 53 splits where sb dies at 450k domains; v1
         # ships sb disabled for exactly that class and enabled for the
         # relu families)
-        banded = any(op.kind == 'nonlin'
-                     and op.fn not in ('relu', 'leaky_relu')
-                     for op in net.ops.values())
-        heuristic = 'widest' if banded else 'sb'
+        n_band = sum(op.n for op in net.ops.values()
+                     if op.kind == 'nonlin'
+                     and op.fn not in ('relu', 'leaky_relu'))
+        n_relu = sum(op.n for op in net.ops.values()
+                     if op.kind == 'nonlin'
+                     and op.fn in ('relu', 'leaky_relu'))
+        heuristic = 'widest' if n_band > n_relu else 'sb'
     D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
     q = W.shape[0]
     # per-disjunct row selector (D, q) for the batched refutation check
@@ -64,6 +67,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     f_hi = hi.reshape(1, -1).to('cpu', dt)
     f_worst = torch.full((1,), -torch.inf)
     n_bounded = n_split = rounds = 0
+    _round_wall, _round_B = 1.0, 1
     t0 = time.time()
     n_nonlin = sum(net.ops[nm].n for nm in net.order
                    if net.ops[nm].kind == 'nonlin')
@@ -130,11 +134,24 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             return 'timeout', {'frontier': int(f_lo.shape[0]),
                                'bounded': n_bounded, 'splits': n_split}
         rounds += 1
+        # adaptive batch growth: when leaves are cheap (microseconds) and
+        # the frontier dwarfs the batch, the loop is launch-overhead-bound
+        # and doubling the batch is free throughput (lsnc: v1 ships
+        # batch_size 65536 for exactly this; 350k leaves/s at 64k vs 7k/s
+        # at 4096). Expensive-leaf nets (iso: ~40us/leaf, where bigger
+        # batches dilute the boundary-alpha cap) never trigger.
+        if (rounds > 4 and batch < 65536 and f_lo.shape[0] > 4 * batch
+                and _round_wall / max(_round_B, 1) < 2e-5):
+            batch *= 2
+        _round_t0 = time.time()
         # pick the worst-first batch, sized by the memory budget
         per_dom = q * max(net.ops[o].n for o in net.order) * 4 * 8
         bs = min(batch, memory.chunk_size(f_lo.shape[0], per_dom, dev))
-        order = torch.argsort(f_worst)                # least-verified first
-        take, keep = order[:bs], order[bs:]
+        # worst-first pop via topk (a full argsort over a multi-million
+        # frontier cost ~12s of lsnc's 39s run)
+        take = torch.topk(f_worst, bs, largest=False, sorted=False).indices
+        keep = torch.ones(f_worst.shape[0], dtype=torch.bool)
+        keep[take] = False
         blo, bhi = f_lo[take].to(dev), f_hi[take].to(dev)
         f_lo, f_hi, f_worst = f_lo[keep], f_hi[keep], f_worst[keep]
 
@@ -179,6 +196,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 inter[k2] = tuple(merged)
         lbq, Ain = backward.crown(net, blo, bhi, W, inter,
                                   return_input_adjoint=True)
+        _round_wall, _round_B = time.time() - _round_t0, blo.shape[0]
         # the clip bias reconstruction below must use THIS lbq -- it is the
         # exact concretization of Ain; the alpha-improved bound has no
         # matching linearization and an inflated bias would over-clip
@@ -315,7 +333,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 widx = torch.argsort(w)[:64]
                 cand, _ = attack.pgd(net, spec, lo=olo[widx], hi=ohi[widx],
                                      restarts=256, iters=60, device=device,
-                                     time_budget=1.5, seed=rounds)
+                                     time_budget=0.5, seed=rounds)
                 if cand is not None:
                     ok, vinfo = attack.validate(onnx_path, spec, cand)
                     if ok:
