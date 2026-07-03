@@ -185,6 +185,47 @@ CASES['concat'] = _concat_case
 CASES['maxpool'] = _maxpool_case
 
 
+def _softmax_case():
+    """The loader's difference-form softmax decomposition, built the same
+    way graph.py emits it: softmax_i = 1/sum_j exp(x_j - x_i). Validates
+    the maths against numpy softmax through every path."""
+    from vibecheck2.core.linmap import Scale, Select, SumAxis
+    lm1 = _dense(4, 4)
+    lm3 = _dense(4, 3)
+    k = 4
+    ii = np.arange(k)[:, None]
+    jj = np.arange(k)[None, :]
+    idx_j = np.broadcast_to(jj, (k, k)).reshape(-1).copy()
+    idx_i = np.broadcast_to(ii, (k, k)).reshape(-1).copy()
+    ops = {
+        'x': Op('x', 'input', (), (4,), 4),
+        'h': Op('h', 'linmap', ('x',), (4,), 4, lm=lm1),
+        'sj': Op('sj', 'linmap', ('h',), (16,), 16, lm=Select(idx_j, 4)),
+        'si': Op('si', 'linmap', ('h',), (16,), 16, lm=Select(idx_i, 4)),
+        'ni': Op('ni', 'linmap', ('si',), (16,), 16, lm=Scale(-1.0, 16)),
+        'd': Op('d', 'add', ('sj', 'ni'), (16,), 16),
+        'e': Op('e', 'nonlin', ('d',), (16,), 16, fn='exp'),
+        's': Op('s', 'linmap', ('e',), (4,), 4, lm=SumAxis(4, 4, 1)),
+        'sm': Op('sm', 'nonlin', ('s',), (4,), 4, fn='reciprocal'),
+        'y': Op('y', 'linmap', ('sm',), (3,), 3, lm=lm3),
+    }
+    net = Net(ops, ['h', 'sj', 'si', 'ni', 'd', 'e', 's', 'sm', 'y'],
+              'x', 'y')
+
+    def ref(x):
+        h = x @ lm1.W.T + lm1.b
+        z = np.exp(h - h.max(axis=1, keepdims=True))
+        sm = z / z.sum(axis=1, keepdims=True)
+        return sm @ lm3.W.T + lm3.b
+
+    lo = -np.ones(4, dtype=np.float32) * 0.7
+    hi = np.ones(4, dtype=np.float32) * 0.7
+    return net, ref, lo, hi
+
+
+CASES['softmax'] = _softmax_case
+
+
 def _samples(lo, hi, n=128):
     x = RNG.uniform(lo, hi, size=(n, lo.size)).astype(np.float32)
     x[0], x[1] = lo, hi
@@ -257,6 +298,7 @@ GOLDEN = {
     # bmm crown-side: the general McCormick bilinear adjoint (mul and bmm
     # are shape instances of one engine)
     'bmm': dict.fromkeys(PATHS, True),
+    'softmax': dict.fromkeys(PATHS, True),
 }
 
 

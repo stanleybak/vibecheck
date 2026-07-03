@@ -96,10 +96,27 @@ def intermediates(net, lo, hi):
     Also falls back to interval when zono lacks an op's relaxation."""
     from . import memory
     B = lo.shape[0]
+    ist = fwd.interval(net, lo, hi, return_state=True)
+    iiv = _inter_from_state(net, lambda e: ist[e])
     if _zono_cost_bytes(net, B) < memory.free_bytes(lo.device) * memory.SAFETY:
         try:
             _lo, _hi, state = fwd.zono(net, lo, hi, return_state=True)
-            return _inter_from_state(net, lambda e: state[e].bounds())
+            izo = _inter_from_state(net, lambda e: state[e].bounds())
+            # intersect with interval per entry (both sound; interval
+            # keeps structurally-positive chains positive where the zono
+            # concretization of band generators goes negative -- the
+            # softmax difference form's sum >= exp(0) = 1)
+            out = {}
+            for k2, zt in izo.items():
+                it = iiv[k2]
+                merged = []
+                for j2 in range(0, len(zt), 2):
+                    lo2 = torch.maximum(zt[j2], it[j2])
+                    hi2 = torch.minimum(zt[j2 + 1], it[j2 + 1])
+                    merged.append(lo2)
+                    merged.append(torch.maximum(hi2, lo2))
+                out[k2] = tuple(merged)
+            return out
         except NotImplementedError:
             pass                # an op without a zono relaxation yet
         except torch.cuda.OutOfMemoryError:
@@ -107,8 +124,7 @@ def intermediates(net, lo, hi):
             # gens only materialize for crossing elements); interval is
             # the sanctioned degradation, not a crash
             torch.cuda.empty_cache()
-    state = fwd.interval(net, lo, hi, return_state=True)
-    return _inter_from_state(net, lambda e: state[e])
+    return iiv
 
 
 from .forward import clamped_bounds  # single definition (forward.py)
@@ -211,7 +227,19 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
                     l.unsqueeze(1), h.unsqueeze(1),
                     alpha[name].clamp(0.0, 1.0), op.params)
             else:
-                al, bl, au, bu = rel.planes(l, h, op.params)
+                try:
+                    al, bl, au, bu = rel.planes(l, h, op.params)
+                except NotImplementedError:
+                    if 'out_lo' not in op.params:
+                        raise
+                    # emission-declared output range as constant planes:
+                    # the softmax reciprocal is in (0, 1] because its sum
+                    # contains exp(0) = 1, no matter how loose the
+                    # propagated input range got
+                    al = torch.zeros_like(l)
+                    au = torch.zeros_like(l)
+                    bl = torch.full_like(l, op.params['out_lo'])
+                    bu = torch.full_like(l, op.params['out_hi'])
                 if alpha and name in alpha:
                     # relu: optimizable lower slope on unstable neurons only
                     unstable = ((l < 0) & (h > 0)).unsqueeze(1)

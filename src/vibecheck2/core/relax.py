@@ -321,6 +321,12 @@ class Reciprocal:
         # chord slope band: g(y) = 1/y - lam*y has its interior stationary
         # point at y = -1/sqrt(-lam... ) i.e. g'(y) = -1/y^2 - lam = 0 ->
         # y* = +/- sqrt(-1/lam) (lam < 0 always for 1/y on sign-definite y)
+        if bool(((lo <= 0) & (hi >= 0)).any()):
+            # same refusal as planes(); silently continuing here produced
+            # positive lam and clamped sqrt garbage (caught by the
+            # op-coverage suite as an unsound zono bracket)
+            raise NotImplementedError(
+                'reciprocal over a range containing 0 is unbounded')
         lam = -1.0 / (lo * hi)
         y_star = torch.sqrt((-1.0 / lam).clamp_min(1e-30))
         y_star = torch.where(lo > 0, y_star, -y_star)

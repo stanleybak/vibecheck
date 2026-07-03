@@ -130,8 +130,19 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
                 ci, ri = (xl + xh) / 2, (xh - xl) / 2
             f = REL[op.fn].point
             flo, fhi = f(ci - ri, op.params), f(ci + ri, op.params)
-            if op.fn in ('relu', 'leaky_relu', 'sigmoid', 'tanh', 'exp',
-                         'floor', 'sign', 'reciprocal'):
+            if op.fn == 'reciprocal':
+                # monotone ONLY on sign-definite ranges; across 0 the true
+                # range is unbounded both ways (endpoint eval there was
+                # silently unsound). The declared out_range param (the
+                # softmax emission knows its sum >= exp(0) = 1) or a
+                # vacuous +/-inf keeps it bracketing.
+                crossing = (ci - ri <= 0) & (ci + ri >= 0)
+                flo = torch.where(crossing, torch.full_like(flo, -torch.inf),
+                                  flo)
+                fhi = torch.where(crossing, torch.full_like(fhi, torch.inf),
+                                  fhi)
+            elif op.fn in ('relu', 'leaky_relu', 'sigmoid', 'tanh', 'exp',
+                           'floor', 'sign'):
                 pass                      # monotone: endpoint eval is exact
             elif op.fn in ('sin', 'cos', 'pow'):
                 flo, fhi = _nonmono_interval(op, ci - ri, ci + ri, flo, fhi)
@@ -139,6 +150,12 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
                 raise NotImplementedError(f'interval: nonlin {op.fn!r}')
             lo_hi = torch.minimum(flo, fhi), torch.maximum(flo, fhi)
             rlo, rhi = REL_RANGE.get(op.fn, (None, None))
+            if 'out_lo' in op.params:      # emission-declared output range
+                rlo = op.params['out_lo'] if rlo is None \
+                    else max(rlo, op.params['out_lo'])
+            if 'out_hi' in op.params:
+                rhi = op.params['out_hi'] if rhi is None \
+                    else min(rhi, op.params['out_hi'])
             l2 = lo_hi[0] if rlo is None else lo_hi[0].clamp_min(rlo)
             h2 = lo_hi[1] if rhi is None else lo_hi[1].clamp_max(rhi)
             h2 = torch.maximum(h2, l2)
@@ -258,6 +275,12 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     lo, hi = _as2d(lo), _as2d(hi)
     B, n = lo.shape
     dev, dt = lo.device, lo.dtype
+    # cheap parallel interval state: every nonlin pre-activation is
+    # intersected with it, so zono is never looser than IBP and
+    # structurally-positive chains survive band negativity (the softmax
+    # difference form: sum of exps >= exp(0) = 1, which the exp band's
+    # generators alone cannot see)
+    _iv = interval(net, lo, hi, return_state=True)
     c = (hi + lo) / 2
     # generators only for dims that are WIDE somewhere in the batch: a
     # zero-radius dim needs no symbol (dist_shift: 8 wide of 792 dims,
@@ -310,6 +333,9 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                     f'zono: no affine band for {op.fn!r} yet (design 3.4)')
             z = state[op.inputs[0]]
             zl, zh = z.bounds()
+            _il, _ih = _iv[op.inputs[0]]
+            zl = torch.maximum(zl, _il)
+            zh = torch.minimum(zh, torch.maximum(_ih, zl))
             if clamp_bounds and name in clamp_bounds:
                 cl, ch = clamp_bounds[name]
                 zl = torch.maximum(zl, cl)
@@ -317,7 +343,16 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
             # generic DeepZ affine band: y = lam*x + mu + delta*e_new
             # (relu: DeepZ triangle; sigmoid/tanh: chord band; each op's
             # RelaxLib entry owns its closed-form construction)
-            lam, mu, delta = rel.band(zl, zh, op.params)
+            try:
+                lam, mu, delta = rel.band(zl, zh, op.params)
+            except NotImplementedError:
+                if 'out_lo' not in op.params:
+                    raise
+                lam = torch.zeros_like(zl)
+                mu = torch.full_like(zl, (op.params['out_lo']
+                                          + op.params['out_hi']) / 2)
+                delta = torch.full_like(zl, (op.params['out_hi']
+                                             - op.params['out_lo']) / 2)
             if (slope_override and op.fn == 'relu'
                     and name in slope_override):
                 lam_o = slope_override[name].clamp(0.0, 1.0)

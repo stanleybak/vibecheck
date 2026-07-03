@@ -750,3 +750,34 @@ at its softmax: the exp/sum/reciprocal decomposition hits fp32 infinity
 softmax relaxation (output in (0,1), rows sum to 1), not more
 decomposition patching. Regressions: acasxu 6/6, dist_shift 4/4, iso
 35.7s, idx_8945 87.5s, suite 156 passed.
+
+### Day-6: difference-form softmax + a NaN false-unsat killed
+
+Softmax splitting was already covered (the range-split machinery owns
+exp/reciprocal edges); the missing piece was the REPRESENTATION. The
+emission is now softmax_i = 1/sum_j exp(x_j - x_i): shift-invariant by
+construction, CROWN bounds logit DIFFERENCES (common terms cancel), and
+the sum contains exp(0) = 1 so the reciprocal input is >= 1
+structurally. Emission-declared output ranges (params out_lo/out_hi)
+give every path a sound constant-plane fallback when propagated ranges
+still explode: softmax outputs are in (0, 1] no matter how loose the
+intermediates got. Coverage matrix now 17 ops x 7 paths = 119 cells,
+all green, softmax included.
+
+The suite + vit runs caught three more soundness bugs, each now fixed:
+- Reciprocal.band silently produced clamped-sqrt garbage on crossing
+  ranges (planes refused; band did not) -- unsound zono.
+- interval endpoint eval treated reciprocal as monotone ACROSS zero
+  ([1/lo, 1/hi] misses the asymptote) -- now +/-inf when crossing, then
+  range-clamped.
+- THE BIG ONE: the dual's keep-test `best <= tol` is False for NaN, so
+  NaN kernel bounds counted as CERTIFIED -- a NaN-state dual "refuted"
+  all 9 vit disjuncts in 2 nodes each. keep is now ~(best > tol), and
+  _GenGeometry refuses non-finite bands at build.
+
+zono self-clamps every nonlin pre-activation against a parallel
+interval state (never looser than IBP), and intermediates() intersects
+zono with interval entries. vit rows: honest unknown end-to-end (the
+remaining M6 depth is intermediate tightness on the attention stack).
+Battery: acasxu 6/6, dist_shift 4/4, idx_8945 70.6s, iso 26.7s, yolo
+13.8s, tests 163/163.

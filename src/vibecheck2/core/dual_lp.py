@@ -74,6 +74,12 @@ class _GenGeometry:
                 lam, mu, delta = rel.band(l.unsqueeze(0), h.unsqueeze(0),
                                           op.params)
                 lam, mu, delta = lam[0], mu[0], delta[0]
+            if not bool(torch.isfinite(lam).all()
+                        & torch.isfinite(mu).all()
+                        & torch.isfinite(delta).all()):
+                raise NotImplementedError(
+                    f'gen geometry: non-finite band for {op.fn} '
+                    f'(inf/NaN intermediate bounds)')
             self.lam[nm], self.mu[nm], self.delta[nm] = lam, mu, delta
             self.fresh[nm] = torch.nonzero(delta > 0,
                                            as_tuple=False).flatten()
@@ -521,7 +527,11 @@ def _make_host_frontier_verifier(base_cls):
                         deadline=deadline)
                     if _PARENT_FLOOR:
                         best = torch.maximum(best, floor)
-                    keep = best <= _TOL
+                    # NaN bounds MUST stay uncertified: `best <= tol` is
+                    # False for NaN, which silently counted garbage nodes
+                    # as certified (vit: a NaN-state dual "refuted" all 9
+                    # disjuncts in 2 nodes -- a false-unsat generator)
+                    keep = ~(best > _TOL)
                     ss = sides[keep]
                     l0, l1, nk = o0[keep], o1[keep], onu[keep]
                     pb = best[keep]
@@ -823,10 +833,18 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             sk = score_keys(net, lo, hi, W[r:r + 1], inter, keys)
             extra = [(np.eye(k_rows)[i], float(bias[r2]))
                      for i, r2 in enumerate(order) if r2 != r]
-            verdict, info = ver.verify_query(
-                state, qw, qb, sk, time_limit=min(per_q,
-                                                  deadline - time.time()),
-                extra_hs=extra)
+            try:
+                verdict, info = ver.verify_query(
+                    state, qw, qb, sk,
+                    time_limit=min(per_q, deadline - time.time()),
+                    extra_hs=extra)
+            except torch._inductor.exc.InductorError as e:
+                # torch.compile lowering rejects degenerate state shapes
+                # (vit: zero-width blocks after non-finite bands were
+                # refused); skip THIS row, the pipeline continues honestly
+                log(f'[vc2/dual] kernel lowering failed for row {r}: '
+                    f'{str(e)[:70]}; skipping')
+                continue
             if (verdict != 'unsat'
                     and info.get('reason') != 'splits_exhausted'
                     and deadline - time.time() > 5.0):
@@ -845,10 +863,15 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                     proj_rows=proj)
                 sk2 = score_keys(net, lo, hi, W[r:r + 1], gamma_inter[d],
                                  g_keys)
-                verdict, info = ver.verify_query(
-                    g_state, qw, qb, sk2,
-                    time_limit=min(per_q, deadline - time.time()),
-                    extra_hs=extra)
+                try:
+                    verdict, info = ver.verify_query(
+                        g_state, qw, qb, sk2,
+                        time_limit=min(per_q, deadline - time.time()),
+                        extra_hs=extra)
+                except torch._inductor.exc.InductorError as e:
+                    log(f'[vc2/dual] gamma kernel lowering failed for row '
+                        f'{r}: {str(e)[:70]}; skipping')
+                    continue
                 log(f'[vc2/dual]   gamma retry: {verdict} '
                     f'nodes={info.get("nodes")} '
                     f'wall={info.get("wall", 0):.2f}s')
