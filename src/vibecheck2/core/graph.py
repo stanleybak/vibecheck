@@ -80,6 +80,27 @@ class Net:
         return cons
 
 
+def tag_simplex_bmm(net):
+    """Mark bmm ops whose LEFT factor is a softmax output over the
+    contraction axis: each output row is then a CONVEX COMBINATION of the
+    right factor's rows (weights >= 0, summing to 1), so the output is
+    bounded by [min_j V_j, max_j V_j] coordinatewise -- the standard
+    attention tightening. Without it, interval treats the weights as an
+    independent [0,1] box and attn@V blows up by a factor of the token
+    count (vit block 1: diffs +-712 instead of +-40)."""
+    for nm in net.order:
+        op = net.ops[nm]
+        if op.kind != 'bmm':
+            continue
+        left = net.ops[op.inputs[0]]
+        if (left.kind == 'nonlin' and left.fn == 'reciprocal'
+                and left.params.get('softmax_axis_len') ==
+                op.params['a_shape'][-1]
+                and left.params.get('softmax_post') == 1):
+            op.params['simplex_left'] = True
+    return net
+
+
 def decompose_maxpool(net):
     """Replace native maxpool ops with the exact pairwise relu tree:
     max(a, b) = a + relu(b - a), levels until one column remains. Window
@@ -426,7 +447,8 @@ def from_compute_graph(cg, true_shapes=None) -> Net:
                      nd_shape=ish, lm=lm.SumAxis(pre * k, k, post))
                 emit(name, 'nonlin', [name + '/s'], out_shape,
                      nd_shape=ish, fn='reciprocal',
-                     params={'out_lo': 0.0, 'out_hi': 1.0})
+                     params={'out_lo': 0.0, 'out_hi': 1.0,
+                             'softmax_axis_len': k, 'softmax_post': post})
             else:
                 e = name + '/exp'
                 emit(e, 'nonlin', [x0 := src(node.inputs[0])],
@@ -887,5 +909,6 @@ def load(onnx_path, dtype=np.float32) -> Net:
     min_max_to_relu(cg)
     net = from_compute_graph(cg, true_shapes=_onnx_true_shapes(onnx_path))
     net = decompose_maxpool(net)
+    net = tag_simplex_bmm(net)
     net.onnx_path = onnx_path
     return net

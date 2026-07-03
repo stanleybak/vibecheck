@@ -537,58 +537,74 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         bs = min(batch, memory.chunk_size(len(heap), per_dom, dev))
         batch_doms = [heapq.heappop(heap) for _ in range(min(bs, len(heap)))]
         B = len(batch_doms)
-        blo = lo1.expand(B, -1)
-        bhi = hi1.expand(B, -1)
-        clamps = {}
-        range_clamps = {}
-        for bi, (_, _, splits) in enumerate(batch_doms):
-            for nm, j, spec_ in splits:
-                if isinstance(spec_, tuple):          # smooth range split
-                    if nm not in range_clamps:
-                        n_e = net.ops[nm].n
-                        range_clamps[nm] = (
-                            torch.full((B, n_e), -torch.inf, device=dev),
-                            torch.full((B, n_e), torch.inf, device=dev))
-                    rlo, rhi = range_clamps[nm]
-                    rlo[bi, j] = max(float(rlo[bi, j]), spec_[0])
-                    rhi[bi, j] = min(float(rhi[bi, j]), spec_[1])
-                else:                                  # relu sign split
-                    if nm not in clamps:
-                        clamps[nm] = torch.zeros(B, net.ops[nm].n, device=dev,
-                                                 dtype=torch.int8)
-                    clamps[nm][bi, j] = spec_
-        # reforward-IBP under the clamps, intersected with the (tighter at
-        # the root, clamp-blind) root intermediates: best of both regimes
-        ib_state = backward.fwd.interval(net, blo, bhi, return_state=True,
-                                         clamps=clamps,
-                                         range_clamps=range_clamps)
-        ib = backward._inter_from_state(net, lambda e: ib_state[e])
-        inter = {}
-        for k2, v in root_inter.items():
-            rv = tuple(t.expand(B, -1) for t in v)
-            iv = ib[k2]
-            merged = []
-            for j2 in range(0, len(rv), 2):
-                merged.append(torch.maximum(rv[j2], iv[j2]))
-                merged.append(torch.minimum(rv[j2 + 1], iv[j2 + 1]))
-            inter[k2] = tuple(merged)
-        if n_relu_total <= 2000:
-            # small net (acasxu class): per-batch CROWN refinement of the
-            # merged bounds under the clamps. NOT for wide layers: the
-            # identity blocks scale with unstable count x batch (malbeware,
-            # 7842 unstable: 6 domains/s vs the fixed-root regime; abcrown
-            # runs fixed root intermediates + beta only on this class)
-            inter = backward.intermediates_crown(net, blo, bhi,
-                                                 base_inter=inter,
-                                                 clamps=clamps,
-                                                 range_clamps=range_clamps)
-        adj = {}
-        lbq = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
-                             range_clamps=range_clamps, collect_adjoints=adj)
-        lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter, clamps,
-                                          iters=beta_iters, thresholds=-bias,
-                                          range_clamps=range_clamps)
-        lbq = torch.maximum(lbq, lb_ab)
+        try:
+            blo = lo1.expand(B, -1)
+            bhi = hi1.expand(B, -1)
+            clamps = {}
+            range_clamps = {}
+            for bi, (_, _, splits) in enumerate(batch_doms):
+                for nm, j, spec_ in splits:
+                    if isinstance(spec_, tuple):          # smooth range split
+                        if nm not in range_clamps:
+                            n_e = net.ops[nm].n
+                            range_clamps[nm] = (
+                                torch.full((B, n_e), -torch.inf, device=dev),
+                                torch.full((B, n_e), torch.inf, device=dev))
+                        rlo, rhi = range_clamps[nm]
+                        rlo[bi, j] = max(float(rlo[bi, j]), spec_[0])
+                        rhi[bi, j] = min(float(rhi[bi, j]), spec_[1])
+                    else:                                  # relu sign split
+                        if nm not in clamps:
+                            clamps[nm] = torch.zeros(B, net.ops[nm].n, device=dev,
+                                                     dtype=torch.int8)
+                        clamps[nm][bi, j] = spec_
+            # reforward-IBP under the clamps, intersected with the (tighter at
+            # the root, clamp-blind) root intermediates: best of both regimes
+            ib_state = backward.fwd.interval(net, blo, bhi, return_state=True,
+                                             clamps=clamps,
+                                             range_clamps=range_clamps)
+            ib = backward._inter_from_state(net, lambda e: ib_state[e])
+            inter = {}
+            for k2, v in root_inter.items():
+                rv = tuple(t.expand(B, -1) for t in v)
+                iv = ib[k2]
+                merged = []
+                for j2 in range(0, len(rv), 2):
+                    merged.append(torch.maximum(rv[j2], iv[j2]))
+                    merged.append(torch.minimum(rv[j2 + 1], iv[j2 + 1]))
+                inter[k2] = tuple(merged)
+            if n_relu_total <= 2000:
+                # small net (acasxu class): per-batch CROWN refinement of the
+                # merged bounds under the clamps. NOT for wide layers: the
+                # identity blocks scale with unstable count x batch (malbeware,
+                # 7842 unstable: 6 domains/s vs the fixed-root regime; abcrown
+                # runs fixed root intermediates + beta only on this class)
+                inter = backward.intermediates_crown(net, blo, bhi,
+                                                     base_inter=inter,
+                                                     clamps=clamps,
+                                                     range_clamps=range_clamps)
+            adj = {}
+            lbq = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
+                                 range_clamps=range_clamps, collect_adjoints=adj)
+            lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter, clamps,
+                                              iters=beta_iters, thresholds=-bias,
+                                              range_clamps=range_clamps)
+            lbq = torch.maximum(lbq, lb_ab)
+        except (torch.cuda.OutOfMemoryError,
+                torch.AcceleratorError):
+            # round-level OOM recovery (mirrors input_split_bab): push
+            # the popped domains back, halve the batch, continue --
+            # covers raw CUDA allocation failures (compile workspace)
+            # that bypass the caching allocator's OutOfMemoryError
+            torch.cuda.empty_cache()
+            for dom in batch_doms:
+                heapq.heappush(heap, dom)
+            if batch <= 8:
+                return 'timeout', {'frontier': len(heap),
+                                   'bounded': n_bounded,
+                                   'reason': 'oom_floor'}
+            batch = max(8, B // 2)
+            continue
         n_bounded += B
         refuted = refuted_of(lbq)
         open_mask = ~refuted.all(dim=1)

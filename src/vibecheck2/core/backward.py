@@ -282,6 +282,24 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
             put(op.inputs[0], Ap * alx + An * aux)
             put(op.inputs[1], Ap * aly + An * auy)
             d = d + (Ap * clo + An * cup).sum(dim=2)
+        elif op.kind == 'bmm' and op.params.get('simplex_left'):
+            # attention @ V: the left rows are softmax weights (simplex),
+            # so the output is inside the coordinatewise hull of the
+            # right factor's rows -- constant planes, adjoint terminates
+            # here (sound: the hull holds for every x in the box). The
+            # McCormick route treats the weights as an independent [0,1]
+            # box and blows up by the token count.
+            _, _, ly, hy = inter[name]
+            bsh = op.params['b_shape']
+            k, p = bsh[-2], bsh[-1]
+            Bv = Ao.shape[0]
+            sl = ly.reshape(Bv, -1, k, p).min(dim=2, keepdim=True).values
+            sh = hy.reshape(Bv, -1, k, p).max(dim=2, keepdim=True).values
+            m = op.params['a_shape'][-2]
+            sl = sl.expand(Bv, sl.shape[1], m, p).reshape(Bv, 1, -1)
+            sh = sh.expand(Bv, sh.shape[1], m, p).reshape(Bv, 1, -1)
+            Ap, An = _pos_part(Ao), _neg_part(Ao)
+            d = d + (Ap * sl + An * sh).sum(dim=2)
         elif op.kind == 'bmm':
             # bmm = the contracted instance of the same McCormick engine:
             # out[g,i,j] = sum_l X[g,i,l] * Y[g,l,j]; the adjoint on each
@@ -313,7 +331,12 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
         else:
             raise NotImplementedError(f'crown: op kind {op.kind!r}')
 
-    Ain = A.pop(net.input_name)
+    Ain = A.pop(net.input_name, None)
+    if Ain is None:
+        # every adjoint path terminated early (a simplex-hull bmm whose
+        # constant planes absorbed all mass): the bound is d alone
+        Ain = torch.zeros(lo.shape[0], W.shape[-2], net.n_in,
+                          device=lo.device, dtype=lo.dtype)
     assert not A, f'unconsumed adjoints: {list(A)}'
     c = (hi + lo) / 2
     r = (hi - lo) / 2
@@ -373,6 +396,10 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
                                 Wc.unsqueeze(0).expand(B, -1, -1), inter,
                                 start=_e, clamps=clamps,
                                 range_clamps=range_clamps)
+                    # a refinement through non-finite planes (exp past
+                    # fp32) must be a NO-OP, not a poison
+                    out = torch.where(torch.isfinite(out), out,
+                                      torch.full_like(out, -torch.inf))
                     _lb[:, sel] = torch.maximum(_lb[:, sel], out[:, :m])
                     _ub[:, sel] = torch.minimum(_ub[:, sel], -out[:, m:])
 
@@ -414,6 +441,8 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
             Wb = Wc.unsqueeze(0).expand(B, -1, -1)
             out = crown(net, lo, hi, Wb, inter, start=_e, clamps=clamps,
                         range_clamps=range_clamps)
+            out = torch.where(torch.isfinite(out), out,
+                              torch.full_like(out, -torch.inf))
             if alpha_iters > 0:
                 # joint-intermediate alpha (v1 phase-0.5 alpha-refresh): the
                 # identity rows themselves get optimized slopes, which is

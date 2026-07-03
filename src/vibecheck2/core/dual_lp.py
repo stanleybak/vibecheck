@@ -838,11 +838,14 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                     state, qw, qb, sk,
                     time_limit=min(per_q, deadline - time.time()),
                     extra_hs=extra)
-            except torch._inductor.exc.InductorError as e:
-                # torch.compile lowering rejects degenerate state shapes
-                # (vit: zero-width blocks after non-finite bands were
-                # refused); skip THIS row, the pipeline continues honestly
-                log(f'[vc2/dual] kernel lowering failed for row {r}: '
+            except (torch._inductor.exc.InductorError,
+                    torch.AcceleratorError) as e:
+                # torch.compile lowering rejects degenerate state shapes,
+                # and raw CUDA allocations (compile workspace) can fail
+                # outside the caching allocator's OutOfMemoryError; skip
+                # THIS row, the pipeline continues honestly
+                torch.cuda.empty_cache()
+                log(f'[vc2/dual] kernel failed for row {r}: '
                     f'{str(e)[:70]}; skipping')
                 continue
             if (verdict != 'unsat'
@@ -868,8 +871,10 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                         g_state, qw, qb, sk2,
                         time_limit=min(per_q, deadline - time.time()),
                         extra_hs=extra)
-                except torch._inductor.exc.InductorError as e:
-                    log(f'[vc2/dual] gamma kernel lowering failed for row '
+                except (torch._inductor.exc.InductorError,
+                        torch.AcceleratorError) as e:
+                    torch.cuda.empty_cache()
+                    log(f'[vc2/dual] gamma kernel failed for row '
                         f'{r}: {str(e)[:70]}; skipping')
                     continue
                 log(f'[vc2/dual]   gamma retry: {verdict} '

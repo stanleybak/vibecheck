@@ -111,6 +111,13 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
         log(f'[vc2] not implemented: {e}; verdict unknown')
         return 'unknown', {'reason': f'not_implemented: {e}',
                            'time': time.time() - t0}
+    except torch.AcceleratorError as e:
+        # raw CUDA allocation failure outside the caching allocator
+        # (compile workspace exhaustion poisons subsequent allocs in this
+        # process); the phases that ran stand, the verdict is honest
+        log(f'[vc2] accelerator failure: {str(e)[:80]}; verdict unknown')
+        return 'unknown', {'reason': 'accelerator_failure',
+                           'time': time.time() - t0}
 
 
 def _verify_groups(net, spec, groups, onnx_path, timeout, device,

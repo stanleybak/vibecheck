@@ -781,3 +781,37 @@ zono with interval entries. vit rows: honest unknown end-to-end (the
 remaining M6 depth is intermediate tightness on the attention stack).
 Battery: acasxu 6/6, dist_shift 4/4, idx_8945 70.6s, iso 26.7s, yolo
 13.8s, tests 163/163.
+
+### Day-6 continued: attention-stack intermediate tightness
+
+The vit chain diagnostic (block-by-block pre-activation bounds) showed
+block 0 honestly bounded (+-29.5 logit diffs are real) and block 1
+exploding because CROWN could not see the SIMPLEX: softmax rows sum to
+1, so attention @ V is a convex combination of value rows. Landed:
+
+- tag_simplex_bmm: bmms whose left factor is a softmax output over the
+  contraction axis carry simplex_left; the interval bmm intersects the
+  coordinatewise hull of V's rows, and crown gives the tagged bmm
+  constant hull planes (adjoint terminates there, sound for every x).
+  IBP through block 1 tightened 5x at the interval level, and the
+  post-attention relu went from NaN to finite (+-350).
+- inf-safe (c, r) store: infinite widths anchor the center at the
+  finite side with r = inf (reads back (-inf, inf): loose but FINITE
+  arithmetic; inf - inf NaNs were poisoning everything downstream).
+- no-poison refinement: intermediates_crown through non-finite planes
+  is a no-op, never a NaN writer; crown completes with zero input
+  adjoint when hull planes absorb all mass.
+- kernel/compile failures (InductorError, AcceleratorError) skip the
+  dual row or resolve at the central boundary as loud unknowns; the
+  relu BaB gained the same round-level requeue-and-halve guard as the
+  input split.
+
+tests2/test_attention.py pins all four mechanisms (simplex tag, hull
+soundness+tightness through interval AND crown vs numpy softmax
+attention, inf-never-NaN interval, refinement no-poison, non-finite
+state refusal): 168 tests total. vit rows now run the FULL pipeline
+with finite bounds (pgd root worst -85.7, was NaN) -- still unknown:
+the remaining gap to v1's unsat is bilinear tightness (Q@K McCormick
+with refined factors, alpha over the McCormick mix) on nets whose true
+logit-diff ranges are genuinely wide. Battery: acasxu 6/6, dist_shift
+4/4, idx_8945 89.7s, suite 168/168.

@@ -159,7 +159,20 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
             l2 = lo_hi[0] if rlo is None else lo_hi[0].clamp_min(rlo)
             h2 = lo_hi[1] if rhi is None else lo_hi[1].clamp_max(rhi)
             h2 = torch.maximum(h2, l2)
-            state[name] = ((h2 + l2) / 2, (h2 - l2) / 2)
+            # the (c, r) encoding NaNs on infinite widths (inf - inf);
+            # anchor the center at the finite side and let r = inf carry
+            # the unboundedness -- reads back as (-inf, inf) downstream,
+            # loose but FINITE arithmetic (vit: exp past fp32 max)
+            wide = torch.isinf(l2) | torch.isinf(h2)
+            c_mid = torch.where(
+                wide,
+                torch.where(torch.isfinite(l2), l2,
+                            torch.where(torch.isfinite(h2), h2,
+                                        torch.zeros_like(l2))),
+                (h2 + l2) / 2)
+            r_mid = torch.where(wide, torch.full_like(h2, torch.inf),
+                                (h2 - l2) / 2)
+            state[name] = (c_mid, r_mid)
         elif op.kind == 'add':
             (c1, r1), (c2, r2) = state[op.inputs[0]], state[op.inputs[1]]
             state[name] = (c1 + c2, r1 + r2)
@@ -200,6 +213,27 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
 
 
 def _bmm_interval(op, sa_state, sb_state):
+    lo_c, hi_c = _bmm_interval_corners(op, sa_state, sb_state)
+    if op.params.get('simplex_left'):
+        # left rows are convex-combination weights (softmax): the output
+        # is inside the coordinatewise hull of the right factor's rows
+        (cb, rb) = sb_state
+        B = cb.shape[0]
+        sb = op.params['b_shape']
+        k, p = sb[-2], sb[-1]
+        bl = (cb - rb).reshape(B, -1, k, p)
+        bh = (cb + rb).reshape(B, -1, k, p)
+        sl = bl.min(dim=2, keepdim=True).values           # (B, G, 1, p)
+        sh = bh.max(dim=2, keepdim=True).values
+        m = op.params['a_shape'][-2]
+        sl = sl.expand(B, sl.shape[1], m, p).reshape(B, -1)
+        sh = sh.expand(B, sh.shape[1], m, p).reshape(B, -1)
+        lo_c = torch.maximum(lo_c, sl)
+        hi_c = torch.maximum(torch.minimum(hi_c, sh), lo_c)
+    return lo_c, hi_c
+
+
+def _bmm_interval_corners(op, sa_state, sb_state):
     """Sound interval matmul via per-product corner enumeration, summed
     over the contraction axis. Memory is (B, ..., m, k, n); attention-sized
     operands only (the McCormick adjoint version arrives with M6)."""
