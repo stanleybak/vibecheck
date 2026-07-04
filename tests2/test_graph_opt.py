@@ -125,3 +125,23 @@ def test_fold_does_not_touch_non_selector_pair():
     fold_split_relu(net)
     assert len(net.order) == n0
     assert torch.allclose(fwd.point(net, x), y0, atol=1e-5)
+
+
+def test_decompose_maxpool_is_exact():
+    """maxpool op -> pairwise relu tree computes the identical max (exact)."""
+    from vibecheck2.core.graph import decompose_maxpool
+    C, H, W = 2, 6, 6
+    n_in = C * H * W
+    ops = {
+        'x': Op('x', 'input', (), (C, H, W), n_in),
+        'p': Op('p', 'maxpool', ('x',), (C, 3, 3), C * 3 * 3,
+                params={'in_shape': (C, H, W), 'kernel_shape': (2, 2),
+                        'stride': (2, 2), 'padding': (0, 0)}),
+    }
+    net = Net(ops, ['p'], 'x', 'p')
+    x = torch.tensor(RNG.uniform(-3, 3, (8, n_in)), dtype=torch.float32)
+    y_pool = fwd.point(net, x)
+    net2 = decompose_maxpool(net)
+    assert not any(o.kind == 'maxpool' for o in net2.ops.values())
+    y_relu = fwd.point(net2, x)
+    assert torch.allclose(y_pool, y_relu, atol=1e-5), "maxpool decomp not exact"

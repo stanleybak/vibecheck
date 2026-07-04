@@ -894,22 +894,16 @@ def load(onnx_path, dtype=np.float32) -> Net:
     ReLU+affine); all are semantics-preserving, so the parity gates against
     ORT still bind."""
     from vibecheck.network import ComputeGraph
-    from vibecheck.onnx_optimizer import (drop_identity_pads,
-                                          maxpool_to_relu, min_max_to_relu)
+    from vibecheck.onnx_optimizer import drop_identity_pads, min_max_to_relu
     cg = ComputeGraph.from_onnx(onnx_path, dtype=dtype)
     drop_identity_pads(cg)
-    try:
-        maxpool_to_relu(cg)
-    except NotImplementedError as e:
-        # padded MaxPool pads with -inf, which the ONNX-level rewrite
-        # refuses; the Net-level decomposition below handles it exactly
-        # (padded window slots repeat a valid element: max(a, a) = a)
-        print(f'[vc2] onnx maxpool_to_relu skipped ({e}); '
-              f'decomposing at the Net level')
     min_max_to_relu(cg)
     net = from_compute_graph(cg, true_shapes=_onnx_true_shapes(onnx_path))
     from .graph_opt import fold_split_relu
     net = fold_split_relu(net)          # undo relu-split hardening (exact)
+    # MaxPool is emitted as a native maxpool op (from_compute_graph) and
+    # decomposed here into the exact pairwise relu tree -- one vc2-native path
+    # for padded AND unpadded pools (no ONNX-level maxpool_to_relu needed).
     net = decompose_maxpool(net)
     net = tag_simplex_bmm(net)
     net.onnx_path = onnx_path

@@ -339,8 +339,9 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
                 (Ap * aly + An * auy).sum(dim=3).reshape(B, q, -1))
             d = d + (Ap * clo + An * cup).sum(dim=(2, 3, 4, 5))
         elif op.kind == 'maxpool':
-            raise NotImplementedError(
-                'crown: maxpool relaxation arrives with M5 (relu decomposition)')
+            raise AssertionError(                       # unreachable
+                'crown reached a maxpool op: decompose_maxpool must run at '
+                'load (graph.py) so no maxpool survives into relaxation')
         else:
             raise NotImplementedError(f'crown: op kind {op.kind!r}')
 

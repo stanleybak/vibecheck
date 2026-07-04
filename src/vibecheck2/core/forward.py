@@ -462,8 +462,9 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
             state[name] = ZonoState(c2, torch.diag_embed(delta),
                                     [(name, i) for i in range(c2.shape[1])])
         elif op.kind == 'maxpool':
-            raise NotImplementedError(
-                'zono: maxpool arrives with M5 (relu decomposition)')
+            raise AssertionError(                       # unreachable
+                'zono reached a maxpool op: decompose_maxpool must run at '
+                'load (graph.py) so no maxpool survives into relaxation')
         else:
             raise NotImplementedError(f'zono: op kind {op.kind!r}')
     zout = state[net.output_name]
