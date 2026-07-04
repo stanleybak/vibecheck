@@ -94,7 +94,7 @@ def test_milp_candidate_is_genuine():
     xc = torch.tensor(cand, dtype=torch.float32).reshape(1, -1)
     from vibecheck2.core import forward as fwd
     yv = fwd.point(net, xc)
-    assert float(yv[0, 0] + bias[0]) < 0.0      # genuinely violating
+    assert float(yv[0, 0] + bias[0]) <= 1e-5    # satisfies the CE region (<=0)
     assert (xc[0] >= lo[0] - 1e-6).all() and (xc[0] <= hi[0] + 1e-6).all()
 
 

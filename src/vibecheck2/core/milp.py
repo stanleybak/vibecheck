@@ -129,17 +129,6 @@ def refute_rows_milp(net, lo, hi, inter, W, bias, disj_idx, disjuncts,
     bn = bias.cpu().numpy().astype(float)
     refuted = set()
     candidate = None
-
-    def _solve(obj, budget):
-        m.setObjective(obj, gp.GRB.MINIMIZE)
-        m.Params.TimeLimit = max(3.0, budget)
-        m.Params.BestBdStop = obj_margin        # stop once the sign is decided
-        m.Params.BestObjStop = -obj_margin
-        m.optimize()
-        bound = m.ObjBound if m.SolCount >= 0 else -np.inf
-        inc = m.ObjVal if m.SolCount > 0 else float('nan')
-        return bound, inc
-
     todo = list(disjuncts)
     for d in todo:
         left = deadline - time.time()
@@ -147,32 +136,25 @@ def refute_rows_milp(net, lo, hi, inter, W, bias, disj_idx, disjuncts,
             break
         d = int(d)
         rows = rows_of[d]
-        per_q = max(3.0, left / max(1, len(todo) - len(refuted)))
-        # per-row: one always-positive row already refutes the conjunction
-        done = False
-        for r in rows:
-            bound, inc = _solve(Wn[r] @ y_out + bn[r], per_q / len(rows))
-            log(f'[vc2/milp] disj {d} row {r}: bound={bound:+.6f} '
-                f'inc={inc:+.6f}')
-            if m.Status == gp.GRB.INFEASIBLE or bound > obj_margin:
-                refuted.add(d)
-                done = True
-                break
-            if len(rows) == 1 and m.SolCount > 0 and inc < -obj_margin \
-                    and candidate is None:
-                candidate = np.array(x_in.X, dtype=np.float64)  # single-row CE
-        if done or len(rows) == 1 or deadline - time.time() < 3:
-            continue
-        # joint conjunction: min_x max_r (w_r.y + b_r) > 0 proves no CE
-        t = m.addVar(lb=-gp.GRB.INFINITY, name=f'_t{d}')
-        cs = [m.addConstr(t >= Wn[r] @ y_out + bn[r]) for r in rows]
-        bound, inc = _solve(t, max(3.0, deadline - time.time() - 1))
-        log(f'[vc2/milp] disj {d} JOINT (k={len(rows)}): bound={bound:+.6f} '
-            f'inc={inc:+.6f}')
-        if m.Status == gp.GRB.INFEASIBLE or bound > obj_margin:
-            refuted.add(d)
-        elif m.SolCount > 0 and inc < -obj_margin and candidate is None:
-            candidate = np.array(x_in.X, dtype=np.float64)   # whole AND holds
+        # FEASIBILITY of the CE region {all rows w_r.y + b_r <= 0} (v1's Gurobi
+        # route). INFEASIBLE proves no counterexample exists -> refuted, and it
+        # is DECISIVE at any positive true margin -- no razor-thin obj_margin
+        # trap (min-of-max got stuck at a loose LP bound of 0.0 on sat_relu
+        # v56_c239, where the exact margin is a tiny positive epsilon). A
+        # feasible point satisfies every row -> a CE candidate the caller
+        # validates through the ORT chokepoint.
+        cs = [m.addConstr(Wn[r] @ y_out + bn[r] <= 0.0) for r in rows]
+        m.setObjective(0.0)
+        m.Params.BestBdStop = gp.GRB.INFINITY
+        m.Params.BestObjStop = gp.GRB.INFINITY
+        m.Params.TimeLimit = max(3.0, left / max(1, len(todo) - len(refuted)))
+        t0 = time.time()
+        m.optimize()
+        log(f'[vc2/milp] disj {d} (k={len(rows)}): status={m.Status} '
+            f'sols={m.SolCount} t={time.time() - t0:.1f}s')
+        if m.Status == gp.GRB.INFEASIBLE:
+            refuted.add(d)                          # sound: CE region empty
+        elif m.SolCount > 0 and candidate is None:
+            candidate = np.array(x_in.X, dtype=np.float64)  # all rows <= 0
         m.remove(cs)
-        m.remove(t)
     return refuted, candidate
