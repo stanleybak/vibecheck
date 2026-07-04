@@ -92,6 +92,15 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
         try:
             return try_discrete_enum(onnx_path, vnnlib_path, timeout, log)
         except NotImplementedError:
+            # discrete-enum can't model it either. An unsupported OP in the
+            # original load (e.g. smart_turn's quantized/dequantized conv
+            # kernels) is a FEATURE BOUNDARY -> honest 'unknown', not a crash;
+            # any other load error is a real bug and still becomes 'error'.
+            if isinstance(e, NotImplementedError):
+                log(f'[vc2] net not supported: {e}; verdict unknown')
+                return 'unknown', {
+                    'reason': f'not_implemented: {str(e)[:200]}',
+                    'time': time.time() - t0}
             raise e
     try:
         spec = load_vnnlib(vnnlib_path)
