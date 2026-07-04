@@ -423,6 +423,18 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     f'open={len(open_d)}/{len(spec.disjuncts)}')
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
+    # MILP eligibility, computed BEFORE the dual so the dual cannot starve the
+    # exact escalation. On spread-slack relu nets (malbeware: 7842 unstable in
+    # one wide layer) the dual spins the full budget refuting nothing, but the
+    # triangle-exact MILP proves ObjBound>0 in ~8s. Reserve it a slice by
+    # capping the dual's deadline; non-eligible nets (conv/deep) reserve 0.
+    n_nonlin_m = sum(net.ops[nm].n for nm in net.order
+                     if net.ops[nm].kind == 'nonlin')
+    relu_only = all(op.fn == 'relu' for op in net.ops.values()
+                    if op.kind == 'nonlin')
+    milp_eligible = relu_only and n_nonlin_m <= 25_000
+    milp_reserve = (min(45.0, 0.45 * (t0 + timeout - time.time()))
+                    if milp_eligible else 0.0)
     if verdict != 'unsat':
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
@@ -431,7 +443,8 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         from .core.dual_lp import certify_queries
         refuted = certify_queries(
             net, spec, W, b, di, lo, hi, inter, open_d,
-            deadline=t0 + timeout - 2.0, device=device, log=log)
+            deadline=t0 + timeout - 2.0 - milp_reserve, device=device,
+            log=log)
         open_d = [d for d in open_d if d not in refuted]
         log(f'[vc2] dual-lp: {len(refuted)} disjuncts refuted, '
             f'{len(open_d)} open')
@@ -444,11 +457,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # (measured: 9.6k splits, zero closures), but the triangle-exact
         # MILP closes them. Gated to relu-only nets small enough to
         # encode; leaves a slice for the BaB fall-through.
-        n_nonlin_m = sum(net.ops[nm].n for nm in net.order
-                         if net.ops[nm].kind == 'nonlin')
-        relu_only = all(op.fn == 'relu' for op in net.ops.values()
-                        if op.kind == 'nonlin')
-        if relu_only and n_nonlin_m <= 25_000 and budget.remaining() > 25:
+        if milp_eligible and budget.remaining() > 25:
             from .core.milp import refute_rows_milp
             rows_open = [r for d in open_d
                          for r in torch.nonzero(di == d, as_tuple=False)
