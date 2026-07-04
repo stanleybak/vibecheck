@@ -771,10 +771,16 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
             l, h = inter[nm]
             n_unstable += int(((l < 0) & (h > 0)).sum())
     est = float(n_unstable) * (net.n_in + n_unstable) * 4
-    if est > 2e9:
-        log(f'[vc2/dual] skipped: dense state ~{est / 1e9:.1f}GB '
-            f'({n_unstable} unstable rows; needs the sparse-patches '
-            f'state, M5)')
+    # skip cap (dense-worst-case estimate). Overridable via VC_DUAL_MAXGB to
+    # probe how much the ACTUAL sparse backward state (row_indices/row_values
+    # per unstable neuron) really costs vs this dense upper bound -- the M5
+    # sparse-patch question is whether conv nets stay far under it.
+    import os as _os
+    _cap = float(_os.environ.get('VC_DUAL_MAXGB', '2.0')) * 1e9
+    if est > _cap:
+        log(f'[vc2/dual] skipped: dense-est state ~{est / 1e9:.1f}GB > '
+            f'cap {_cap / 1e9:.1f}GB ({n_unstable} unstable rows; '
+            f'sparse-patches state = M5)')
         return set()
     # per-query direction-adaptive slopes (v1 build_dir_adaptive_alpha):
     # per neuron, the OPTIMIZED alpha where the query's adjoint ew > 0

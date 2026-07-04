@@ -240,13 +240,67 @@ class _V1Band:
     def _rel(self, params=None):
         raise NotImplementedError
 
-    def band(self, lo, hi, params=None):
-        lam, mu, delta = self._rel(params).affine_band(lo, hi)
+    def _deriv(self, x, params=None):
+        """f'(x), used only to bound the alpha slope search; not a bound."""
+        raise NotImplementedError
+
+    def band(self, lo, hi, params=None, lam=None):
+        # affine_band is SOUND FOR ANY lam (v1 nl_* docstring): the caller may
+        # supply an optimized slope; None keeps v1's chord default.
+        lam, mu, delta = self._rel(params).affine_band(lo, hi, lam=lam)
         return (lam.to(lo.dtype), mu.to(lo.dtype), delta.to(lo.dtype))
 
     def planes(self, lo, hi, params=None):
         lam, mu, delta = self.band(lo, hi, params)
         return lam, mu - delta, lam, mu + delta
+
+    def _convexity(self, lo, hi, params=None):
+        """(convex_mask, concave_mask): True only where f is PROVABLY convex
+        (resp. concave) over the WHOLE [lo, hi]. Default: unknown everywhere
+        (falls back to the sound symmetric band). Subclasses that can decide
+        it soundly (pow) override."""
+        z = torch.zeros_like(lo, dtype=torch.bool)
+        return z, z
+
+    def alpha_planes(self, lo, hi, alpha, params=None):
+        """nl_alpha for sin/cos/pow. Where the op is PROVABLY convex/concave
+        over [lo,hi], use the tight ASYMMETRIC CROWN planes -- one side is the
+        chord, the other an OPTIMIZABLE TANGENT (a tangent lies below a convex
+        f / above a concave f for ANY touch point, so every alpha in [0,1] is
+        sound and differentiable; no arccos, no NaN). Elsewhere (sin/cos over
+        a mixed interval) fall back to the sound single-slope band."""
+        f = self.point
+        convex, concave = self._convexity(lo, hi, params)
+        w = (hi - lo).clamp_min(1e-12)
+        chord = torch.where(hi > lo,
+                            (f(hi, params) - f(lo, params)) / w,
+                            self._deriv(lo, params))
+        b_chord = f(lo, params) - chord * lo
+        # optimizable tangent at t; slope f'(t), intercept f(t) - f'(t) t
+        t_lo = lo + alpha[..., 0, :].clamp(0.0, 1.0) * (hi - lo)
+        t_hi = lo + alpha[..., 1, :].clamp(0.0, 1.0) * (hi - lo)
+        s_lo, s_hi = self._deriv(t_lo, params), self._deriv(t_hi, params)
+        cvx = torch.broadcast_to(convex, s_lo.shape)
+        ccv = torch.broadcast_to(concave, s_lo.shape)
+        chb = torch.broadcast_to(chord, s_lo.shape)
+        bcb = torch.broadcast_to(b_chord, s_lo.shape)
+        # default chord/chord covers convex-upper and concave-lower; then set
+        # the tangent side. convex: lower=tangent, upper=chord. concave: swap.
+        al = torch.where(cvx, s_lo, chb)
+        bl = torch.where(cvx, f(t_lo, params) - s_lo * t_lo, bcb)
+        au = torch.where(ccv, s_hi, chb)
+        bu = torch.where(ccv, f(t_hi, params) - s_hi * t_hi, bcb)
+        # mixed intervals (sin/cos spanning an inflection): the sound
+        # single-slope band -- only compute the pricey affine_band if needed.
+        unknown = ~(cvx | ccv)
+        if bool(unknown.any()):
+            lam_b, mu, delta = self.band(lo, hi, params)
+            lb = torch.broadcast_to(lam_b, al.shape)
+            al = torch.where(unknown, lb, al)
+            bl = torch.where(unknown, torch.broadcast_to(mu - delta, al.shape), bl)
+            au = torch.where(unknown, lb, au)
+            bu = torch.where(unknown, torch.broadcast_to(mu + delta, al.shape), bu)
+        return al, bl, au, bu
 
 
 class Sin(_V1Band):
@@ -257,6 +311,9 @@ class Sin(_V1Band):
         from vibecheck.nl_sin import SinRelax
         return SinRelax()
 
+    def _deriv(self, x, params=None):
+        return torch.cos(x)
+
 
 class Cos(_V1Band):
     def point(self, x, params=None):
@@ -265,6 +322,9 @@ class Cos(_V1Band):
     def _rel(self, params=None):
         from vibecheck.nl_cos import CosRelax
         return CosRelax()
+
+    def _deriv(self, x, params=None):
+        return -torch.sin(x)
 
 
 class Exp:
@@ -341,6 +401,22 @@ class Pow(_V1Band):
     def _rel(self, params=None):
         from vibecheck.nl_pow import PowRelax
         return PowRelax((params or {})['exponent'])
+
+    def _deriv(self, x, params=None):
+        e = (params or {})['exponent']
+        return e * x ** (e - 1)
+
+    def _convexity(self, lo, hi, params=None):
+        # f''(x) = e(e-1) x^(e-2): even integer e >= 2 is convex everywhere;
+        # odd e is convex on x>=0, concave on x<=0. Other e -> band fallback.
+        e = (params or {})['exponent']
+        if float(e).is_integer() and e >= 2:
+            if int(e) % 2 == 0:
+                t = torch.ones_like(lo, dtype=torch.bool)
+                return t, torch.zeros_like(t)
+            return lo >= 0, hi <= 0
+        z = torch.zeros_like(lo, dtype=torch.bool)
+        return z, z
 
 
 class _SignSTE(torch.autograd.Function):
