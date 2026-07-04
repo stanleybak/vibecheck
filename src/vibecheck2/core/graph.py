@@ -638,6 +638,51 @@ def from_compute_graph(cg, true_shapes=None) -> Net:
                 emit(name, 'linmap', [inp], out_shape,
                      lm=lm.ScaleShift(None, b, n_out))
 
+        elif t in ('Min', 'Max'):
+            # EXACT Min/Max -> ReLU+affine (only Sub/Relu/Add, all sound):
+            #   max(x,c) = c + ReLU(x - c)     min(x,c) = c - ReLU(c - x)
+            #   max(a,b) = a + ReLU(b - a)     min(a,b) = a - ReLU(a - b)
+            # Needed by the monotonic_acasxu clamp Min(Max(v,LO),HI). Native
+            # here so the IR owns it (no v1 onnx_optimizer.min_max_to_relu).
+            is_max = t == 'Max'
+            neg = lambda k: lm.ScaleShift(-np.ones(k, dtype=dtype), None, k)
+            sub_nm, rel_nm = name + '/mm_sub', name + '/mm_relu'
+            ckey = next((k for k in node.params
+                         if k.startswith('const_')), None)
+            if ckey is not None:
+                c = _broadcast_flat(node.params[ckey], out_shape, dtype)
+                inp, _n = broadcast_in(node, out_shape)
+                if is_max:                          # c + ReLU(x - c)
+                    emit(sub_nm, 'linmap', [inp], out_shape,
+                         lm=lm.ScaleShift(None, -c, n_out))
+                    emit(rel_nm, 'nonlin', [sub_nm], out_shape, fn='relu')
+                    emit(name, 'linmap', [rel_nm], out_shape,
+                         lm=lm.ScaleShift(None, c, n_out))
+                else:                               # c - ReLU(c - x)
+                    emit(sub_nm, 'linmap', [inp], out_shape,
+                         lm=lm.ScaleShift(-np.ones(n_out, dtype=dtype), c,
+                                          n_out))
+                    emit(rel_nm, 'nonlin', [sub_nm], out_shape, fn='relu')
+                    emit(name, 'linmap', [rel_nm], out_shape,
+                         lm=lm.ScaleShift(-np.ones(n_out, dtype=dtype), c,
+                                          n_out))
+            else:
+                na, nb, full = broadcast_pair(node)
+                nf = _flat(full)
+                ng = name + '/mm_neg'
+                if is_max:                          # a + ReLU(b - a)
+                    emit(ng, 'linmap', [na], full, lm=neg(nf))
+                    emit(sub_nm, 'add', [nb, ng], full)
+                    emit(rel_nm, 'nonlin', [sub_nm], full, fn='relu')
+                    emit(name, 'add', [na, rel_nm], full)
+                else:                               # a - ReLU(a - b)
+                    emit(ng, 'linmap', [nb], full, lm=neg(nf))
+                    emit(sub_nm, 'add', [na, ng], full)
+                    emit(rel_nm, 'nonlin', [sub_nm], full, fn='relu')
+                    ngr = name + '/mm_negr'
+                    emit(ngr, 'linmap', [rel_nm], full, lm=neg(nf))
+                    emit(name, 'add', [na, ngr], full)
+
         elif t in ('Mul', 'Div'):
             if 'scale' in node.params:      # Div's scale is pre-inverted by v1
                 a = _broadcast_flat(node.params['scale'], out_shape, dtype)
@@ -894,10 +939,10 @@ def load(onnx_path, dtype=np.float32) -> Net:
     ReLU+affine); all are semantics-preserving, so the parity gates against
     ORT still bind."""
     from vibecheck.network import ComputeGraph
-    from vibecheck.onnx_optimizer import drop_identity_pads, min_max_to_relu
     cg = ComputeGraph.from_onnx(onnx_path, dtype=dtype)
-    drop_identity_pads(cg)
-    min_max_to_relu(cg)
+    # graph-opt is now fully vc2-native: from_compute_graph handles Pad (any
+    # constant pad), Min/Max, and MaxPool directly on the IR, and the passes
+    # below fold split-relus + decompose maxpool. No v1 onnx_optimizer.
     net = from_compute_graph(cg, true_shapes=_onnx_true_shapes(onnx_path))
     from .graph_opt import fold_split_relu
     net = fold_split_relu(net)          # undo relu-split hardening (exact)

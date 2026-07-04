@@ -145,3 +145,44 @@ def test_decompose_maxpool_is_exact():
     assert not any(o.kind == 'maxpool' for o in net2.ops.values())
     y_relu = fwd.point(net2, x)
     assert torch.allclose(y_pool, y_relu, atol=1e-5), "maxpool decomp not exact"
+
+
+def _load_from_onnx_nodes(nodes, inits, in_dims, out_name):
+    """Build a tiny ONNX model in memory and load it through vc2 -> Net."""
+    import tempfile, os, onnx
+    from onnx import helper, TensorProto as TP
+    from vibecheck2.core.graph import load as load_net
+    xi = helper.make_tensor_value_info('x', TP.FLOAT, [1, *in_dims])
+    yo = helper.make_tensor_value_info(out_name, TP.FLOAT, None)
+    g = helper.make_graph(nodes, 'g', [xi], [yo], inits)
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 13)])
+    m.ir_version = 8
+    fd, p = tempfile.mkstemp(suffix='.onnx')
+    os.close(fd)
+    onnx.save(m, p)
+    try:
+        return load_net(p)
+    finally:
+        os.remove(p)
+
+
+def test_native_minmax_is_exact_clamp():
+    from onnx import helper, TensorProto as TP
+    inits = [helper.make_tensor('lo', TP.FLOAT, [1], [0.5]),
+             helper.make_tensor('hi', TP.FLOAT, [1], [2.0])]
+    nodes = [helper.make_node('Max', ['x', 'lo'], ['m']),
+             helper.make_node('Min', ['m', 'hi'], ['y'])]
+    net = _load_from_onnx_nodes(nodes, inits, [4], 'y')
+    assert not any(o.kind == 'maxpool' for o in net.ops.values())
+    x = torch.tensor(RNG.uniform(-3, 3, (16, 4)), dtype=torch.float32)
+    y = fwd.point(net, x)
+    assert torch.allclose(y, torch.clamp(x, 0.5, 2.0), atol=1e-5)
+
+
+def test_native_pad_is_identity_on_zero_pad():
+    from onnx import helper, TensorProto as TP
+    pads = helper.make_tensor('pads', TP.INT64, [4], [0, 0, 0, 0])
+    nodes = [helper.make_node('Pad', ['x', 'pads'], ['y'], mode='constant')]
+    net = _load_from_onnx_nodes(nodes, [pads], [3], 'y')
+    x = torch.tensor(RNG.uniform(-2, 2, (8, 3)), dtype=torch.float32)
+    assert torch.allclose(fwd.point(net, x), x, atol=1e-6)
