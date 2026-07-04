@@ -63,9 +63,9 @@ def test_milp_matches_exact():
                         lo[0].numpy(), hi[0].numpy())
              for r in range(3)]
     import time
-    refuted, cand = refute_rows_milp(net, lo, hi, inter, W, bias,
-                                     [0, 1, 2],
-                                     deadline=time.time() + 60)
+    refuted, cand = refute_rows_milp(  # each row its own disjunct
+        net, lo, hi, inter, W, bias, torch.tensor([0, 1, 2]), [0, 1, 2],
+        deadline=time.time() + 60)
     for r in range(3):
         if exact[r] > 0.05:                     # clearly positive rows
             assert r in refuted, (r, exact[r])
@@ -86,7 +86,8 @@ def test_milp_candidate_is_genuine():
                     0) @ lm3.W.T + lm3.b)
     bias = torch.tensor([float(-y[:, 0].min()) - 0.5])  # min goes negative
     import time
-    refuted, cand = refute_rows_milp(net, lo, hi, inter, W, bias, [0],
+    refuted, cand = refute_rows_milp(net, lo, hi, inter, W, bias,
+                                     torch.tensor([0]), [0],
                                      deadline=time.time() + 60)
     assert 0 not in refuted
     assert cand is not None
@@ -95,3 +96,36 @@ def test_milp_candidate_is_genuine():
     yv = fwd.point(net, xc)
     assert float(yv[0, 0] + bias[0]) < 0.0      # genuinely violating
     assert (xc[0] >= lo[0] - 1e-6).all() and (xc[0] <= hi[0] + 1e-6).all()
+
+
+def test_milp_conjunction_refuted_when_no_single_row_is():
+    """The sat_relu case: a disjunct is a CONJUNCTION of rows, none of which
+    is individually refutable, but whose AND is infeasible. Rows y+c and -y+c
+    (c>0) give {y<=-c AND y>=c} = empty, yet each alone is satisfiable when y
+    straddles +-c. Per-row refutation must FAIL; the joint max-row must SUCCEED.
+    """
+    from vibecheck2.core.graph import Net, Op
+    from vibecheck2.core.linmap import Dense
+    import time
+    # trivial net y = x over [-1, 1] (y straddles +-c)
+    net = Net({'x': Op('x', 'input', (), (1,), 1),
+               'y': Op('y', 'linmap', ('x',), (1,), 1,
+                       lm=Dense(np.eye(1, dtype=np.float32),
+                                np.zeros(1, dtype=np.float32)))},
+              ['y'], 'x', 'y')
+    lo, hi = -torch.ones(1, 1), torch.ones(1, 1)
+    inter = backward.intermediates_crown(net, lo, hi)
+    c = 0.1
+    W = torch.tensor([[1.0], [-1.0]])
+    bias = torch.tensor([c, c])
+    # per-row (each its own disjunct): NEITHER refutable
+    indiv, _ = refute_rows_milp(net, lo, hi, inter, W, bias,
+                                torch.tensor([0, 1]), [0, 1],
+                                deadline=time.time() + 60)
+    assert indiv == set(), f"a single row was refutable ({indiv}); joint path not exercised"
+    # both rows in ONE disjunct (a conjunction): jointly refuted
+    joint, cand = refute_rows_milp(net, lo, hi, inter, W, bias,
+                                   torch.tensor([0, 0]), [0],
+                                   deadline=time.time() + 60)
+    assert 0 in joint, "conjunction not refuted by the joint max-row MILP"
+    assert cand is None

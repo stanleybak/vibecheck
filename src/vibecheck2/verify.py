@@ -353,12 +353,9 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         the solver DUAL bound (sound at any point); an incumbent is only a
         candidate and is validated through the ORT chokepoint."""
         from .core.milp import refute_rows_milp
-        rows_open = [r for d in open_d
-                     for r in torch.nonzero(di == d, as_tuple=False)
-                     .flatten().tolist()]
         try:
             mrefuted, cand = refute_rows_milp(net, lo, hi, inter, W, b,
-                                              rows_open, deadline=deadline,
+                                              di, open_d, deadline=deadline,
                                               log=log)
         except NotImplementedError as e:
             log(f'[vc2/milp] skipped: {e}')
@@ -369,11 +366,8 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             if okc:
                 return 'sat', np.asarray(vinfo.get('witness_inbox', cand))
             log('[vc2/milp] incumbent rejected by ORT chokepoint')
-        rem = [d for d in open_d
-               if not any(int(r) in mrefuted for r in
-                          torch.nonzero(di == d, as_tuple=False)
-                          .flatten().tolist())]
-        log(f'[vc2] milp: {len(mrefuted)} rows refuted, {len(rem)} open')
+        rem = [d for d in open_d if int(d) not in mrefuted]
+        log(f'[vc2] milp: {len(mrefuted)} disjuncts refuted, {len(rem)} open')
         return ('unsat', None) if not rem else ('open', rem)
 
     if verdict != 'unsat' and open_d and milp_eligible \

@@ -36,15 +36,27 @@ def _linmap_matrix(lm, n_in, dev):
     return W, b
 
 
-def refute_rows_milp(net, lo, hi, inter, W, bias, rows, deadline,
-                     log=lambda m: None, obj_margin=1e-5):
-    """Try to refute each query row (w.y + b > 0 proven) by exact MILP.
+def refute_rows_milp(net, lo, hi, inter, W, bias, disj_idx, disjuncts,
+                     deadline, log=lambda m: None, obj_margin=1e-5):
+    """Refute each open DISJUNCT (conjunction of rows) by exact MILP.
 
-    Returns (refuted_row_set, candidate_ce_or_None). A candidate CE is
-    the incumbent of a row whose optimum went clearly negative; the
-    caller MUST validate it through the ORT chokepoint.
+    A counterexample to disjunct d satisfies EVERY row: w_r.y + b_r <= 0.
+    Refuting d proves that region empty:
+      - single row r:        min_x (w_r.y + b_r) > 0.
+      - conjunction (k>1):   min_x max_r (w_r.y + b_r) > 0  (a per-row pass
+        runs first, since one always-positive row already refutes the AND).
+    This closes conjunctive specs (sat_relu) that per-row refutation cannot.
+
+    disj_idx (q,): disjunct id of each query row. disjuncts: ids to try.
+    Returns (refuted_disjunct_set, candidate_ce_or_None); a candidate is an
+    incumbent where the whole conjunction holds, validated by the caller
+    through the ORT chokepoint.
     """
     import gurobipy as gp
+
+    di = disj_idx.cpu().numpy() if hasattr(disj_idx, 'cpu') else \
+        np.asarray(disj_idx)
+    rows_of = {int(d): np.nonzero(di == d)[0].tolist() for d in disjuncts}
 
     dev = lo.device
     n_bin = 0
@@ -59,7 +71,7 @@ def refute_rows_milp(net, lo, hi, inter, W, bias, rows, deadline,
         elif op.kind not in ('input', 'linmap', 'add', 'concat'):
             raise NotImplementedError(f'milp: op kind {op.kind!r}')
     log(f'[vc2/milp] encoding: {n_bin} binaries, '
-        f'{len(rows)} rows, budget {deadline - time.time():.0f}s')
+        f'{len(disjuncts)} disjuncts, budget {deadline - time.time():.0f}s')
 
     m = gp.Model()
     m.Params.OutputFlag = 0
@@ -113,32 +125,54 @@ def refute_rows_milp(net, lo, hi, inter, W, bias, rows, deadline,
             edge[nm] = y
 
     y_out = edge[net.output_name]
+    Wn = W.cpu().numpy().astype(float)
+    bn = bias.cpu().numpy().astype(float)
     refuted = set()
     candidate = None
-    for r in rows:
+
+    def _solve(obj, budget):
+        m.setObjective(obj, gp.GRB.MINIMIZE)
+        m.Params.TimeLimit = max(3.0, budget)
+        m.Params.BestBdStop = obj_margin        # stop once the sign is decided
+        m.Params.BestObjStop = -obj_margin
+        m.optimize()
+        bound = m.ObjBound if m.SolCount >= 0 else -np.inf
+        inc = m.ObjVal if m.SolCount > 0 else float('nan')
+        return bound, inc
+
+    todo = list(disjuncts)
+    for d in todo:
         left = deadline - time.time()
         if left < 3:
             break
-        w = W[r].cpu().numpy().astype(float)
-        b = float(bias[r])
-        m.setObjective(w @ y_out + b, gp.GRB.MINIMIZE)
-        m.Params.TimeLimit = max(3.0, left / max(1, len(rows) -
-                                                 len(refuted)))
-        # stop as soon as the sign is decided either way
-        m.Params.BestBdStop = obj_margin
-        m.Params.BestObjStop = -obj_margin
-        t0 = time.time()
-        m.optimize()
-        bound = m.ObjBound if m.SolCount >= 0 else -np.inf
-        log(f'[vc2/milp] row {r}: status={m.Status} '
-            f'bound={bound:+.6f} incumbent='
-            f'{m.ObjVal if m.SolCount > 0 else float("nan"):+.6f} '
-            f't={time.time() - t0:.1f}s')
-        if m.Status == gp.GRB.INFEASIBLE:
-            # the box itself admits no feasible point: vacuous refutation
-            refuted.add(r)
-        elif bound > obj_margin:
-            refuted.add(r)                      # sound: dual bound > 0
-        elif m.SolCount > 0 and m.ObjVal < -obj_margin and candidate is None:
-            candidate = np.array(x_in.X, dtype=np.float64)
+        d = int(d)
+        rows = rows_of[d]
+        per_q = max(3.0, left / max(1, len(todo) - len(refuted)))
+        # per-row: one always-positive row already refutes the conjunction
+        done = False
+        for r in rows:
+            bound, inc = _solve(Wn[r] @ y_out + bn[r], per_q / len(rows))
+            log(f'[vc2/milp] disj {d} row {r}: bound={bound:+.6f} '
+                f'inc={inc:+.6f}')
+            if m.Status == gp.GRB.INFEASIBLE or bound > obj_margin:
+                refuted.add(d)
+                done = True
+                break
+            if len(rows) == 1 and m.SolCount > 0 and inc < -obj_margin \
+                    and candidate is None:
+                candidate = np.array(x_in.X, dtype=np.float64)  # single-row CE
+        if done or len(rows) == 1 or deadline - time.time() < 3:
+            continue
+        # joint conjunction: min_x max_r (w_r.y + b_r) > 0 proves no CE
+        t = m.addVar(lb=-gp.GRB.INFINITY, name=f'_t{d}')
+        cs = [m.addConstr(t >= Wn[r] @ y_out + bn[r]) for r in rows]
+        bound, inc = _solve(t, max(3.0, deadline - time.time() - 1))
+        log(f'[vc2/milp] disj {d} JOINT (k={len(rows)}): bound={bound:+.6f} '
+            f'inc={inc:+.6f}')
+        if m.Status == gp.GRB.INFEASIBLE or bound > obj_margin:
+            refuted.add(d)
+        elif m.SolCount > 0 and inc < -obj_margin and candidate is None:
+            candidate = np.array(x_in.X, dtype=np.float64)   # whole AND holds
+        m.remove(cs)
+        m.remove(t)
     return refuted, candidate
