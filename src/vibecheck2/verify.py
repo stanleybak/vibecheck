@@ -140,25 +140,34 @@ def _verify_groups(net, spec, groups, onnx_path, timeout, device,
         return _verify_one(net, spec, onnx_path, timeout, device,
                            alpha_iters, pgd_budget, log, t0)
     log(f'[vc2] {len(groups)} input-subbox groups (per-disjunct boxes)')
-    if len(groups) > 16 and all(len(idxs) == 1 for _, _, idxs in groups):
-        # single-row-per-group survivors (nn4sys cardinality: 960 subs
-        # over 2 shared W rows): one MULTI-SUB input-split BaB over the
-        # stacked subboxes -- the batched bound amortizes across subs,
-        # where the serial per-group pipeline got 0.2s each and timed out
+    if len(groups) > 16:
+        # MULTI-SUB input-split BaB: one root per (subbox, single-row
+        # disjunct). The batched bound amortizes across all subs where a
+        # serial per-group pipeline times out (nn4sys cardinality 960; lindex
+        # 120k). A subbox may carry SEVERAL disjuncts (lindex: 2/box) -- each
+        # becomes its OWN root, so the per-group disjunct count no longer
+        # matters (the old code required exactly 1 and otherwise fell to a
+        # screen+serial loop that bounded every group vs ALL query rows and
+        # stalled). Requires every disjunct single-row: its row is the root's
+        # refutation target.
         W, b, di = _spec_queries(spec, net.n_out)
         per_d = {}
         for i in range(di.shape[0]):
             per_d.setdefault(int(di[i]), []).append(i)
-        if all(len(per_d.get(idxs[0], ())) == 1 for _, _, idxs in groups):
+        if all(len(per_d.get(d, ())) == 1
+               for _, _, idxs in groups for d in idxs):
             from .core.search import input_split_bab
-            r_lo = torch.tensor(np.stack([np.asarray(g[0]).ravel()
-                                          for g in groups]),
-                                dtype=torch.float32)
-            r_hi = torch.tensor(np.stack([np.asarray(g[1]).ravel()
-                                          for g in groups]),
-                                dtype=torch.float32)
-            r_row = torch.tensor([per_d[idxs[0]][0]
-                                  for _, _, idxs in groups])
+            r_lo, r_hi, r_row = [], [], []
+            for glo, ghi, idxs in groups:
+                glo = np.asarray(glo).ravel()
+                ghi = np.asarray(ghi).ravel()
+                for d in idxs:
+                    r_lo.append(glo)
+                    r_hi.append(ghi)
+                    r_row.append(per_d[d][0])
+            r_lo = torch.tensor(np.stack(r_lo), dtype=torch.float32)
+            r_hi = torch.tensor(np.stack(r_hi), dtype=torch.float32)
+            r_row = torch.tensor(r_row)
             verdict, binfo = input_split_bab(
                 net, spec, W, b, di, r_lo.min(dim=0).values,
                 r_hi.max(dim=0).values,
