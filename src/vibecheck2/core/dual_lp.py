@@ -365,6 +365,7 @@ def build_state(net, lo, hi, inter=None, slopes=None):
 
 
 _VERIFIER = {}
+_DUMP_WARNED = False           # BnB-dump telemetry failure logged once
 
 
 def _host_ram_room():
@@ -859,11 +860,20 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                 # bank the BnB problem for the offline dual-ascent
                 # harness (num iterations, step rules, split orders,
                 # per-node slope optimization -- experiments need a
-                # dataset, and every campaign run contributes)
+                # dataset, and every campaign run contributes). This is
+                # AUXILIARY telemetry: a dump failure must never abort a
+                # verify, so it is caught and logged, never propagated.
                 from vibecheck.fast_dual_ascent.fast_verify_dual import (
                     _dump_bnb_instance)
-                _dump_bnb_instance(state, qw, qb, list(sk),
-                                   _os.environ['VC_DUMP_BNB_DIR'])
+                try:
+                    _dump_bnb_instance(state, qw, qb, list(sk),
+                                       _os.environ['VC_DUMP_BNB_DIR'])
+                except Exception as _e:           # noqa: BLE001 - telemetry
+                    global _DUMP_WARNED
+                    if not _DUMP_WARNED:
+                        log(f'[vc2/dual] BnB dump skipped (telemetry only): '
+                            f'{type(_e).__name__}: {str(_e)[:120]}')
+                        _DUMP_WARNED = True
             try:
                 verdict, info = ver.verify_query(
                     state, qw, qb, sk,

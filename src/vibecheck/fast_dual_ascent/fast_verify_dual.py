@@ -343,6 +343,15 @@ class Verifier:
 _DUMP_BNB_COUNTER = [0]
 
 
+def _idx_or_name(v):
+    """int position when convertible, else the raw op-name string (cora nets
+    key unstable neurons by name like 'relu_1_copy', not an integer index)."""
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return v
+
+
 def _dump_bnb_instance(state, qw, qb, scored_keys, out_dir, query_id=None):
     """Dump the parsed Phase-8 BnB instance to ``out_dir`` as a pickle, for
     offline experimentation (split-order strategies, LP cross-checks). Captures
@@ -360,8 +369,11 @@ def _dump_bnb_instance(state, qw, qb, scored_keys, out_dir, query_id=None):
         lam=np.array([float(ul[j]['lam']) for j in sidx]),
         mu=np.array([float(ul[j]['mu']) for j in sidx]),
         e_new_col=prob.e_new_col,
-        layer_idx=np.array([int(ul[j]['layer_idx']) for j in sidx]),
-        neuron_idx=np.array([int(ul[j]['neuron_idx']) for j in sidx]),
+        # layer_idx is an int position for most nets but a STRING op name for
+        # some (cora: 'relu_1_copy'); preserve the raw value (numpy infers a
+        # clean homogeneous dtype per net) so reconstruction stays exact.
+        layer_idx=np.array([_idx_or_name(ul[j]['layer_idx']) for j in sidx]),
+        neuron_idx=np.array([_idx_or_name(ul[j]['neuron_idx']) for j in sidx]),
     )
     n = _DUMP_BNB_COUNTER[0]; _DUMP_BNB_COUNTER[0] += 1
     tag = query_id if query_id is not None else n
