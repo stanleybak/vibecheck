@@ -855,6 +855,14 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                     torch.cuda.empty_cache()
                     log(f'[vc2/dual] state OOM for row {r}; skipping')
                     state_cache[r] = ({}, [])
+                except KeyError as e:
+                    # the backward gen-state builder has no symbol for some
+                    # op's generators (ml4acopf linear-residual: Sin/Floor);
+                    # a feature boundary, not a crash -- skip the dual for
+                    # this row and let the BaB fall-through carry it.
+                    log(f'[vc2/dual] state unsupported for row {r} '
+                        f'({type(e).__name__}: {str(e)[:60]}); skipping')
+                    state_cache[r] = ({}, [])
             state, keys = state_cache[r]
             if not keys:
                 continue

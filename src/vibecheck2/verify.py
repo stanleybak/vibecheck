@@ -333,13 +333,18 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     # this class (malbeware, safenlp) and must not be starved: the wide route's
     # input-split floor (max(20s,...)) or the dual can eat a short (T=20)
     # budget whole before it is ever reached.
-    n_nonlin_m = sum(net.ops[nm].n for nm in net.order
-                     if net.ops[nm].kind == 'nonlin')
-    n_relu_layers = sum(1 for op in net.ops.values()
-                        if op.kind == 'nonlin')
     relu_only = all(op.fn == 'relu' for op in net.ops.values()
                     if op.kind == 'nonlin')
-    milp_eligible = (relu_only and n_nonlin_m <= 25_000
+    n_relu_layers = sum(1 for op in net.ops.values()
+                        if op.kind == 'nonlin')
+    # gate on the UNSTABLE count -- that is the MILP's binary count (milp.py),
+    # not the full relu width. malbeware 16-25 has a wide layer but few
+    # unstable neurons; keying on full width wrongly gated it out.
+    n_unstable = sum(int(((inter[nm][0] < 0) & (inter[nm][1] > 0)).sum())
+                     for nm in net.order
+                     if net.ops[nm].kind == 'nonlin'
+                     and net.ops[nm].fn == 'relu') if relu_only else 0
+    milp_eligible = (relu_only and n_unstable <= 25_000
                      and n_relu_layers <= 2)
 
     def _try_milp(open_d, deadline):
