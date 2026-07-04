@@ -232,16 +232,33 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
 
     # Phase A: falsification first (cheap, decides most sat instances).
     # A candidate is only a 'sat' after the ORT chokepoint accepts it.
+    #
+    # Restart diversity, not iteration count, is the lever on tight-eps sat
+    # rows: cifar100 idx_8502 (eps 0.0039) plateaus at margin +0.011 with 100
+    # OSI restarts even at 500+ iters, but crosses zero at r=256 -- each OSI
+    # restart samples a different output-space basin and one lands in the CE
+    # basin.  So escalate restarts on a near-zero MISS; clear cases exit on
+    # the first (cheap) pass and never pay for the extra restarts.
     if pgd_budget > 0:
-        w, _info = attack.pgd(net, spec, device=device, restarts=100,
-                              init='osi', time_budget=pgd_budget, log=log)
-        if w is not None:
-            ok, vinfo = attack.validate(onnx_path, spec, w)
-            if ok:
-                w_emit = vinfo.get('witness_inbox', w)
-                return 'sat', {'witness': np.asarray(w_emit),
-                               'time': time.time() - t0}
-            log('[vc2] pgd candidate rejected by ORT chokepoint; continuing')
+        restarts = 100
+        for _ in range(3):                        # 100 -> 250 -> 625
+            w, ainfo = attack.pgd(net, spec, device=device, restarts=restarts,
+                                  iters=250, init='osi',
+                                  time_budget=pgd_budget, log=log)
+            if w is not None:
+                ok, vinfo = attack.validate(onnx_path, spec, w)
+                if ok:
+                    w_emit = vinfo.get('witness_inbox', w)
+                    return 'sat', {'witness': np.asarray(w_emit),
+                                   'time': time.time() - t0}
+                log('[vc2] pgd candidate rejected by ORT chokepoint; '
+                    'continuing')
+            # escalate only on a genuine near-miss (margin just above zero,
+            # or a marginal below-zero candidate the chokepoint rejected) with
+            # cheap-phase budget to spare; otherwise fall through to bounds.
+            if ainfo['best_margin'] >= 0.05 or budget.remaining() < 15:
+                break
+            restarts = int(restarts * 2.5)
 
     dev = torch.device(device)
     lo = torch.tensor(spec.x_lo, dtype=torch.float32, device=dev).unsqueeze(0)
