@@ -813,9 +813,11 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
             break
         # cap the dual's share: a diverging frontier must not starve the
         # BaB fall-through (challenging_certified: 490s at 19M open and
-        # growing, relu BaB got 40s and bounded nothing)
+        # growing, relu BaB got 40s and bounded nothing). 0.75, not 0.5:
+        # cifar100 idx_8945's dual FINISHES at ~60% of the budget (36M
+        # nodes) and the blunter cap cost the row on the A10G.
         per_q = max(2.0, min(left / max(1, len(open_d)) / max(1, len(rows)),
-                             0.5 * left))
+                             0.75 * left))
         row_t0 = time.time()
         for r in rows:
             # thin state: obj rows are the query + sibling COMBINATIONS
