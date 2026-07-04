@@ -428,11 +428,20 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     # one wide layer) the dual spins the full budget refuting nothing, but the
     # triangle-exact MILP proves ObjBound>0 in ~8s. Reserve it a slice by
     # capping the dual's deadline; non-eligible nets (conv/deep) reserve 0.
+    #
+    # DEPTH gate: big-M's LP relaxation is tight for shallow nets but degrades
+    # fast with depth (relusplitter, 5 relu layers: MILP ObjBound stuck at -33
+    # after its whole budget). On deep relu nets MILP just burns time the
+    # relu-split BaB needs, so cap it to <=2 relu layers -- that is exactly the
+    # single-wide-layer spread-slack regime it was built for.
     n_nonlin_m = sum(net.ops[nm].n for nm in net.order
                      if net.ops[nm].kind == 'nonlin')
+    n_relu_layers = sum(1 for op in net.ops.values()
+                        if op.kind == 'nonlin')
     relu_only = all(op.fn == 'relu' for op in net.ops.values()
                     if op.kind == 'nonlin')
-    milp_eligible = relu_only and n_nonlin_m <= 25_000
+    milp_eligible = (relu_only and n_nonlin_m <= 25_000
+                     and n_relu_layers <= 2)
     milp_reserve = (min(45.0, 0.45 * (t0 + timeout - time.time()))
                     if milp_eligible else 0.0)
     if verdict != 'unsat':
