@@ -882,6 +882,11 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
             if (verdict != 'unsat'
                     and info.get('reason') != 'splits_exhausted'
                     and deadline - time.time() > 5.0):
+                log(f'[vc2/dual]   main attempt: {verdict} '
+                    f'nodes={info.get("nodes")} '
+                    f'wall={info.get("wall", 0):.2f}s '
+                    f'reason={info.get("reason", "-")} '
+                    f'open={info.get("open", 0)}')
                 # gamma retry: refine THIS disjunct's intermediates under
                 # its own output rows (INVPROP; conditional on the CE
                 # region, so scoped strictly to this disjunct) and rerun
