@@ -623,7 +623,9 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
             for t in alpha.values():
                 t.clamp_(0.0, 1.0)
     lb = crown(net, lo, hi, W, inter, alpha, start=start)
-    best = torch.maximum(best, lb.detach())
+    # best stays None if the budget was already exhausted on entry (the loop
+    # broke on iter 0 before setting it); the fresh lb above is then the bound.
+    best = lb.detach() if best is None else torch.maximum(best, lb.detach())
     if return_alpha:
         return best, {k: v.detach() for k, v in alpha.items()}
     return best

@@ -318,7 +318,61 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         _dbg.add('spec_lb', (lb + b) if alpha_iters > 0 else (lb0 + b))
         _dbg.add('inter', {k: (v[0], v[1]) for k, v in inter.items()
                            if isinstance(v, tuple) and len(v) == 2})
-    if verdict != 'unsat' and wide_route:
+    # MILP eligibility (shallow relu-only nets: big-M is tight only for <=2
+    # relu layers -- see the depth gate rationale). Computed here, before the
+    # wide route and the dual, because the exact MILP is the DECISIVE tool for
+    # this class (malbeware, safenlp) and must not be starved: the wide route's
+    # input-split floor (max(20s,...)) or the dual can eat a short (T=20)
+    # budget whole before it is ever reached.
+    n_nonlin_m = sum(net.ops[nm].n for nm in net.order
+                     if net.ops[nm].kind == 'nonlin')
+    n_relu_layers = sum(1 for op in net.ops.values()
+                        if op.kind == 'nonlin')
+    relu_only = all(op.fn == 'relu' for op in net.ops.values()
+                    if op.kind == 'nonlin')
+    milp_eligible = (relu_only and n_nonlin_m <= 25_000
+                     and n_relu_layers <= 2)
+
+    def _try_milp(open_d, deadline):
+        """Triangle-exact MILP escalation. Returns ('sat', witness_np) |
+        ('unsat', None) | ('open', remaining_open_disjuncts). Refutation uses
+        the solver DUAL bound (sound at any point); an incumbent is only a
+        candidate and is validated through the ORT chokepoint."""
+        from .core.milp import refute_rows_milp
+        rows_open = [r for d in open_d
+                     for r in torch.nonzero(di == d, as_tuple=False)
+                     .flatten().tolist()]
+        try:
+            mrefuted, cand = refute_rows_milp(net, lo, hi, inter, W, b,
+                                              rows_open, deadline=deadline,
+                                              log=log)
+        except NotImplementedError as e:
+            log(f'[vc2/milp] skipped: {e}')
+            return 'open', open_d
+        if cand is not None and onnx_path is not None:
+            from .core import attack
+            okc, vinfo = attack.validate(onnx_path, spec, cand)
+            if okc:
+                return 'sat', np.asarray(vinfo.get('witness_inbox', cand))
+            log('[vc2/milp] incumbent rejected by ORT chokepoint')
+        rem = [d for d in open_d
+               if not any(int(r) in mrefuted for r in
+                          torch.nonzero(di == d, as_tuple=False)
+                          .flatten().tolist())]
+        log(f'[vc2] milp: {len(mrefuted)} rows refuted, {len(rem)} open')
+        return ('unsat', None) if not rem else ('open', rem)
+
+    if verdict != 'unsat' and open_d and milp_eligible \
+            and budget.remaining() > 8:
+        mv, mres = _try_milp(open_d, time.time()
+                             + min(0.65 * budget.remaining(), 60.0))
+        if mv == 'sat':
+            return 'sat', {'witness': mres, 'time': time.time() - t0}
+        if mv == 'unsat':
+            return 'unsat', {'time': time.time() - t0}
+        open_d = mres                             # partial: continue with rest
+
+    if verdict != 'unsat' and open_d and wide_route:
         # wide route: most such instances close under input splits with
         # per-leaf zono planes in seconds (dist_shift, acasxu), so try
         # that FIRST on a budget slice; the borderline rows that instead
@@ -423,78 +477,33 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     f'open={len(open_d)}/{len(spec.disjuncts)}')
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
-    # MILP eligibility, computed BEFORE the dual so the dual cannot starve the
-    # exact escalation. On spread-slack relu nets (malbeware: 7842 unstable in
-    # one wide layer) the dual spins the full budget refuting nothing, but the
-    # triangle-exact MILP proves ObjBound>0 in ~8s. Reserve it a slice by
-    # capping the dual's deadline; non-eligible nets (conv/deep) reserve 0.
-    #
-    # DEPTH gate: big-M's LP relaxation is tight for shallow nets but degrades
-    # fast with depth (relusplitter, 5 relu layers: MILP ObjBound stuck at -33
-    # after its whole budget). On deep relu nets MILP just burns time the
-    # relu-split BaB needs, so cap it to <=2 relu layers -- that is exactly the
-    # single-wide-layer spread-slack regime it was built for.
-    n_nonlin_m = sum(net.ops[nm].n for nm in net.order
-                     if net.ops[nm].kind == 'nonlin')
-    n_relu_layers = sum(1 for op in net.ops.values()
-                        if op.kind == 'nonlin')
-    relu_only = all(op.fn == 'relu' for op in net.ops.values()
-                    if op.kind == 'nonlin')
-    milp_eligible = (relu_only and n_nonlin_m <= 25_000
-                     and n_relu_layers <= 2)
-    milp_reserve = (min(45.0, 0.45 * (t0 + timeout - time.time()))
-                    if milp_eligible else 0.0)
     if verdict != 'unsat':
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
         # refuter. The state builds BACKWARD (unstable rows only, chunked),
         # so no forward-zonotope gate; survivors fall through to BaB.
+        # (MILP-eligible nets already had their exact shot ABOVE, before the
+        # wide route, so the dual needs no reserve here.)
         from .core.dual_lp import certify_queries
         refuted = certify_queries(
             net, spec, W, b, di, lo, hi, inter, open_d,
-            deadline=t0 + timeout - 2.0 - milp_reserve, device=device,
-            log=log)
+            deadline=t0 + timeout - 2.0, device=device, log=log)
         open_d = [d for d in open_d if d not in refuted]
         log(f'[vc2] dual-lp: {len(refuted)} disjuncts refuted, '
             f'{len(open_d)} open')
         if not open_d:
             return 'unsat', {'time': time.time() - t0}
-    if verdict != 'unsat' and open_d:
-        # exact-MILP escalation for spread-slack nets (malbeware,
-        # challenging_certified): the relaxation split tree cannot
-        # converge when the gap spreads thin over thousands of triangles
-        # (measured: 9.6k splits, zero closures), but the triangle-exact
-        # MILP closes them. Gated to relu-only nets small enough to
-        # encode; leaves a slice for the BaB fall-through.
-        if milp_eligible and budget.remaining() > 25:
-            from .core.milp import refute_rows_milp
-            rows_open = [r for d in open_d
-                         for r in torch.nonzero(di == d, as_tuple=False)
-                         .flatten().tolist()]
-            try:
-                mrefuted, cand = refute_rows_milp(
-                    net, lo, hi, inter, W, b, rows_open,
-                    deadline=time.time() + 0.8 * budget.remaining(),
-                    log=log)
-            except NotImplementedError as e:
-                log(f'[vc2/milp] skipped: {e}')
-                mrefuted, cand = set(), None
-            if cand is not None and onnx_path is not None:
-                from .core import attack
-                okc, vinfo = attack.validate(onnx_path, spec, cand)
-                if okc:
-                    return 'sat', {'witness': np.asarray(
-                        vinfo.get('witness_inbox', cand)),
-                        'time': time.time() - t0}
-                log('[vc2/milp] incumbent rejected by ORT chokepoint')
-            open_d = [d for d in open_d
-                      if not any(int(r) in mrefuted for r in
-                                 torch.nonzero(di == d, as_tuple=False)
-                                 .flatten().tolist())]
-            log(f'[vc2] milp: {len(mrefuted)} rows refuted, '
-                f'{len(open_d)} disjuncts open')
-            if not open_d:
-                return 'unsat', {'time': time.time() - t0}
+    if verdict != 'unsat' and open_d and milp_eligible \
+            and budget.remaining() > 8:
+        # second exact-MILP shot: the intermediates are now tighter (joint-
+        # inter alpha + lift), so rows the early attempt left open may close.
+        mv, mres = _try_milp(open_d, time.time()
+                             + min(0.8 * budget.remaining(), 60.0))
+        if mv == 'sat':
+            return 'sat', {'witness': mres, 'time': time.time() - t0}
+        if mv == 'unsat':
+            return 'unsat', {'time': time.time() - t0}
+        open_d = mres
     if verdict != 'unsat':
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
