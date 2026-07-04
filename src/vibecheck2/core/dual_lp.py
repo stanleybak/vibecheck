@@ -854,6 +854,16 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
             sk = score_keys(net, lo, hi, W[r:r + 1], inter, keys)
             extra = [(np.eye(k_rows)[i], float(bias[r2]))
                      for i, r2 in enumerate(order) if r2 != r]
+            import os as _os
+            if _os.environ.get('VC_DUMP_BNB_DIR'):
+                # bank the BnB problem for the offline dual-ascent
+                # harness (num iterations, step rules, split orders,
+                # per-node slope optimization -- experiments need a
+                # dataset, and every campaign run contributes)
+                from vibecheck.fast_dual_ascent.fast_verify_dual import (
+                    _dump_bnb_instance)
+                _dump_bnb_instance(state, qw, qb, list(sk),
+                                   _os.environ['VC_DUMP_BNB_DIR'])
             try:
                 verdict, info = ver.verify_query(
                     state, qw, qb, sk,
