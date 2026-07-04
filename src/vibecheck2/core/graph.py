@@ -908,6 +908,8 @@ def load(onnx_path, dtype=np.float32) -> Net:
               f'decomposing at the Net level')
     min_max_to_relu(cg)
     net = from_compute_graph(cg, true_shapes=_onnx_true_shapes(onnx_path))
+    from .graph_opt import fold_split_relu
+    net = fold_split_relu(net)          # undo relu-split hardening (exact)
     net = decompose_maxpool(net)
     net = tag_simplex_bmm(net)
     net.onnx_path = onnx_path
