@@ -74,15 +74,16 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                      if op.kind == 'nonlin'
                      and op.fn in ('relu', 'leaky_relu'))
         heuristic = 'widest' if n_band > n_relu else 'sb'
-    _row_map = None
+    _row_map = weight_of = None
     if roots is not None:
-        # dedupe the query rows BEFORE q feeds the memory sizing: nn4sys
-        # carries 960 disjunct rows drawn from 2 unique (w, b) pairs, and
-        # a stale q=960 shrank the pop batch to 1-2 domains per round
-        key = torch.cat([W, bias.unsqueeze(1)], dim=1)
-        uniq, _row_map = torch.unique(key, dim=0, return_inverse=True)
-        W = uniq[:, :-1].contiguous()
-        bias = uniq[:, -1].contiguous()
+        # dedupe by WEIGHT only for the CROWN cost. Cardinality specs (lindex:
+        # 120k rows) carry ~q DISTINCT thresholds sharing ONE weight, so a
+        # (w, b)-dedup left q identical-weight columns and CROWN ran O(B x q).
+        # Keep the per-ROW bias per-domain and add it after a gather: f_row
+        # indexes the original rows, weight_of maps a row to its unique weight.
+        uniqW, weight_of = torch.unique(W, dim=0, return_inverse=True)
+        W = uniqW.contiguous()
+        weight_of = weight_of.to(dev)
     q = W.shape[0]
     if roots is not None:
         D, sel = 0, None       # per-domain rows replace the disjunct map
@@ -98,7 +99,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     if roots is not None:
         f_lo = roots[0].to('cpu', dt)
         f_hi = roots[1].to('cpu', dt)
-        f_row = _row_map.cpu()[roots[2].cpu()]
+        f_row = roots[2].cpu()          # original row idx (bias is per-row)
         f_worst = torch.full((f_lo.shape[0],), -torch.inf)
         log(f'[vc2/bab] multi-sub: {f_lo.shape[0]} roots over '
             f'{W.shape[0]} unique rows')
@@ -154,14 +155,21 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             net, f_lo.to(dev), f_hi.to(dev),
             alpha_iters=(12 if n_nonlin <= 20000 else 0))
 
+    def dom_bound(lbq, brow):
+        """(B,) each domain's OWN row bound = its weight column + its bias
+        (multi-sub, weight-deduped W)."""
+        wrow = weight_of[brow]
+        return lbq.gather(1, wrow.unsqueeze(1)).squeeze(1) + bias[brow]
+
     def domain_refuted(lbq, brow=None):
         """(B, q) query lbs -> (B, D) refutation matrix; in multi-sub
         mode a (B, 1) matrix from each domain's OWN row. Only FINITE
         positive bounds refute (+inf is an artifact, never a proof)."""
+        if brow is not None:
+            db = dom_bound(lbq, brow)
+            return ((db > 0) & torch.isfinite(db)).unsqueeze(1)
         lbb = lbq + bias
         pos = (lbb > 0) & torch.isfinite(lbb)        # refuting rows
-        if brow is not None:
-            return pos.gather(1, brow.unsqueeze(1))
         refuted = torch.zeros(lbq.shape[0], D, device=dev, dtype=torch.bool)
         for dd in range(D):
             refuted[:, dd] = (pos & sel[dd]).any(dim=1)
@@ -315,8 +323,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 # split anyway, and alpha on the whole batch halves the loop
                 # throughput (iso: 33k -> 75k leaves/s)
                 if brow is not None:
-                    margin = (lbq + bias).gather(1,
-                                                 brow.unsqueeze(1)).squeeze(1)
+                    margin = dom_bound(lbq, brow)
                 else:
                     margin = (lbq + bias).max(dim=1).values
                 bmask = open_mask & (margin > -10.0)
@@ -326,9 +333,20 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             if open_mask.any() and alpha_iters > 0 and oi.numel():
                 inter_o = {k2: tuple(t[oi] for t in v)
                            for k2, v in inter.items()}
+                if brow is not None:
+                    # W is weight-deduped (q_W cols); the alpha loss threshold
+                    # must be per-COLUMN, not per original row. Target each
+                    # column's HARDEST domain (max of -bias over rows mapping
+                    # to it) so alpha keeps optimizing until every sharing
+                    # sub-row could cross zero.
+                    thr = torch.full((W.shape[0],), -float('inf'), device=dev)
+                    thr.scatter_reduce_(0, weight_of, -bias, reduce='amax',
+                                        include_self=True)
+                else:
+                    thr = -bias
                 lb_a, al = backward.alpha_crown(net, blo[oi], bhi[oi], W,
                                                 inter_o, iters=alpha_iters,
-                                                thresholds=-bias,
+                                                thresholds=thr,
                                                 return_alpha=True)
                 # one extra pass with the final alphas yields a linearization
                 # whose exact concretization is its own bound -- a SOUND
@@ -376,19 +394,28 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             # (iso instance_3: v1 with this clip 55s / ~2.5k queue, without
             # it timeout -- it is the load-bearing certifier, not the alpha)
             oref = refuted[open_mask]
-            lbb = (lbq_lin + bias)[open_mask]
             if brow is not None:
-                # multi-sub: each domain's CE must satisfy exactly ITS
-                # row's halfspace -- a pure conjunction, no union step
+                # multi-sub: each domain clips against ITS single row's
+                # halfspace A_r.x + d_r <= 0 (a pure conjunction). Gather the
+                # domain's weight-row adjoint and per-domain bound from the
+                # weight-deduped columns (same closed form as clip_domains).
                 orow = brow[open_mask]
-                xl_u, xh_u = olo.clone(), ohi.clone()
-                for rr in orow.unique().tolist():
-                    m = orow == rr
-                    clo, chi = clip_domains(olo[m], ohi[m], oA[m],
-                                            lbb[m], [rr])
-                    xl_u[m], xh_u[m] = clo, chi
+                wrow_o = weight_of[orow]
+                Ar = oA.gather(1, wrow_o.view(-1, 1, 1)
+                               .expand(-1, 1, oA.shape[2])).squeeze(1)
+                d_r = (lbq_lin[open_mask].gather(
+                    1, wrow_o.unsqueeze(1)).squeeze(1) + bias[orow])
+                mn = Ar.clamp(max=0) * ohi + Ar.clamp(min=0) * olo
+                base = mn.sum(dim=1, keepdim=True)
+                d = d_r.unsqueeze(1) - base
+                slack = -d - (base - mn)
+                new_hi = torch.minimum(ohi, slack / Ar.clamp_min(1e-30))
+                new_lo = torch.maximum(olo, slack / Ar.clamp_max(-1e-30))
+                xh_u = torch.where(Ar > 0, new_hi, ohi)
+                xl_u = torch.where(Ar < 0, new_lo, olo)
                 feas_any = (xh_u - xl_u).min(dim=1).values >= 0
             else:
+                lbb = (lbq_lin + bias)[open_mask]
                 xl_u = torch.full_like(olo, torch.inf)
                 xh_u = torch.full_like(ohi, -torch.inf)
                 feas_any = torch.zeros(olo.shape[0], dtype=torch.bool,
@@ -418,7 +445,12 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             olo, ohi, oA = olo[feas_any], ohi[feas_any], oA[feas_any]
             if brow is not None:
                 orow = orow[feas_any]
-            lbq_open = (lbq + bias)[open_mask][feas_any]
+                # per-domain query bound = the domain's OWN row (weight-deduped
+                # gather + per-domain bias); lbq columns are unique weights.
+                lbq_open = (lbq[open_mask][feas_any].gather(
+                    1, weight_of[orow].unsqueeze(1)).squeeze(1) + bias[orow])
+            else:
+                lbq_open = (lbq + bias)[open_mask][feas_any]
             if not olo.shape[0]:
                 continue
             # Smart-Branching: estimated improvement per input dim; split the
@@ -455,7 +487,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             f_lo = torch.cat([f_lo, ch_lo.cpu()])
             f_hi = torch.cat([f_hi, ch_hi.cpu()])
             if brow is not None:
-                w = lbq_open.gather(1, orow.unsqueeze(1)).squeeze(1)
+                w = lbq_open                    # already per-domain (No,)
                 f_row = torch.cat([f_row,
                                    orow.repeat(ch_lo.shape[0]
                                                // orow.shape[0]).cpu()])
