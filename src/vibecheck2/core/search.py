@@ -243,23 +243,40 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             else:
                 B = blo.shape[0]
                 zst = None
+                zono_oom = False
                 try:
                     # true per-subbox planes from the wide-dims zonotope
                     _l, _h, zst = backward.fwd.zono(net, blo, bhi,
                                                     return_state=True)
-                except (NotImplementedError,
-                        torch.cuda.OutOfMemoryError) as _ze:
+                except torch.cuda.OutOfMemoryError:
+                    zono_oom = True
+                    # empty_cache OUTSIDE this handler's live traceback would
+                    # still pin the zono partial state; do it here and let the
+                    # fallback below (no zono call) run cache-clean
+                    if dev.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    if roots is None:
+                        backward._warn_once(
+                            'input-split per-batch zono unavailable (OOM); '
+                            'interval reforward only')
+                except NotImplementedError as _ze:
                     backward._warn_once(
                         f'input-split per-batch zono unavailable '
                         f'({type(_ze).__name__}: {str(_ze)[:60]}); '
                         f'interval reforward only')
-                    # fall back BELOW: running the fallback inside
-                            # this handler would pin the zono's partial state
-                            # via the live traceback (mscn: 3GB held while
-                            # the interval pass then OOMs)
                 if zst is not None:
                     ib = backward._inter_from_state(
                         net, lambda e: zst[e].bounds())
+                elif zono_oom and roots is not None:
+                    # multi-sub: the zono generator count EXPLODES on mul/
+                    # reciprocal nets (mscn_2048d: 130+ GiB, OOMs at every
+                    # batch down to the floor -- it is not batch-linear), yet
+                    # interval reforward is far too loose to close cardinality
+                    # subboxes (frontier -> 100k+). Memory-bounded backward
+                    # CROWN (chunked identity queries) is strictly tighter than
+                    # interval and fits: the load-bearing per-subbox bound.
+                    # If CROWN itself OOMs, the outer handler halves the batch.
+                    ib = backward.intermediates_crown(net, blo, bhi)
                 else:
                     if dev.type == 'cuda':
                         torch.cuda.empty_cache()
