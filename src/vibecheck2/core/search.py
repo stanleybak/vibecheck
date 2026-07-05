@@ -43,7 +43,7 @@ def _requeue(f_lo, f_hi, f_worst, f_row, batch, blo, bhi, brow):
 def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     device='cpu', batch=4096, split_dims=2, alpha_iters=8,
                     onnx_path=None, attack_every=8, heuristic=None,
-                    roots=None, log=lambda m: None):
+                    roots=None, mini_group=None, log=lambda m: None):
     """Returns (verdict, info): 'unsat' | 'sat' (+witness) | 'timeout'.
 
     W (q, n_out), bias (q,), disj_idx (q,): the spec query rows.
@@ -96,13 +96,27 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     # the frontier lives on HOST: a stuck instance grows it to millions of
     # (n_in,) rows (dist_shift index112 hit 250k x 792 and OOM-crashed the
     # GPU mid-bookkeeping); only the popped batch goes to the device
+    pend_lo = pend_hi = pend_row = None
     if roots is not None:
-        f_lo = roots[0].to('cpu', dt)
-        f_hi = roots[1].to('cpu', dt)
-        f_row = roots[2].cpu()          # original row idx (bias is per-row)
+        R_lo = roots[0].to('cpu', dt)
+        R_hi = roots[1].to('cpu', dt)
+        R_row = roots[2].cpu()          # original row idx (bias is per-row)
+        # MINI-GROUP admission: keep only `mini_group` subboxes active on the
+        # frontier at once, holding the rest in a pending pool and admitting
+        # the next wave as the active set closes (see _admit below). One shared
+        # frontier over all N roots splits every open sub each round and
+        # explodes (mscn: 145k leaves); this caps the peak while paying the
+        # weight-dedup/setup cost ONCE. mini_group=None -> all roots at once.
+        if mini_group and R_lo.shape[0] > mini_group:
+            f_lo, pend_lo = R_lo[:mini_group], R_lo[mini_group:]
+            f_hi, pend_hi = R_hi[:mini_group], R_hi[mini_group:]
+            f_row, pend_row = R_row[:mini_group], R_row[mini_group:]
+        else:
+            f_lo, f_hi, f_row = R_lo, R_hi, R_row
         f_worst = torch.full((f_lo.shape[0],), -torch.inf)
-        log(f'[vc2/bab] multi-sub: {f_lo.shape[0]} roots over '
-            f'{W.shape[0]} unique rows')
+        log(f'[vc2/bab] multi-sub: {R_lo.shape[0]} roots over '
+            f'{W.shape[0]} unique rows'
+            + (f', mini-group {mini_group}' if pend_lo is not None else ''))
     else:
         f_lo = lo.reshape(1, -1).to('cpu', dt)
         f_hi = hi.reshape(1, -1).to('cpu', dt)
@@ -191,10 +205,25 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             olo = torch.where(Ar < 0, new_lo, olo)
         return olo, ohi
 
-    while f_lo.shape[0]:
+    while f_lo.shape[0] or (pend_lo is not None and pend_lo.shape[0]):
         if time.time() > deadline:
             return 'timeout', {'frontier': int(f_lo.shape[0]),
+                               'pending': int(pend_lo.shape[0])
+                               if pend_lo is not None else 0,
                                'bounded': n_bounded, 'splits': n_split}
+        # admit the next wave once the active set has drained below the group
+        # size, so the peak frontier stays ~mini_group (the descendants of the
+        # active subs) instead of the whole root set. Refill to the group size.
+        if (pend_lo is not None and pend_lo.shape[0]
+                and f_lo.shape[0] < mini_group):
+            na = min(mini_group - f_lo.shape[0], pend_lo.shape[0])
+            f_lo = torch.cat([f_lo, pend_lo[:na]])
+            f_hi = torch.cat([f_hi, pend_hi[:na]])
+            f_row = torch.cat([f_row, pend_row[:na]])
+            f_worst = torch.cat([f_worst,
+                                 torch.full((na,), -torch.inf)])
+            pend_lo, pend_hi, pend_row = (pend_lo[na:], pend_hi[na:],
+                                          pend_row[na:])
         rounds += 1
         # adaptive batch growth: when leaves are cheap (microseconds) and
         # the frontier dwarfs the batch, the loop is launch-overhead-bound
@@ -270,12 +299,13 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 elif zono_oom and roots is not None:
                     # multi-sub: the zono generator count EXPLODES on mul/
                     # reciprocal nets (mscn_2048d: 130+ GiB, OOMs at every
-                    # batch down to the floor -- it is not batch-linear), yet
-                    # interval reforward is far too loose to close cardinality
-                    # subboxes (frontier -> 100k+). Memory-bounded backward
-                    # CROWN (chunked identity queries) is strictly tighter than
-                    # interval and fits: the load-bearing per-subbox bound.
-                    # If CROWN itself OOMs, the outer handler halves the batch.
+                    # batch), yet interval reforward is far too loose to close
+                    # cardinality subboxes (frontier -> 100k+). Memory-bounded
+                    # backward CROWN (chunked identity queries) is tighter than
+                    # interval and fits at narrow width (mscn_128d). If CROWN
+                    # itself OOMs, the outer handler halves the batch. (At 2048d
+                    # its per-mul-factor refinement is O(width^2) and too slow;
+                    # that family needs a forward-LiRPA propagator, see notes.)
                     ib = backward.intermediates_crown(net, blo, bhi)
                 else:
                     if dev.type == 'cuda':

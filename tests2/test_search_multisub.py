@@ -67,6 +67,34 @@ def test_multisub_mixed_weights_per_row_bias():
     assert verdict == 'unsat', (verdict, info)
 
 
+def test_multisub_minigroups_all_refuted_unsat():
+    """The mscn shape at the DRIVER level: many distinct subboxes, each a
+    single refutable row. verify._verify_groups must chunk them into
+    mini-groups and return unsat when every chunk closes (v1's mini_group
+    strategy -- one shared frontier over all N would explode on real nets).
+    N=1100 forces >1 mini-group (mg=1000), exercising the chunk loop +
+    aggregation; the identity net closes each chunk in one round.
+    """
+    from vibecheck.spec import VNNSpec, Conjunct, Constraint
+    from vibecheck2.verify import _verify_groups, _subbox_groups
+    net = _identity_net()                       # y = x over R^2
+    N = 1100
+    disj = []
+    for d in range(N):
+        lo0 = 0.1 + 0.001 * d                   # distinct box per disjunct
+        ilo = np.array([lo0, 0.0], dtype=np.float64)
+        ihi = np.array([lo0 + 0.3, 1.0], dtype=np.float64)
+        # CE region y_0 <= -0.5; box has x_0 >= lo0 > 0 > -0.5 -> refuted
+        disj.append(Conjunct(constraints=[Constraint(0, '<=', -0.5)],
+                             input_lo=ilo, input_hi=ihi))
+    spec = VNNSpec(x_lo=np.zeros(2), x_hi=np.ones(2) * 1.5, disjuncts=disj)
+    groups = _subbox_groups(spec)
+    assert len(groups) > 16, len(groups)
+    verdict, _ = _verify_groups(net, spec, groups, None, 30.0, 'cpu',
+                                8, 0.0, lambda _m: None, time.time())
+    assert verdict == 'unsat', verdict
+
+
 def test_multisub_open_domain_not_refuted():
     """A genuinely feasible sub (b_r < 0 -> min x0 + b_r < 0) must NOT be
     refuted: with no onnx_path the CE can't be validated, so the search

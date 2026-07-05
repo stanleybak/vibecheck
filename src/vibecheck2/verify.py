@@ -168,11 +168,26 @@ def _verify_groups(net, spec, groups, onnx_path, timeout, device,
             r_lo = torch.tensor(np.stack(r_lo), dtype=torch.float32)
             r_hi = torch.tensor(np.stack(r_hi), dtype=torch.float32)
             r_row = torch.tensor(r_row)
+            n_roots = r_lo.shape[0]
+            # MINI-GROUP admission (v1 mini_group_size): input_split_bab keeps
+            # only ~mg subboxes active on the frontier at once, admitting the
+            # next wave as they close. One shared frontier over ALL roots splits
+            # every open sub each round and explodes (mscn: 145k leaves, never
+            # converges) even though the per-sub bound is fine -- v1's fast
+            # CROWN also closes ~0% up front and wins purely by bounding the
+            # peak frontier. Done INSIDE the BaB so the weight-dedup + setup is
+            # paid ONCE, not per wave (the caller-loop repeated it and was 3x
+            # slower). mg=200 matches v1; small root sets never explode anyway.
+            mg = 200 if n_roots > 500 else None
             verdict, binfo = input_split_bab(
                 net, spec, W, b, di, r_lo.min(dim=0).values,
-                r_hi.max(dim=0).values,
-                deadline=t0 + timeout - 2.0, device=device,
-                onnx_path=onnx_path, roots=(r_lo, r_hi, r_row), log=log)
+                r_hi.max(dim=0).values, deadline=t0 + timeout - 2.0,
+                device=device, onnx_path=onnx_path,
+                roots=(r_lo, r_hi, r_row), mini_group=mg,
+                # multi-sub closes by SPLITTING (v1's mini-group BaB is pure
+                # forward-LiRPA + split, no per-leaf alpha); the 8-iter alpha
+                # per round cost 15x the bound and closed nothing extra here.
+                alpha_iters=0, log=log)
             log(f'[vc2] multi-sub bab: {verdict} '
                 f'{ {k: v for k, v in binfo.items() if k != "witness"} }')
             if verdict == 'sat':
