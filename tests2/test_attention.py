@@ -31,31 +31,15 @@ def _attention_net(k=4, p=3):
     """input(4) -> logits(k*k) & V(k*p) -> softmax(k,k) @ V(k,p) -> out."""
     lmq = _d(4, k * k)
     lmv = _d(4, k * p)
-    # difference-form softmax over rows of the (k, k) logits
-    pi = np.arange(k)[:, None, None]
-    ii = np.arange(k)[None, :, None]
-    jj = np.arange(k)[None, None, :]
-    idx_j = np.ascontiguousarray(
-        np.broadcast_to(pi * k + jj, (k, k, k))).reshape(-1)
-    idx_i = np.ascontiguousarray(
-        np.broadcast_to(pi * k + ii, (k, k, k))).reshape(-1)
-    n_d = k * k * k
+    # FUSED softmax over rows of the (k, k) logits (the propagators own
+    # the transform; see relax.Softmax / forward._softmax_zono)
     ops = {
         'x': Op('x', 'input', (), (4,), 4),
         'q': Op('q', 'linmap', ('x',), (k * k,), k * k, lm=lmq),
         'v': Op('v', 'linmap', ('x',), (k * p,), k * p, lm=lmv),
-        'sj': Op('sj', 'linmap', ('q',), (n_d,), n_d,
-                 lm=Select(idx_j, k * k)),
-        'si': Op('si', 'linmap', ('q',), (n_d,), n_d,
-                 lm=Select(idx_i, k * k)),
-        'ni': Op('ni', 'linmap', ('si',), (n_d,), n_d,
-                 lm=Scale(-1.0, n_d)),
-        'dd': Op('dd', 'add', ('sj', 'ni'), (n_d,), n_d),
-        'e': Op('e', 'nonlin', ('dd',), (n_d,), n_d, fn='exp'),
-        's': Op('s', 'linmap', ('e',), (k * k,), k * k,
-                lm=SumAxis(k * k, k, 1)),
-        'w': Op('w', 'nonlin', ('s',), (k * k,), k * k, fn='reciprocal',
-                params={'out_lo': 0.0, 'out_hi': 1.0,
+        'w': Op('w', 'nonlin', ('q',), (k * k,), k * k, fn='softmax',
+                params={'pre': k, 'k': k, 'post': 1,
+                        'out_lo': 0.0, 'out_hi': 1.0,
                         'softmax_axis_len': k, 'softmax_post': 1}),
         'av': Op('av', 'bmm', ('w', 'v'), (k * p,), k * p,
                  params={'a_shape': (k, k), 'b_shape': (k, p)}),

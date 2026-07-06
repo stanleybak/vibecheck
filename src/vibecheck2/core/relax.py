@@ -573,6 +573,51 @@ class Floor:
         return al, (bl + bu) / 2, (bu - bl) / 2
 
 
+class Softmax:
+    """Fused row softmax (params pre/k/post; softmax over the k axis).
+
+    NOT an elementwise band op: forward.interval/zono own a dedicated
+    fused transformer (v1's approach: constant shift from live bounds,
+    exp bands, correlated division). This entry provides the exact
+    pointwise map and SOUND constant planes for backward CROWN (the
+    exact interval image; the adjoint stops here -- forward carries the
+    tightness on attention nets, mirroring v1 where attention backward
+    planes are a later add-on).
+    """
+
+    def point(self, x, params=None):
+        p = params or {}
+        pre, k, post = p['pre'], p['k'], p['post']
+        B = x.shape[0]
+        return torch.softmax(
+            x.reshape(B, pre, k, post), dim=2).reshape(B, -1)
+
+    def planes(self, lo, hi, params=None):
+        ylo, yhi = softmax_interval(lo, hi, params)
+        z = torch.zeros_like(lo)
+        return z, ylo, z, yhi
+
+
+def softmax_interval(lo, hi, params):
+    """EXACT coordinatewise interval image of row softmax: y_i is maximal
+    at x_i = hi_i with every rival at its low (and minimal mirrored) --
+    softmax is increasing in x_i and decreasing in each x_j (j != i), so
+    the coordinate extremes are attained at these corners. Closed form."""
+    p = params or {}
+    pre, k, post = p['pre'], p['k'], p['post']
+    B = lo.shape[0]
+    l = lo.reshape(B, pre, k, post)
+    h = hi.reshape(B, pre, k, post)
+    c = h.max(dim=2, keepdim=True).values     # exact shift-invariance
+    el, eh = torch.exp(l - c), torch.exp(h - c)
+    sl = el.sum(dim=2, keepdim=True)
+    sh = eh.sum(dim=2, keepdim=True)
+    y_hi = eh / (eh + (sl - el)).clamp_min(1e-30)
+    y_lo = el / (el + (sh - eh)).clamp_min(1e-30)
+    return (y_lo.reshape(B, -1).clamp(0.0, 1.0),
+            y_hi.reshape(B, -1).clamp(0.0, 1.0))
+
+
 # mathematical output ranges, used to clamp propagated bounds (exp's
 # interval lower underflows to 0.0 in fp32, which makes a downstream
 # softmax reciprocal look unbounded; in real arithmetic exp > 0)
@@ -582,10 +627,10 @@ OUT_RANGE = {
     'sin': (-1.0, 1.0), 'cos': (-1.0, 1.0),
     'exp': (0.0, None), 'sign': (-1.0, 1.0),
     'floor': (None, None), 'reciprocal': (None, None),
-    'pow': (None, None),
+    'pow': (None, None), 'softmax': (0.0, 1.0),
 }
 
 REL = {'relu': Relu(), 'leaky_relu': LeakyRelu(), 'sigmoid': Sigmoid(),
        'tanh': Tanh(), 'sin': Sin(), 'cos': Cos(), 'exp': Exp(),
        'pow': Pow(), 'sign': SignFn(), 'floor': Floor(),
-       'reciprocal': Reciprocal()}
+       'reciprocal': Reciprocal(), 'softmax': Softmax()}

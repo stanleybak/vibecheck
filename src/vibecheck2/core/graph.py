@@ -93,10 +93,7 @@ def tag_simplex_bmm(net):
         if op.kind != 'bmm':
             continue
         left = net.ops[op.inputs[0]]
-        is_softmax_out = (
-            (left.kind == 'nonlin' and left.fn == 'reciprocal')
-            or left.kind == 'mul')          # max-shift form: exp * recip
-        if (is_softmax_out
+        if (left.kind == 'nonlin' and left.fn == 'softmax'
                 and left.params.get('softmax_axis_len') ==
                 op.params['a_shape'][-1]
                 and left.params.get('softmax_post') == 1):
@@ -408,67 +405,25 @@ def from_compute_graph(cg, true_shapes=None) -> Net:
                  out_shape, params={'a_shape': sa, 'b_shape': sb})
 
         elif t == 'Softmax':
-            # decompose into existing RelaxLib ops: softmax(x) =
-            # softmax_i = 1 / sum_j exp(x_j - x_i): shift-invariant BY
-            # CONSTRUCTION (differences cancel the common scale, so fp32
-            # never sees exp of a raw logit), and the sum contains the
-            # j = i term exp(0) = 1, so the reciprocal's input is >= 1
-            # -- no zero-range refusals, output lands in (0, 1] for
-            # free. CROWN also bounds logit DIFFERENCES far tighter than
-            # raw logits (common terms cancel through the linear map).
-            # Costs k x k intermediate width; huge axes keep the plain
-            # exp/sum/reciprocal/mul form.
+            # ONE FUSED op (v1 verify_zono_bnb's softmax handler): the
+            # propagators own the whole row transform -- constant shift
+            # chosen from LIVE bounds (no graph max tree: its relu-band
+            # slack measured WORSE than the k x k difference form), exp
+            # bands, row-sum, reciprocal band, and a CORRELATION-EXACT
+            # product with the shared row denominator. The k x k
+            # difference decomposition this replaces had UNBOUNDED
+            # denominators (sum_j exp(x_j - x_i), measured width 18711 on
+            # vit 1151 vs v1's 135) that floored the zonotope at -0.46
+            # where v1 sits at -0.042.
             ish = v1shape(node.inputs[0])
             axis = node.params.get('axis', -1)
             a = axis if axis >= 0 else len(ish) + axis
             pre, k, post = _flat(ish[:a]), ish[a], _flat(ish[a + 1:])
-            n_sm = pre * k * post
-            n_d = pre * k * k * post
-            if n_d <= 4_000_000:
-                pi = np.arange(pre)[:, None, None, None]
-                ii = np.arange(k)[None, :, None, None]
-                jj = np.arange(k)[None, None, :, None]
-                qq = np.arange(post)[None, None, None, :]
-                idx_j = np.ascontiguousarray(np.broadcast_to(
-                    (pi * k + jj) * post + qq,
-                    (pre, k, k, post))).reshape(-1)
-                idx_i = np.ascontiguousarray(np.broadcast_to(
-                    (pi * k + ii) * post + qq,
-                    (pre, k, k, post))).reshape(-1)
-                x0 = src(node.inputs[0])
-                emit(name + '/sj', 'linmap', [x0], (n_d,),
-                     nd_shape=(pre, k, k, post), lm=lm.Select(idx_j, n_sm))
-                emit(name + '/si', 'linmap', [x0], (n_d,),
-                     nd_shape=(pre, k, k, post), lm=lm.Select(idx_i, n_sm))
-                emit(name + '/ni', 'linmap', [name + '/si'], (n_d,),
-                     nd_shape=(pre, k, k, post), lm=lm.Scale(-1.0, n_d))
-                emit(name + '/d', 'add', [name + '/sj', name + '/ni'],
-                     (n_d,), nd_shape=(pre, k, k, post))
-                emit(name + '/e', 'nonlin', [name + '/d'], (n_d,),
-                     nd_shape=(pre, k, k, post), fn='exp')
-                emit(name + '/s', 'linmap', [name + '/e'], (n_sm,),
-                     nd_shape=ish, lm=lm.SumAxis(pre * k, k, post))
-                emit(name, 'nonlin', [name + '/s'], out_shape,
-                     nd_shape=ish, fn='reciprocal',
-                     params={'out_lo': 0.0, 'out_hi': 1.0,
-                             'softmax_axis_len': k, 'softmax_post': post})
-            else:
-                e = name + '/exp'
-                emit(e, 'nonlin', [x0 := src(node.inputs[0])],
-                     _drop_batch(ish), nd_shape=ish, fn='exp')
-                sm = name + '/sum'
-                emit(sm, 'linmap', [e], (pre, post),
-                     nd_shape=(pre, 1, post), lm=lm.SumAxis(pre, k, post))
-                rc = name + '/recip'
-                emit(rc, 'nonlin', [sm], (pre, post),
-                     nd_shape=(pre, 1, post), fn='reciprocal')
-                bc = name + '/bcast'
-                grid = np.arange(pre * post).reshape(pre, 1, post)
-                idx = np.ascontiguousarray(
-                    np.broadcast_to(grid, (pre, k, post))).reshape(-1)
-                emit(bc, 'linmap', [rc], _drop_batch(ish), nd_shape=ish,
-                     lm=lm.Select(idx, pre * post))
-                emit(name, 'mul', [e, bc], out_shape, nd_shape=ish)
+            emit(name, 'nonlin', [src(node.inputs[0])], out_shape,
+                 nd_shape=ish, fn='softmax',
+                 params={'pre': pre, 'k': k, 'post': post,
+                         'out_lo': 0.0, 'out_hi': 1.0,
+                         'softmax_axis_len': k, 'softmax_post': post})
 
         elif t in ('Gemm', 'MatMul'):
             W, b = node.params['W'], node.params.get('b')
