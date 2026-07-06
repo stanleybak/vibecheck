@@ -499,10 +499,16 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         mem_est = sum(op.n for op in net.ops.values()) * g_est * 8
         if mem_est <= memory.free_bytes(dev) * memory.SAFETY:
             try:
-                sub = Budget(min(0.35 * budget.remaining(), 60.0),
+                # slice + iters sized for the 300-bus nets (measured):
+                # 300base_p3 closes 276/276 at ~95s, p4 needs 600/600 at
+                # ~278s and >400 iterations -- a 150s/200-iter cap left 71
+                # open. The loop self-terminates on close/plateau, so the
+                # wide caps only cost time on nets it was losing anyway
+                # (and the dual/BaB measurably never rescue this class).
+                sub = Budget(min(0.7 * budget.remaining(), 300.0),
                              margin=0.0)
                 lb_f = forward.alpha_zono(net, lo.double(), hi.double(),
-                                          W.double(),
+                                          W.double(), iters=1000,
                                           thresholds=(-b).double(),
                                           budget=sub, disj_idx=di)[0]
                 verdict, open_d = _verdict_from_lbs(
