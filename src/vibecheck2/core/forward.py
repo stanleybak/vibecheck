@@ -131,6 +131,15 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
                 xl = torch.maximum(ci - ri, rlo)
                 xh = torch.minimum(ci + ri, torch.maximum(rhi, xl))
                 ci, ri = (xl + xh) / 2, (xh - xl) / 2
+            if 'in_lo' in op.params or 'in_hi' in op.params:
+                # emission-DECLARED input range (a theorem about the
+                # subgraph, e.g. a shifted-softmax denominator lies in
+                # [1, k] always); intersecting is sound by declaration
+                xl = (ci - ri).clamp_min(op.params.get('in_lo', -torch.inf))
+                xh = torch.maximum(
+                    (ci + ri).clamp_max(op.params.get('in_hi', torch.inf)),
+                    xl)
+                ci, ri = (xl + xh) / 2, (xh - xl) / 2
             f = REL[op.fn].point
             flo, fhi = f(ci - ri, op.params), f(ci + ri, op.params)
             if op.fn == 'reciprocal':
@@ -184,6 +193,10 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
             cands = torch.stack([(c1 - r1) * (c2 - r2), (c1 - r1) * (c2 + r2),
                                  (c1 + r1) * (c2 - r2), (c1 + r1) * (c2 + r2)])
             mlo, mhi = cands.min(dim=0).values, cands.max(dim=0).values
+            if 'out_lo' in op.params:      # emission-declared output range
+                mlo = mlo.clamp_min(op.params['out_lo'])
+            if 'out_hi' in op.params:
+                mhi = torch.maximum(mhi.clamp_max(op.params['out_hi']), mlo)
             state[name] = ((mhi + mlo) / 2, (mhi - mlo) / 2)
         elif op.kind == 'concat':
             B = c.shape[0]
@@ -379,6 +392,11 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 cl, ch = clamp_bounds[name]
                 zl = torch.maximum(zl, cl)
                 zh = torch.minimum(zh, torch.maximum(ch, zl))
+            if 'in_lo' in op.params or 'in_hi' in op.params:
+                # emission-declared input range (see interval()); sound
+                zl = zl.clamp_min(op.params.get('in_lo', -torch.inf))
+                zh = torch.maximum(
+                    zh.clamp_max(op.params.get('in_hi', torch.inf)), zl)
             # generic DeepZ affine band: y = lam*x + mu + delta*e_new
             # (relu: DeepZ triangle; sigmoid/tanh: chord band; each op's
             # RelaxLib entry owns its closed-form construction). An override
@@ -456,6 +474,10 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
             cands = torch.stack([la * lb_, la * hb_, ha * lb_, ha * hb_])
             mlo = cands.min(dim=0).values
             mhi = cands.max(dim=0).values
+            if 'out_lo' in op.params:      # emission-declared output range
+                mlo = mlo.clamp_min(op.params['out_lo'])
+            if 'out_hi' in op.params:
+                mhi = torch.maximum(mhi.clamp_max(op.params['out_hi']), mlo)
             c2 = (mhi + mlo) / 2
             delta = (mhi - mlo) / 2
             G2 = torch.diag_embed(delta)

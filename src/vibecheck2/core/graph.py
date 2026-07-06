@@ -93,7 +93,10 @@ def tag_simplex_bmm(net):
         if op.kind != 'bmm':
             continue
         left = net.ops[op.inputs[0]]
-        if (left.kind == 'nonlin' and left.fn == 'reciprocal'
+        is_softmax_out = (
+            (left.kind == 'nonlin' and left.fn == 'reciprocal')
+            or left.kind == 'mul')          # max-shift form: exp * recip
+        if (is_softmax_out
                 and left.params.get('softmax_axis_len') ==
                 op.params['a_shape'][-1]
                 and left.params.get('softmax_post') == 1):

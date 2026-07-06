@@ -379,3 +379,49 @@ def test_alpha_planes_sound_exp_reciprocal():
             y = rel.point(xs)
             assert bool((al * xs + bl <= y + 1e-5).all()), (fn, a)
             assert bool((y <= au * xs + bu + 1e-5).all()), (fn, a)
+
+
+def test_softmax_decomposition_exact_and_sound(tmp_path):
+    """The softmax decomposition must be EXACT pointwise and sound under
+    zono, with the output landing in [0, 1] even for wide (scale-8)
+    logits. (A graph-level max-shift variant with an exact relu-max tree
+    was built and MEASURED WORSE on vit -- tree relaxation slack + the
+    collapsed final mul; see the vit memory note. The k x k difference
+    form stays.)"""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+    A = numpy_helper.from_array(
+        (8 * _rng.normal(size=(4, 10))).astype(np.float32), 'A')
+    X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1, 4])
+    Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 10])
+    g = helper.make_graph(
+        [helper.make_node('MatMul', ['X', 'A'], ['h']),
+         helper.make_node('Softmax', ['h'], ['Y'], axis=-1)],
+        'g', [X], [Y], [A])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 13)])
+    m.ir_version = 7
+    onnx.save(m, str(tmp_path / 'sm.onnx'))
+    from vibecheck2.core import forward as fwd
+    from vibecheck2.core import graph as g2
+    net = g2.load(str(tmp_path / 'sm.onnx'))
+    xs = torch.tensor(_rng.uniform(-2, 2, size=(64, 4)).astype(np.float32))
+    y = fwd.point(net, xs)
+    ref = torch.softmax(xs @ torch.tensor(
+        np.array(8 * _rng.normal(size=(4, 10)), dtype=np.float32)), dim=1)
+    # regenerate A deterministically is fragile; compare against torch on
+    # the SAME loaded weights instead: recover A from the net's first linmap
+    import numpy as _np
+    Aop = next(net.ops[nm] for nm in net.order
+               if net.ops[nm].kind == 'linmap')
+    W = torch.tensor(_np.asarray(Aop.lm.point(torch.eye(4))))
+    ref = torch.softmax(xs @ W, dim=1)
+    assert float((y - ref).abs().max()) < 1e-5
+    # wide logits (scale 8): the old difference form's denominators blow
+    # up; the shifted form must stay sound with bounded internals
+    lo = torch.full((1, 4), -1.5)
+    hi = torch.full((1, 4), 1.5)
+    zlo, zhi = fwd.zono(net, lo, hi)
+    pts = lo + (hi - lo) * torch.rand(512, 4)
+    ys = fwd.point(net, pts)
+    assert (ys >= zlo - 1e-4).all() and (ys <= zhi + 1e-4).all()
+    assert float(zhi.max()) <= 1.0 + 1e-5   # softmax output range holds
