@@ -323,3 +323,39 @@ def test_slp_polish_reaches_equality_face(tmp_path):
     from vibecheck2.core import forward as fwd
     y = fwd.point(net, torch.tensor(w, dtype=torch.float32).unsqueeze(0))[0]
     assert float(y.max()) <= 1e-7
+
+
+# --------------------------------------------------------------------------- #
+# stabilize_intermediates: split-and-tighten envelopes stay sound
+# --------------------------------------------------------------------------- #
+
+def test_stabilize_intermediates_sound(tmp_path):
+    from vibecheck2.core import backward, forward as fwd
+    from vibecheck2.core import graph as g2
+    from vibecheck2.core.budget import Budget
+    from vibecheck2.core.search import stabilize_intermediates
+    net = g2.load(_tiny_residual_net(tmp_path))
+    lo = torch.full((1, 4), -1.2)
+    hi = torch.full((1, 4), 1.0)
+    W = torch.tensor([[1.0, -1.0, 0.5, 0.0], [0.0, 2.0, -1.0, 1.0]])
+    inter = backward.intermediates(net, lo, hi)
+    inter2 = stabilize_intermediates(net, W, lo, hi, inter, Budget(30.0),
+                                     passes=2)
+    xs = torch.rand(512, 4) * (hi - lo) + lo
+    state = {net.input_name: xs}
+    for name in net.order:                    # exact per-edge values
+        op = net.ops[name]
+        if op.kind == 'linmap':
+            state[name] = op.lm.point(state[op.inputs[0]])
+        elif op.kind == 'nonlin':
+            state[name] = torch.relu(state[op.inputs[0]])
+        elif op.kind == 'add':
+            state[name] = state[op.inputs[0]] + state[op.inputs[1]]
+    for nm, v in inter2.items():
+        if nm not in state:
+            continue
+        assert (state[nm] >= v[0] - 1e-4).all(), nm
+        assert (state[nm] <= v[1] + 1e-4).all(), nm
+        # never looser than the base bounds
+        assert (v[0] >= inter[nm][0] - 1e-6).all(), nm
+        assert (v[1] <= inter[nm][1] + 1e-6).all(), nm

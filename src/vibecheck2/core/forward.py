@@ -482,6 +482,38 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     return lo_o, hi_o
 
 
+def zono_cost(net, lo, hi):
+    """(n_generators, state_bytes_per_float64) the zonotope WILL allocate,
+    by replaying its column-adding rules over the cheap interval state:
+    wide input dims, one column per nonlin element whose band has delta>0
+    on its interval range, one per mul/bmm element with nonzero radius.
+    Predictive sizing for alpha_zono admission (memory.py discipline) --
+    the shape-only guess (all elements, every edge at full width) measured
+    13x over the real footprint on vit and wrongly gated the phase out.
+    """
+    lo, hi = _as2d(lo), _as2d(hi)
+    iv = interval(net, lo, hi, return_state=True)
+    g = int((hi[0] - lo[0] > 1e-6).sum())
+    for name in net.order:
+        op = net.ops[name]
+        if op.kind == 'nonlin':
+            l, h = iv[op.inputs[0]]
+            rel = REL[op.fn]
+            try:
+                _, _, delta = rel.band(l, h, op.params)
+            except NotImplementedError:
+                if 'out_lo' not in op.params:
+                    raise
+                delta = torch.full_like(l, (op.params['out_hi']
+                                            - op.params['out_lo']) / 2)
+            g += int((delta > 0).any(dim=0).sum())
+        elif op.kind in ('mul', 'bmm'):
+            l, h = iv[name]
+            g += int(((h - l) > 0).any(dim=0).sum())
+    n_bytes = sum(op.n for op in net.ops.values()) * g * 8
+    return g, n_bytes
+
+
 def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
                budget=None, patience=40, clamp_bounds=None, disj_idx=None):
     """Adam-optimized band slopes over the forward zonotope (v1's nl_alpha,

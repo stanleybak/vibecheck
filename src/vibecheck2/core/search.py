@@ -26,6 +26,77 @@ import torch
 from . import attack, backward, debug, memory
 
 
+def stabilize_intermediates(net, W, lo1, hi1, inter, budget, device='cpu',
+                            passes=3, alpha_iters=8, max_branch=512,
+                            log=lambda m: None):
+    """Split-and-tighten stabilization (v1 bab_refine, measured on the box:
+    it closes the relusplitter model_2_2 hard instance in 33s where frontier
+    BaB explodes). No domain frontier: sweep the relu layers in topo order;
+    for each layer, split EVERY still-unstable neuron (one +/- clamp pair
+    per neuron, batched), bound all intermediates under the clamps with
+    alpha-CROWN refinement, and take per-neuron branch ENVELOPES (min lo /
+    max hi over the two branches -- the input domain is covered by
+    {z_j<=0} u {z_j>=0}, so the envelope is a valid parent bound);
+    envelopes from different neurons are intersected (each is
+    independently a parent bound). Tightened layers stabilize downstream
+    neurons, so later sweeps shrink further (v1's trace: layer-3 unstable
+    79 -> 60 -> 41 over three passes); a 48-neuron global top-k variant
+    measured unstable 222 -> 221 in 4 rounds -- splitting the WHOLE layer
+    is the lever, not scoring. The caller reruns root alpha-CROWN after.
+
+    Returns the tightened `inter` (same layout as backward.intermediates).
+    """
+    dev = torch.device(device)
+    relu_edges = [nm for nm in net.order
+                  if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'relu']
+    for ps in range(passes):
+        prev = sum(int(((inter[nm][0] < 0) & (inter[nm][1] > 0)).sum())
+                   for nm in relu_edges)
+        for nm in relu_edges:
+            if budget.over():
+                return inter
+            l, h = inter[nm][0], inter[nm][1]
+            js = torch.nonzero((l[0] < 0) & (h[0] > 0),
+                               as_tuple=False).flatten()
+            if not js.numel():
+                continue
+            js = js[:max_branch // 2]
+            B = 2 * js.numel()
+            cl = torch.zeros(B, net.ops[nm].n, device=dev, dtype=torch.int8)
+            ar = torch.arange(js.numel(), device=dev)
+            cl[2 * ar, js] = 1
+            cl[2 * ar + 1, js] = -1
+            blo, bhi = lo1.expand(B, -1), hi1.expand(B, -1)
+            base = {k2: tuple(t.expand(B, -1) for t in v)
+                    for k2, v in inter.items()}
+            ib = backward.intermediates_crown(net, blo, bhi,
+                                              base_inter=base,
+                                              clamps={nm: cl},
+                                              alpha_iters=alpha_iters,
+                                              budget=budget)
+            new_inter = {}
+            for k2, v in inter.items():
+                merged = []
+                for j2 in range(0, len(v), 2):
+                    bl, bh = ib[k2][j2], ib[k2][j2 + 1]
+                    env_l = torch.minimum(bl[0::2], bl[1::2])
+                    env_h = torch.maximum(bh[0::2], bh[1::2])
+                    nl = torch.maximum(
+                        v[j2], env_l.max(dim=0, keepdim=True).values)
+                    nh = torch.minimum(
+                        v[j2 + 1], env_h.min(dim=0, keepdim=True).values)
+                    merged.append(nl)
+                    merged.append(torch.maximum(nh, nl))
+                new_inter[k2] = tuple(merged)
+            inter = new_inter
+        n_unst = sum(int(((inter[nm][0] < 0) & (inter[nm][1] > 0)).sum())
+                     for nm in relu_edges)
+        log(f'[vc2/stab] pass={ps + 1} unstable={n_unst}')
+        if n_unst >= prev:                      # converged: passes stop paying
+            break
+    return inter
+
+
 def _requeue(f_lo, f_hi, f_worst, f_row, batch, blo, bhi, brow):
     """Push an OOM'd batch back onto the host frontier and halve the
     batch size (the sanctioned round-level OOM recovery)."""

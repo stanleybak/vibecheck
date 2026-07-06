@@ -480,23 +480,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # v1. float64 like v1: the closing margins are ~1e-7, below
         # float32 resolution at output scale. UNclamped: CROWN clamps
         # measurably trap the optimizer (-0.24 vs closed, same net).
-        # Admission is predictive (memory.py discipline): the zonotope
-        # holds every edge as (n, g) with g bounded by wide inputs +
-        # unstable relus + non-relu band symbols + mul collapses, in
-        # float64. No autograd multiplier: the estimate is already an
-        # over-count (all-unstable g, every edge at full g) -- measured
-        # peaks run under HALF of it (118-residual: est 5.3 GiB f64,
-        # measured ~4.4 incl. tape; the x2 wrongly gated that net out).
+        # Admission is predictive (memory.py discipline): replay the
+        # zonotope's column-adding rules over the interval state for the
+        # EXACT generator count (vit measured: shape-only guessing gave
+        # 129.8 GiB vs 10.1 real and wrongly gated the phase out; the
+        # sum-over-edges upper bound tracks the real peak within ~7%).
         from .core import memory
-        n_unst_r = sum(int(((inter[nm][0] < 0) & (inter[nm][1] > 0)).sum())
-                       for nm in net.order
-                       if net.ops[nm].kind == 'nonlin'
-                       and net.ops[nm].fn == 'relu')
-        n_band = sum(op.n for op in net.ops.values()
-                     if (op.kind == 'nonlin' and op.fn != 'relu')
-                     or op.kind in ('mul', 'bmm'))
-        g_est = n_wide + n_unst_r + n_band
-        mem_est = sum(op.n for op in net.ops.values()) * g_est * 8
+        _, mem_est = forward.zono_cost(net, lo, hi)
         if mem_est <= memory.free_bytes(dev) * memory.SAFETY:
             try:
                 # slice + iters sized for the 300-bus nets (measured):
@@ -596,6 +586,23 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         if mv == 'unsat':
             return 'unsat', {'time': time.time() - t0}
         open_d = mres
+    if verdict != 'unsat' and open_d and relu_only \
+            and n_unstable <= 2000 and budget.remaining() > 20:
+        # split-and-tighten stabilization (v1 bab_refine): tighten the
+        # INTERMEDIATES under targeted sign splits until root alpha closes;
+        # the frontier BaB below measurably explodes exactly where this
+        # converges (relusplitter model_2_2: v1 33s, vc2 BaB frontier 39k)
+        from .core.search import stabilize_intermediates
+        inter = stabilize_intermediates(net, W, lo, hi, inter, budget,
+                                        device=device, log=log)
+        lb_s = backward.alpha_crown(net, lo, hi, W, inter,
+                                    iters=max(alpha_iters, 45),
+                                    thresholds=-b, budget=budget)[0]
+        lb0 = torch.maximum(lb0, lb_s)
+        verdict, open_d = _verdict_from_lbs(lb0 + b, di,
+                                            len(spec.disjuncts))
+        log(f'[vc2] stabilize: worst={float((lb0 + b).min()):.4f} '
+            f'open={len(open_d)}/{len(spec.disjuncts)}')
     if verdict != 'unsat':
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
