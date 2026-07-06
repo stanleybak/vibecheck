@@ -310,7 +310,7 @@ def test_slp_polish_reaches_equality_face(tmp_path):
            '(assert (<= X_1 1.0))', '(assert (>= X_1 -1.0))',
            '(assert (and (<= Y_0 0.0) (<= Y_1 0.0)))'])
     (tmp_path / 'thin.vnnlib').write_text(spec_txt)
-    from vibecheck.vnnlib_loader import load_vnnlib
+    from vibecheck2.frontend.vnnlib_loader import load_vnnlib
     from vibecheck2.core import attack
     from vibecheck2.core import graph as g2
     net = g2.load(str(tmp_path / 'thin.onnx'))

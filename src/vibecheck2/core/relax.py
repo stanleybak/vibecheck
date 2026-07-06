@@ -338,7 +338,7 @@ class Sin(_V1Band):
         return torch.sin(x)
 
     def _rel(self, params=None):
-        from vibecheck.nl_sin import SinRelax
+        from .relax_nl import SinRelax
         return SinRelax()
 
     def _deriv(self, x, params=None):
@@ -350,7 +350,7 @@ class Cos(_V1Band):
         return torch.cos(x)
 
     def _rel(self, params=None):
-        from vibecheck.nl_cos import CosRelax
+        from .relax_nl import CosRelax
         return CosRelax()
 
     def _deriv(self, x, params=None):
@@ -452,7 +452,7 @@ class Pow(_V1Band):
         return x ** (params or {})['exponent']
 
     def _rel(self, params=None):
-        from vibecheck.nl_pow import PowRelax
+        from .relax_nl import PowRelax
         return PowRelax((params or {})['exponent'])
 
     def _deriv(self, x, params=None):

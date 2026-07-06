@@ -280,6 +280,6 @@ def validate(onnx_path, spec, witness):
     1e-4, output STRICTLY violating). Returns (ok, info) where info may
     carry a float32-safe clamped witness ('witness_inbox') and the ORT
     output ('out')."""
-    from vibecheck.verify_graph import _validate_sat_witness
+    from ..frontend.witness import _validate_sat_witness
     return _validate_sat_witness(onnx_path, spec, witness,
                                  atol=1e-4, out_atol=0.0)

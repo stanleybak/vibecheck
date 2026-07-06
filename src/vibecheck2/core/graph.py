@@ -938,7 +938,7 @@ def load(onnx_path, dtype=np.float32) -> Net:
     run first (identity-pad drop, MaxPool -> ReLU decomposition, Min/Max ->
     ReLU+affine); all are semantics-preserving, so the parity gates against
     ORT still bind."""
-    from vibecheck.network import ComputeGraph
+    from ..frontend.network import ComputeGraph
     cg = ComputeGraph.from_onnx(onnx_path, dtype=dtype)
     # graph-opt is now fully vc2-native: from_compute_graph handles Pad (any
     # constant pad), Min/Max, and MaxPool directly on the IR, and the passes

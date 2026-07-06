@@ -75,7 +75,7 @@ def test_multisub_minigroups_all_refuted_unsat():
     N=1100 forces >1 mini-group (mg=1000), exercising the chunk loop +
     aggregation; the identity net closes each chunk in one round.
     """
-    from vibecheck.spec import VNNSpec, Conjunct, Constraint
+    from vibecheck2.frontend.spec import VNNSpec, Conjunct, Constraint
     from vibecheck2.verify import _verify_groups, _subbox_groups
     net = _identity_net()                       # y = x over R^2
     N = 1100

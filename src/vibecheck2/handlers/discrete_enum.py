@@ -13,11 +13,10 @@ import numpy as np
 def try_discrete_enum(onnx_path, vnnlib_path, timeout, log=print):
     """Returns (verdict, details). Raises NotImplementedError when the
     instance is not a discrete-patch enumeration case."""
-    from vibecheck.cctsdb_yolo import cctsdb_yolo_verify
-    from vibecheck.settings import default_settings
+    from .cctsdb import cctsdb_yolo_verify
     t0 = time.time()
     verdict, witness = cctsdb_yolo_verify(
-        onnx_path, vnnlib_path, default_settings(), timeout, log=log)
+        onnx_path, vnnlib_path, timeout, log=log)
     details = {'time': time.time() - t0, 'handler': 'discrete_enum'}
     if verdict == 'sat' and witness:
         details['witness'] = np.asarray(witness[0]).ravel().astype(np.float64)

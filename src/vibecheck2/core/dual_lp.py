@@ -255,7 +255,7 @@ def lift_intermediates(net, lo, hi, inter, cut_rows, rounds=3,
 
     cut_rows: [(w, b)] output rows that must be <= 0 at a counterexample.
     """
-    from vibecheck.box_halfspace import lagrangian_min
+    from .box_halfspace import lagrangian_min
     inter = dict(inter)
     for rnd in range(rounds):
         if budget is not None and budget.remaining() < 10:
@@ -406,7 +406,7 @@ def _make_host_frontier_verifier(base_cls):
     `_bounds` (compute-bound kernel, upload is noise). Kernel math and
     chunk-halving are inherited unchanged."""
     import time as _time
-    from vibecheck.fast_dual_ascent.fast_verify_topk import (
+    from .fast_dual_ascent.fast_verify_topk import (
         _TOL, _PARENT_FLOOR, _DeadlineExceeded)
 
     class HostFrontierVerifier(base_cls):
@@ -599,7 +599,7 @@ def _make_host_frontier_verifier(base_cls):
 def _verifier(device):
     """One compiled Verifier per device (kernel warm-up is reused)."""
     if device not in _VERIFIER:
-        from vibecheck.fast_dual_ascent import Verifier
+        from .fast_dual_ascent import Verifier
         cls = _make_host_frontier_verifier(Verifier)
         _VERIFIER[device] = cls(device=device,
                                 compile=(torch.device(device).type
@@ -877,7 +877,7 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                 # dataset, and every campaign run contributes). This is
                 # AUXILIARY telemetry: a dump failure must never abort a
                 # verify, so it is caught and logged, never propagated.
-                from vibecheck.fast_dual_ascent.fast_verify_dual import (
+                from .fast_dual_ascent.fast_verify_dual import (
                     _dump_bnb_instance)
                 try:
                     _dump_bnb_instance(state, qw, qb, list(sk),

@@ -264,7 +264,7 @@ def _run_path(path, net, ref, lo, hi):
         lb = lb.detach().numpy()[0]
         l, h = lb[:net.n_out], -lb[net.n_out:]
     elif path == 'dual':
-        from vibecheck.fast_dual_ascent import parse_problem
+        from vibecheck2.core.fast_dual_ascent import parse_problem
         inter = backward.intermediates_crown(net, t_lo, t_hi)
         slopes = {nm: torch.full((net.ops[nm].n,), 0.5)
                   for nm in net.order if net.ops[nm].kind == 'nonlin'}

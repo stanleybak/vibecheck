@@ -77,8 +77,8 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
 
     Disjuncts carrying their own input subboxes (acasxu prop_6) decompose
     into independent sub-instances: 'sat' if any, 'unsat' iff all."""
-    from vibecheck.spec import VNNSpec
-    from vibecheck.vnnlib_loader import load_vnnlib
+    from .frontend.spec import VNNSpec
+    from .frontend.vnnlib_loader import load_vnnlib
     t0 = time.time()
     try:
         net = load_net(onnx_path)
@@ -135,7 +135,7 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
 
 def _verify_groups(net, spec, groups, onnx_path, timeout, device,
                    alpha_iters, pgd_budget, log, t0):
-    from vibecheck.spec import VNNSpec
+    from .frontend.spec import VNNSpec
     if len(groups) == 1:
         return _verify_one(net, spec, onnx_path, timeout, device,
                            alpha_iters, pgd_budget, log, t0)
@@ -607,10 +607,21 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     if verdict != 'unsat':
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
-        # target; the two loops share bound/attack machinery meanwhile)
+        # target; the two loops share bound/attack machinery meanwhile).
+        # EXCEPTION (v1 zono-input-split, vit_2023.yaml + measured on vit
+        # 1151): when only a FEW disjuncts survive the root phases AND the
+        # net has non-relu nonlinearities, input splitting wins even on
+        # wide inputs -- v1 closes its last vit disjunct in 21 boxes/25s.
+        # Relu splits cannot address bmm/exp looseness at all, while the
+        # input-split scorer picks the handful of dims the open rows
+        # depend on. Pure-relu wide nets keep the relu route (cifar
+        # idx_8945's 35M-node relu tree is the counter-case).
         from .core.search import input_split_bab, relu_split_bab
+        has_mixed = any((op.kind == 'nonlin' and op.fn != 'relu')
+                        or op.kind in ('mul', 'bmm')
+                        for op in net.ops.values())
         kw = {}
-        if n_wide <= 32:
+        if n_wide <= 32 or (len(open_d) <= 2 and has_mixed):
             bab = input_split_bab
         else:
             bab = relu_split_bab
@@ -643,7 +654,7 @@ def main(argv=None):
         # network-pair instance (isomorphic/monotonic acasxu): reuse the v1
         # front end to merge the pair into one onnx + v1 spec (exact,
         # ORT-oracle-gated), then verify normally (design: frontends port)
-        from vibecheck import network_pair as npair
+        from .frontend import network_pair as npair
         a.net, a.spec = npair.build_merged_instance(a.net, a.spec)
     else:
         # nonlinear v2 spec (adaptive_cruise): v1's ORT-oracle-gated
@@ -652,7 +663,7 @@ def main(argv=None):
         # re-validated by the chokepoint on the AUGMENTED net here, and the
         # strict original-spec disposition is handler work (v1
         # _sat_disposition), so borderline CEs may differ from v1 for now.
-        from vibecheck import nonlinear_augment as nla
+        from .frontend import nonlinear_augment as nla
         try:
             text = nla._read_vnnlib_text(a.spec)
         except (OSError, ValueError):
@@ -676,10 +687,10 @@ def main(argv=None):
         if verdict == 'sat' and details.get('witness') is not None:
             # v1's CE formatting: version/io names resolved from the spec,
             # Y recomputed by the same ORT forward the scorer replays
-            from vibecheck.main import (_counterexample_sexpr,
-                                        _resolve_cex_io_meta,
-                                        _vnnlib_version)
-            from vibecheck.vnnlib_loader import load_vnnlib
+            from .frontend.vnnlib_loader import load_vnnlib
+            from .frontend.witness import (_counterexample_sexpr,
+                                           _resolve_cex_io_meta,
+                                           _vnnlib_version)
             ce = _counterexample_sexpr(
                 a.net, load_vnnlib(a.spec), details['witness'],
                 version=_vnnlib_version(a.spec),
