@@ -317,6 +317,11 @@ def build_state(net, lo, hi, inter=None, slopes=None):
     _lo, _hi, zstate = fwd.zono(net, lo, hi, return_state=True,
                                 record=record, clamp_bounds=clamp,
                                 slope_override=slopes)
+    # fused vector ops (softmax) record c_pre/G_pre/sym for BaB slack
+    # attribution but carry no elementwise band; their fresh generators
+    # stay always-free in the state (the pre-record behavior, under
+    # which the dual closed vit rows).
+    record = {k: v for k, v in record.items() if 'lam' in v}
     out = zstate[net.output_name]
     final_sym = out.sym
     n_gens = len(final_sym)

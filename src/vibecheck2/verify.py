@@ -579,17 +579,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     f'open={len(open_d)}/{len(spec.disjuncts)}')
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
-    zono_bab_route = (verdict != 'unsat' and n_wide > 32
-                      and len(open_d) <= 2
-                      and any((op.kind == 'nonlin' and op.fn != 'relu')
-                              or op.kind in ('mul', 'bmm')
-                              for op in net.ops.values()))
-    if verdict != 'unsat' and not zono_bab_route:
+    if verdict != 'unsat':
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
-        # refuter. SKIPPED on the zono-BaB route: measured on every vit
-        # row, the per-query dual burns its whole slice at time_limit
-        # (3.2M nodes) while the zono BaB needs exactly that budget. The state builds BACKWARD (unstable rows only, chunked),
+        # refuter. (A temporary skip on the vit route was REVERTED: with
+        # the attention backward adjoint live, the dual's state is tight
+        # and it closed 1151's last disjunct in 324 nodes/0.02s; its
+        # stall risk is capped by the 55% slice reserve below.) The state builds BACKWARD (unstable rows only, chunked),
         # so no forward-zonotope gate; survivors fall through to BaB.
         # (MILP-eligible nets already had their exact shot ABOVE, before the
         # wide route, so the dual needs no reserve here.)
