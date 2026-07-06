@@ -411,6 +411,10 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 zh = torch.maximum(
                     zh.clamp_max(op.params.get('in_hi', torch.inf)), zl)
             if op.fn == 'softmax':
+                if record is not None:
+                    record[name] = {'c_pre': z.c.detach(),
+                                    'G_pre': z.G.detach(),
+                                    'sym': list(z.sym)}
                 state[name] = _softmax_zono(op, z, zl, zh, B, dev, dt)
                 continue
             # generic DeepZ affine band: y = lam*x + mu + delta*e_new

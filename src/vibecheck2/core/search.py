@@ -26,6 +26,72 @@ import torch
 from . import attack, backward, debug, memory
 
 
+def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
+                  iters=8, lr=0.05):
+    """beta-CROWN's split Lagrangian ON THE ZONOTOPE margin form (v1
+    attn_crown's own analysis: without beta, a value split only tightens
+    local planes and the concretization still ranges over the full box --
+    'deep splits stagnate at the linearized-network bound', which is
+    EXACTLY the flat -0.04 curve measured on vit 2157; v1 credits betas
+    with 30-100x node collapse vs clamp-only splits).
+
+    Each split neuron's pre-activation is itself affine in the shared
+    symbols (z = z_c + z_G . e, from the zono record hook). On the
+    subdomain the constraint value is nonnegative, so for beta >= 0:
+        min_sub m  >=  min_full [m - beta * constraint],
+    and the right side concretizes in closed form over e in [-1, 1]:
+        [W y_c + b - sum beta (z_c - off)] - |W y_G - sum beta z_G|_1.
+    Optimized per domain with Adam; every iterate is sound (best-of).
+    Returns lbq elementwise-maxed with the tightened bounds."""
+    B, q, g = WG.shape
+    out = lbq.clone()
+    for bi, (_, _, splits) in enumerate(batch_doms):
+        if not splits:
+            continue
+        zc_rows, zg_rows, off = [], [], []
+        for nm, j, spec_ in splits:
+            r = rec.get(nm)
+            if r is None:
+                continue
+            gp = r['G_pre'].shape[2]
+            zg = torch.zeros(g, device=dev)
+            zg[:gp] = r['G_pre'][bi, j]
+            zc = float(r['c_pre'][bi, j])
+            if isinstance(spec_, tuple):     # range split: two constraints
+                lo_c = (spec_[0] if spec_[0] > -1e30
+                        else float(inter[nm][0][bi, j]))
+                hi_c = (spec_[1] if spec_[1] < 1e30
+                        else float(inter[nm][1][bi, j]))
+                zc_rows += [zc, -zc]
+                zg_rows += [zg, -zg]
+                off += [lo_c, -hi_c]         # z - lo >= 0 ; (-z) - (-hi) >= 0
+            else:                            # sign split: sign * z >= 0
+                zc_rows += [spec_ * zc]
+                zg_rows += [spec_ * zg]
+                off += [0.0]
+        if not zc_rows:
+            continue
+        zC = torch.tensor(zc_rows, device=dev)           # (S,)
+        zG = torch.stack(zg_rows)                        # (S, g)
+        offs = torch.tensor(off, device=dev)             # (S,)
+        beta = torch.zeros(q, zC.shape[0], device=dev, requires_grad=True)
+        opt = torch.optim.Adam([beta], lr=lr)
+        base_c = torch.matmul(zo.c[bi], W.T) + bias      # (q,)
+        best = out[bi] + bias
+        for _ in range(iters):
+            b_ = beta.clamp_min(0.0)
+            cterm = base_c - (b_ * (zC - offs).unsqueeze(0)).sum(1)
+            Gterm = WG[bi] - torch.einsum('qs,sg->qg', b_, zG)
+            lb = cterm - Gterm.abs().sum(1)
+            best = torch.maximum(best, lb.detach())
+            loss = -(torch.minimum(lb, torch.zeros_like(lb) + 1.0)).sum()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        out[bi] = best - bias
+    return out
+
+
 def stabilize_intermediates(net, W, lo1, hi1, inter, budget, device='cpu',
                             passes=3, alpha_iters=8, max_branch=512,
                             log=lambda m: None):
@@ -837,10 +903,12 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     # domain: default bands measured ~10x looser
                     so = {nm: t.to(dev).expand(B, -1)
                           for nm, t in warm_alphas.items()}
+                rec = {}
                 _zl, _zh, zst = backward.fwd.zono(net, blo, bhi,
                                                   return_state=True,
                                                   clamp_bounds=cb,
-                                                  slope_override=so)
+                                                  slope_override=so,
+                                                  record=rec)
                 if _dbg:
                     torch.cuda.synchronize() if dev.type == 'cuda' else None
                     log(f'[vc2/rbab] round={rounds} zono {time.time()-_tz:.2f}s B={B}')
@@ -848,6 +916,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 zo = zst[net.output_name]
                 WG = torch.matmul(W, zo.G)               # (B, q, g)
                 lbq = torch.matmul(zo.c, W.T) - WG.abs().sum(-1)
+                lbq = _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms,
+                                    inter, dev)
                 # SLACK ATTRIBUTION scoring (v1's BBPS intent, exact in
                 # the zono frame): each relu fresh column's |W @ G[:,col]|
                 # IS that neuron's relaxation contribution to the margin
