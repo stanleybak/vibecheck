@@ -171,17 +171,23 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
     if 0.0 < bm < 1e-2:
         # razor-thin plateau: gradient steps cannot land ON the max-row=0
         # face, but a trust-region LP can (see _slp_polish); polish inside
-        # the best restart's own box so BaB subbox callers stay scoped
-        bi = int(order[0])
-        cand = _slp_polish(net, spec,
-                           best_x[bi].detach().cpu().numpy()
-                           .astype(np.float64),
-                           lo[bi].cpu().numpy().astype(np.float64),
-                           hi[bi].cpu().numpy().astype(np.float64),
-                           device=dev, log=log)
-        if cand is not None:
-            info['polish'] = True
-            return cand, info
+        # each restart's own box so BaB subbox callers stay scoped. Top-K
+        # rather than argmin only: the LP is region-local and different
+        # plateau points sit in different activation regions (measured:
+        # soundnessbench 009's best point polishes 4.6e-4 -> 5.6e-5 and
+        # stalls there -- the face is not reachable in every region).
+        for bi in order[:4].tolist():
+            if float(best_m[bi]) >= 1e-2:
+                break
+            cand = _slp_polish(net, spec,
+                               best_x[bi].detach().cpu().numpy()
+                               .astype(np.float64),
+                               lo[bi].cpu().numpy().astype(np.float64),
+                               hi[bi].cpu().numpy().astype(np.float64),
+                               device=dev, log=log)
+            if cand is not None:
+                info['polish'] = True
+                return cand, info
     return None, info
 
 
