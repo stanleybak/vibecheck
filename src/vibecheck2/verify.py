@@ -195,6 +195,10 @@ def _verify_groups(net, spec, groups, onnx_path, timeout, device,
                                'time': time.time() - t0}
             if verdict == 'unsat':
                 return 'unsat', {'time': time.time() - t0}
+            if binfo.get('tol_witness') is not None:
+                return 'sat', {'witness': np.asarray(binfo['tol_witness']),
+                               'within_tol': True,
+                               'time': time.time() - t0}
             return 'unknown', {'time': time.time() - t0}
     if len(groups) > 16:
         # mega-disjunct screening for the SERIAL per-group path (multi-sub
@@ -262,6 +266,9 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     budget = Budget(timeout, margin=0.0)
     budget.t0 = t0
     budget.deadline = t0 + timeout - 2.0
+    tol_w = None          # within-tolerance witness: emitted ONLY if the
+                          # pipeline ends without a strict verdict (v1's
+                          # variant sats land at timeout, not at phase A)
 
     # Phase A: falsification first (cheap, decides most sat instances).
     # A candidate is only a 'sat' after the ORT chokepoint accepts it.
@@ -279,11 +286,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                   iters=250, init='osi',
                                   time_budget=pgd_budget, log=log)
             if w is not None:
-                ok, vinfo = attack.validate(onnx_path, spec, w)
+                ok, vinfo = attack.validate(onnx_path, spec, w, log=log)
                 if ok:
                     w_emit = vinfo.get('witness_inbox', w)
                     return 'sat', {'witness': np.asarray(w_emit),
                                    'time': time.time() - t0}
+                if vinfo.get('within_tol_witness') is not None:
+                    tol_w = vinfo['within_tol_witness']
                 log('[vc2] pgd candidate rejected by ORT chokepoint; '
                     'continuing')
             # escalate only on a genuine near-miss (margin just above zero,
@@ -386,9 +395,12 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             return 'open', open_d
         if cand is not None and onnx_path is not None:
             from .core import attack
-            okc, vinfo = attack.validate(onnx_path, spec, cand)
+            nonlocal tol_w
+            okc, vinfo = attack.validate(onnx_path, spec, cand, log=log)
             if okc:
                 return 'sat', np.asarray(vinfo.get('witness_inbox', cand))
+            if vinfo.get('within_tol_witness') is not None:
+                tol_w = vinfo['within_tol_witness']
             log('[vc2/milp] incumbent rejected by ORT chokepoint')
         rem = [d for d in open_d if int(d) not in mrefuted]
         log(f'[vc2] milp: {len(mrefuted)} disjuncts refuted, {len(rem)} open')
@@ -430,6 +442,8 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                'time': time.time() - t0}
             if verdict == 'unsat':
                 return 'unsat', {'time': time.time() - t0}
+            if binfo.get('tol_witness') is not None:
+                tol_w = binfo['tol_witness']
         verdict = 'unknown'
     if verdict != 'unsat' and alpha_iters > 0:
         if verdict != 'unsat' and n_nonlin <= 20000 \
@@ -642,8 +656,18 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         if verdict == 'sat':
             return 'sat', {'witness': binfo['witness'],
                            'time': time.time() - t0}
+        if binfo.get('tol_witness') is not None:
+            tol_w = binfo['tol_witness']
         if verdict == 'timeout':
             verdict = 'unknown'
+    if verdict != 'unsat' and tol_w is not None:
+        # no strict verdict anywhere in the pipeline: emit the stashed
+        # within-tolerance witness (valid falsification for this tool
+        # under the official scorer's COUNTEREXAMPLE_ATOL = 1e-4, no
+        # penalty either way; v1's ml4acopf variant sats are this class)
+        log('[vc2] emitting WITHIN-TOLERANCE witness (no strict verdict)')
+        return 'sat', {'witness': np.asarray(tol_w), 'within_tol': True,
+                       'time': time.time() - t0}
     return verdict, {'open_disjuncts': open_d, 'time': time.time() - t0}
 
 

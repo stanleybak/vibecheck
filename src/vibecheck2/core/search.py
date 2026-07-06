@@ -194,6 +194,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         f_row = torch.zeros(1, dtype=torch.long)
         f_worst = torch.full((1,), -torch.inf)
     n_bounded = n_split = rounds = 0
+    tol_witness = None
     _round_wall, _round_B = 1.0, 1
     t0 = time.time()
     n_nonlin = sum(net.ops[nm].n for nm in net.order
@@ -281,7 +282,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             return 'timeout', {'frontier': int(f_lo.shape[0]),
                                'pending': int(pend_lo.shape[0])
                                if pend_lo is not None else 0,
-                               'bounded': n_bounded, 'splits': n_split}
+                               'bounded': n_bounded, 'splits': n_split,
+                               'tol_witness': tol_witness}
         # admit the next wave once the active set has drained below the group
         # size, so the peak frontier stays ~mini_group (the descendants of the
         # active subs) instead of the whole root set. Refill to the group size.
@@ -661,10 +663,13 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                      restarts=256, iters=60, device=device,
                                      time_budget=0.5, seed=rounds)
                 if cand is not None:
-                    ok, vinfo = attack.validate(onnx_path, spec, cand)
+                    ok, vinfo = attack.validate(onnx_path, spec, cand,
+                                                log=log)
                     if ok:
                         return 'sat', {'witness': np.asarray(
                             vinfo.get('witness_inbox', cand))}
+                    if vinfo.get('within_tol_witness') is not None:
+                        tol_witness = vinfo['within_tol_witness']
         if rounds % 32 == 0:
             log(f'[vc2/bab] round={rounds} frontier={int(f_lo.shape[0])} '
                 f'bounded={n_bounded} t={time.time() - t0:.1f}s')
@@ -717,6 +722,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     heap = [(-float('inf'), 0, ())]           # (worst_lb, tiebreak, splits)
     tick = 1
     n_bounded = rounds = 0
+    tol_witness = None
     t0 = time.time()
 
 
@@ -730,7 +736,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
     while heap:
         if time.time() > deadline:
-            return 'timeout', {'frontier': len(heap), 'bounded': n_bounded}
+            return 'timeout', {'frontier': len(heap), 'bounded': n_bounded,
+                               'tol_witness': tol_witness}
         rounds += 1
         n_relu_total = sum(net.ops[nm].n for nm in relu_edges)
         widest = max(net.ops[o].n for o in net.order)
@@ -902,10 +909,13 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                      time_budget=1.5, seed=rounds,
                                      seeds=seeds)
                 if cand is not None:
-                    ok, vinfo = attack.validate(onnx_path, spec, cand)
+                    ok, vinfo = attack.validate(onnx_path, spec, cand,
+                                                log=log)
                     if ok:
                         return 'sat', {'witness': np.asarray(
                             vinfo.get('witness_inbox', cand))}
+                    if vinfo.get('within_tol_witness') is not None:
+                        tol_witness = vinfo['within_tol_witness']
         if rounds % 16 == 0:
             log(f'[vc2/rbab] round={rounds} frontier={len(heap)} '
                 f'bounded={n_bounded} t={time.time() - t0:.1f}s')

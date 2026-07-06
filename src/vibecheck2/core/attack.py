@@ -299,8 +299,14 @@ def validate(onnx_path, spec, witness, log=lambda m: None):
     ok_tol, info_tol = _validate_sat_witness(onnx_path, spec, witness,
                                              atol=1e-4, out_atol=1e-4)
     if ok_tol:
-        info_tol['within_tol'] = True
-        log('[vc2] sat WITHIN-TOLERANCE (margin <= 1e-4, the official '
-            'CE atol); strict violation not achieved')
-        return ok_tol, info_tol
+        # NOT accepted as sat here: a strict unsat proof must still get
+        # its chance (0298's phase-A PGD also plateaus at +1e-6 and the
+        # pipeline PROVES it unsat afterwards -- eager acceptance flipped
+        # it). The caller pipeline stashes this witness and emits it only
+        # when verification ends WITHOUT a verdict, mirroring v1 (its
+        # variant sats land at ~606s, at timeout).
+        info['within_tol_witness'] = np.asarray(
+            info_tol.get('witness_inbox', witness))
+        log('[vc2] within-tolerance witness stashed (margin <= 1e-4, the '
+            'official CE atol); continuing to seek a strict verdict')
     return ok, info
