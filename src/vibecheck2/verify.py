@@ -480,27 +480,31 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # v1. float64 like v1: the closing margins are ~1e-7, below
         # float32 resolution at output scale. UNclamped: CROWN clamps
         # measurably trap the optimizer (-0.24 vs closed, same net).
-        # Admission is predictive (memory.py discipline): replay the
-        # zonotope's column-adding rules over the interval state for the
-        # EXACT generator count (vit measured: shape-only guessing gave
-        # 129.8 GiB vs 10.1 real and wrongly gated the phase out; the
-        # sum-over-edges upper bound tracks the real peak within ~7%).
+        # Admission by ATTEMPT under the centralized OOM policy: no
+        # faithful predictive estimate exists for the zonotope footprint
+        # (its generator count depends on band widths only the propagation
+        # knows: vit measured 10 GiB real vs ~130 GiB from BOTH a shape
+        # estimate and an interval-replay estimate, each wrongly gating
+        # the phase out while the dual sat one disjunct from closing).
         from .core import memory
-        _, mem_est = forward.zono_cost(net, lo, hi)
-        if mem_est <= memory.free_bytes(dev) * memory.SAFETY:
-            try:
-                # slice + iters sized for the 300-bus nets (measured):
-                # 300base_p3 closes 276/276 at ~95s, p4 needs 600/600 at
-                # ~278s and >400 iterations -- a 150s/200-iter cap left 71
-                # open. The loop self-terminates on close/plateau, so the
-                # wide caps only cost time on nets it was losing anyway
-                # (and the dual/BaB measurably never rescue this class).
-                sub = Budget(min(0.7 * budget.remaining(), 300.0),
-                             margin=0.0)
-                lb_f = forward.alpha_zono(net, lo.double(), hi.double(),
-                                          W.double(), iters=1000,
-                                          thresholds=(-b).double(),
-                                          budget=sub, disj_idx=di)[0]
+        try:
+            # slice + iters sized for the 300-bus nets (measured):
+            # 300base_p3 closes 276/276 at ~95s, p4 needs 600/600 at
+            # ~278s and >400 iterations -- a 150s/200-iter cap left 71
+            # open. The loop self-terminates on close/plateau, so the
+            # wide caps only cost time on nets it was losing anyway
+            # (and the dual/BaB measurably never rescue this class).
+            sub = Budget(min(0.7 * budget.remaining(), 300.0),
+                         margin=0.0)
+            lb_f = memory.attempt(
+                lambda: forward.alpha_zono(net, lo.double(), hi.double(),
+                                           W.double(), iters=1000,
+                                           thresholds=(-b).double(),
+                                           budget=sub, disj_idx=di)[0],
+                tag='fzono-alpha')
+            if lb_f is None:
+                log('[vc2] fzono-alpha skipped (oom)')
+            else:
                 verdict, open_d = _verdict_from_lbs(
                     lb_f + b.double(), di, len(spec.disjuncts))
                 # feed downstream f32 phases a DIRECTED-rounded cast (a
@@ -511,13 +515,10 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                 log(f'[vc2] fzono-alpha: '
                     f'worst={float((lb_f + b.double()).min()):.4e} '
                     f'open={len(open_d)}/{len(spec.disjuncts)}')
-            except NotImplementedError as e:
-                # an op without a forward band yet is a feature boundary
-                # for this escalation only; the phases below still run
-                log(f'[vc2] fzono-alpha skipped ({e})')
-        else:
-            log(f'[vc2] fzono-alpha skipped (est {mem_est / 2**30:.1f} GiB '
-                f'> budget)')
+        except NotImplementedError as e:
+            # an op without a forward band yet is a feature boundary
+            # for this escalation only; the phases below still run
+            log(f'[vc2] fzono-alpha skipped ({e})')
     if verdict != 'unsat' and len(open_d) == 1 and n_nonlin <= 20000:
         # zono-lift (v1 phase 2.5): exact box+halfspace LP tightening of
         # every pre-activation under the open disjunct's own output rows.

@@ -53,6 +53,24 @@ def chunked_indices(fn, idx: torch.Tensor, bytes_per_item: float):
                   file=sys.stderr, flush=True)
 
 
+def attempt(fn, tag: str):
+    """Run `fn()` once; on CUDA OOM, log LOUDLY, free the cache, and return
+    None so the caller skips its OPTIONAL phase and continues the pipeline.
+
+    For whole-phase admission where no predictive estimate is faithful:
+    the forward zonotope's true generator count depends on band widths
+    that only the propagation itself knows (measured on vit: a shape
+    estimate said 130 GiB, an interval-replay estimate said 130 GiB, the
+    real pass took 10 GiB). Centralized here per the one-OOM-catch rule."""
+    try:
+        return fn()
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print(f'[memory] CUDA OOM in optional phase {tag!r}; phase skipped',
+              file=sys.stderr, flush=True)
+        return None
+
+
 def chunked(fn, X: torch.Tensor, bytes_per_item: float):
     """Apply `fn` over the leading dim of X in memory-budgeted chunks.
 
