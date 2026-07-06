@@ -682,8 +682,10 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                      clamps=clamps,
                                                      range_clamps=range_clamps)
             adj = {}
-            lbq = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
-                                 range_clamps=range_clamps, collect_adjoints=adj)
+            lbq, a_in = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
+                                       range_clamps=range_clamps,
+                                       collect_adjoints=adj,
+                                       return_input_adjoint=True)
             lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter, clamps,
                                               iters=beta_iters, thresholds=-bias,
                                               range_clamps=range_clamps)
@@ -770,9 +772,29 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                    int(best_j[bi]), ch),)))
                     tick += 1
             if onnx_path is not None and rounds % attack_every == 1:
+                # BaB-GUIDED seeds (v1 _pgd_refine): each open (domain,
+                # query)'s relaxed-bound argmin x* = mid - sign(A_in) * rad
+                # attains the CROWN lb under that domain's clamps. Hidden
+                # CEs (soundnessbench) defeat box-uniform restarts BY
+                # CONSTRUCTION; the bound's own primal point is where the
+                # relaxation says the margin is lowest, and splitting
+                # isolates it -- seed the attack there.
+                m_bq = lbq + bias
+                seeds = None
+                nz = torch.nonzero(((m_bq <= 0)
+                                    & open_mask.unsqueeze(1)).flatten(),
+                                   as_tuple=False).flatten()
+                if nz.numel():
+                    pick = nz[m_bq.flatten()[nz].argsort()[:64]]
+                    Af = a_in.reshape(-1, a_in.shape[-1])[pick]
+                    mid = (lo1[0] + hi1[0]) / 2
+                    rad = (hi1[0] - lo1[0]) / 2
+                    seeds = (mid.unsqueeze(0) - torch.sign(Af)
+                             * rad.unsqueeze(0)).cpu().numpy()
                 cand, _ = attack.pgd(net, spec, lo=lo1[0], hi=hi1[0],
                                      restarts=128, iters=60, device=device,
-                                     time_budget=1.5, seed=rounds)
+                                     time_budget=1.5, seed=rounds,
+                                     seeds=seeds)
                 if cand is not None:
                     ok, vinfo = attack.validate(onnx_path, spec, cand)
                     if ok:

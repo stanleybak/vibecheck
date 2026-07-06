@@ -279,3 +279,47 @@ def test_band_alpha_sound_across_ops():
             gap = (f(xs, params) - (lam * xs + mu)).abs()
             assert bool((gap <= delta + 1e-5).all()), \
                 (fn, a, float((gap - delta).max()))
+
+
+# --------------------------------------------------------------------------- #
+# slp polish: lands exactly on a razor-thin conjunctive face
+# --------------------------------------------------------------------------- #
+
+def test_slp_polish_reaches_equality_face(tmp_path):
+    """CE set = the line x0+x1 = 0.7071067 (measure zero, conjunctive):
+    the trust-region LP must step from a +1.3e-2 plateau point onto it."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+    A = numpy_helper.from_array(
+        np.array([[1.0, -1.0], [1.0, -1.0]], dtype=np.float32), 'A')
+    C = numpy_helper.from_array(
+        np.array([-0.7071067, 0.7071067], dtype=np.float32), 'C')
+    X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1, 2])
+    Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 2])
+    g = helper.make_graph(
+        [helper.make_node('MatMul', ['X', 'A'], ['h']),
+         helper.make_node('Add', ['h', 'C'], ['Y'])],
+        'g', [X], [Y], [A, C])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 13)])
+    m.ir_version = 7
+    onnx.save(m, str(tmp_path / 'thin.onnx'))
+    spec_txt = '\n'.join(
+        [f'(declare-const X_{i} Real)' for i in range(2)]
+        + [f'(declare-const Y_{i} Real)' for i in range(2)]
+        + ['(assert (<= X_0 1.0))', '(assert (>= X_0 -1.0))',
+           '(assert (<= X_1 1.0))', '(assert (>= X_1 -1.0))',
+           '(assert (and (<= Y_0 0.0) (<= Y_1 0.0)))'])
+    (tmp_path / 'thin.vnnlib').write_text(spec_txt)
+    from vibecheck.vnnlib_loader import load_vnnlib
+    from vibecheck2.core import attack
+    from vibecheck2.core import graph as g2
+    net = g2.load(str(tmp_path / 'thin.onnx'))
+    spec = load_vnnlib(str(tmp_path / 'thin.vnnlib'))
+    x0 = np.array([0.36, 0.36 - 0.7071067], dtype=np.float64)  # margin 1.3e-2
+    w = attack._slp_polish(net, spec, x0,
+                           np.array([-1.0, -1.0]), np.array([1.0, 1.0]),
+                           device='cpu')
+    assert w is not None
+    from vibecheck2.core import forward as fwd
+    y = fwd.point(net, torch.tensor(w, dtype=torch.float32).unsqueeze(0))[0]
+    assert float(y.max()) <= 1e-7

@@ -482,8 +482,11 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # measurably trap the optimizer (-0.24 vs closed, same net).
         # Admission is predictive (memory.py discipline): the zonotope
         # holds every edge as (n, g) with g bounded by wide inputs +
-        # unstable relus + non-relu band symbols + mul collapses, times 2
-        # for the autograd tape, in float64 (0298: est 6.4 GiB fits).
+        # unstable relus + non-relu band symbols + mul collapses, in
+        # float64. No autograd multiplier: the estimate is already an
+        # over-count (all-unstable g, every edge at full g) -- measured
+        # peaks run under HALF of it (118-residual: est 5.3 GiB f64,
+        # measured ~4.4 incl. tape; the x2 wrongly gated that net out).
         from .core import memory
         n_unst_r = sum(int(((inter[nm][0] < 0) & (inter[nm][1] > 0)).sum())
                        for nm in net.order
@@ -493,7 +496,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                      if (op.kind == 'nonlin' and op.fn != 'relu')
                      or op.kind in ('mul', 'bmm'))
         g_est = n_wide + n_unst_r + n_band
-        mem_est = sum(op.n for op in net.ops.values()) * g_est * 8 * 2
+        mem_est = sum(op.n for op in net.ops.values()) * g_est * 8
         if mem_est <= memory.free_bytes(dev) * memory.SAFETY:
             try:
                 sub = Budget(min(0.35 * budget.remaining(), 60.0),

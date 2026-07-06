@@ -167,7 +167,106 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         f'iters={info["iters"]} t={info["time"]:.2f}s')
     if best_m[order[0]] <= 0:
         return best_x[order[0]].detach().cpu().numpy().astype(np.float64), info
+    bm = float(best_m[order[0]])
+    if 0.0 < bm < 1e-2:
+        # razor-thin plateau: gradient steps cannot land ON the max-row=0
+        # face, but a trust-region LP can (see _slp_polish); polish inside
+        # the best restart's own box so BaB subbox callers stay scoped
+        bi = int(order[0])
+        cand = _slp_polish(net, spec,
+                           best_x[bi].detach().cpu().numpy()
+                           .astype(np.float64),
+                           lo[bi].cpu().numpy().astype(np.float64),
+                           hi[bi].cpu().numpy().astype(np.float64),
+                           device=dev, log=log)
+        if cand is not None:
+            info['polish'] = True
+            return cand, info
     return None, info
+
+
+def _slp_polish(net, spec, x0, lo, hi, device, iters=40, time_budget=8.0,
+                log=lambda m: None):
+    """Boundary-CE finder (the analog of v1's LP-primal refine): trust-region
+    sequential LP on the closest disjunct's row margins.
+
+    PGD plateaus at ~+1e-4 on razor-thin sat instances -- soundnessbench
+    PLANTS its counterexamples on the max-row-margin zero face (the official
+    048 CE re-evaluates to +6e-8 and no point within 1e-4 box-noise of it is
+    a CE), and the ml4acopf linear-variant sats live on the same knife edge.
+    Within one activation region the net is exactly affine, so an LP over
+    the margin gradients steps exactly onto the face; the shrinking trust
+    region keeps steps inside the region where the linearization is exact.
+    Measured (soundnessbench 048, A10G): +3.1e-4 plateau -> -2.9e-6
+    chokepoint-validated CE in 10 LP steps.
+
+    Returns a float64 candidate witness or None; callers must validate
+    through the ORT chokepoint like any PGD candidate.
+    """
+    from scipy.optimize import linprog
+    t0 = time.time()
+    dev = torch.device(device)
+    rows = spec.as_linear_queries(net.n_out)
+    Wq = torch.tensor(np.stack([w for _, w, _ in rows]), dtype=torch.float32,
+                      device=dev)
+    bq = torch.tensor([b_ for _, _, b_ in rows], dtype=torch.float32,
+                      device=dev)
+    di = np.array([d for d, _, _ in rows])
+
+    def row_margins(xv):
+        xt = torch.tensor(xv, dtype=torch.float32, device=dev).unsqueeze(0)
+        y = forward.point(net, xt)[0]
+        return (Wq @ y + bq).detach().double().cpu().numpy()
+
+    m_all = row_margins(x0)
+    # the disjunct this point is closest to satisfying (max row per disjunct)
+    d_star = min(set(di.tolist()),
+                 key=lambda d: float(m_all[di == d].max()))
+    ridx = np.nonzero(di == d_star)[0]
+    qd = len(ridx)
+    Wd = Wq[ridx]
+    bd = bq[ridx]
+
+    def margins_grads(xv):
+        xt = torch.tensor(xv, dtype=torch.float32, device=dev,
+                          requires_grad=True).unsqueeze(0)
+        mg = Wd @ forward.point(net, xt)[0] + bd
+        A = np.zeros((qd, len(xv)))
+        for i in range(qd):
+            g, = torch.autograd.grad(mg[i], xt, retain_graph=(i < qd - 1))
+            A[i] = g[0].detach().double().cpu().numpy()
+        return mg.detach().double().cpu().numpy(), A
+
+    w_box = hi - lo
+    cvec = np.zeros(len(x0) + 1)
+    cvec[-1] = 1.0
+    fm = float(m_all[ridx].max())
+    r = 0.05
+    for _ in range(iters):
+        if fm <= 0 or r < 1e-7 or time.time() - t0 > time_budget:
+            break
+        m0, A = margins_grads(x0)
+        blo = np.maximum(lo, x0 - r * w_box)
+        bhi = np.minimum(hi, x0 + r * w_box)
+        res = linprog(cvec,
+                      A_ub=np.hstack([A, -np.ones((qd, 1))]),
+                      b_ub=-(m0 - A @ x0),
+                      bounds=[(float(l), float(h))
+                              for l, h in zip(blo, bhi)] + [(None, None)],
+                      method='highs')
+        if not res.success:
+            r *= 0.4
+            continue
+        xn = res.x[:-1]
+        m_n = row_margins(xn)
+        fn = float(m_n[ridx].max())
+        if fn < fm:
+            x0, fm = xn, fn
+            r = min(0.2, r * 1.5)
+        else:
+            r *= 0.4
+    log(f'[vc2/pgd] slp-polish: margin={fm:+.3e} t={time.time() - t0:.2f}s')
+    return x0 if fm <= 0 else None
 
 
 def validate(onnx_path, spec, witness):
