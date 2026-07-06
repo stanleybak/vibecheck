@@ -195,11 +195,12 @@ def _verify_groups(net, spec, groups, onnx_path, timeout, device,
                                'time': time.time() - t0}
             if verdict == 'unsat':
                 return 'unsat', {'time': time.time() - t0}
+            det = {'time': time.time() - t0}
             if binfo.get('tol_witness') is not None:
-                return 'sat', {'witness': np.asarray(binfo['tol_witness']),
-                               'within_tol': True,
-                               'time': time.time() - t0}
-            return 'unknown', {'time': time.time() - t0}
+                log('[vc2] verdict unknown BUT a within-tolerance CE was '
+                    'found (strict-violation policy keeps unknown)')
+                det['within_tol_ce'] = np.asarray(binfo['tol_witness'])
+            return 'unknown', det
     if len(groups) > 16:
         # mega-disjunct screening for the SERIAL per-group path (multi-sub
         # instances never reach here: their BaB's first rounds are the
@@ -660,15 +661,18 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             tol_w = binfo['tol_witness']
         if verdict == 'timeout':
             verdict = 'unknown'
+    det = {'open_disjuncts': open_d, 'time': time.time() - t0}
     if verdict != 'unsat' and tol_w is not None:
-        # no strict verdict anywhere in the pipeline: emit the stashed
-        # within-tolerance witness (valid falsification for this tool
-        # under the official scorer's COUNTEREXAMPLE_ATOL = 1e-4, no
-        # penalty either way; v1's ml4acopf variant sats are this class)
-        log('[vc2] emitting WITHIN-TOLERANCE witness (no strict verdict)')
-        return 'sat', {'witness': np.asarray(tol_w), 'within_tol': True,
-                       'time': time.time() - t0}
-    return verdict, {'open_disjuncts': open_d, 'time': time.time() - t0}
+        # a within-tolerance CE exists but the verdict stays HONEST
+        # (strict violations only -- policy). Flag it loudly: the
+        # official scorer would accept this witness at its
+        # COUNTEREXAMPLE_ATOL, so the row is one acceptance-policy
+        # decision away from sat (ml4acopf linear variants, vc1's
+        # accepted CEs are exactly these box-vertex points).
+        log('[vc2] verdict unknown BUT a within-tolerance CE was found '
+            '(margin <= ce_tol; strict-violation policy keeps unknown)')
+        det['within_tol_ce'] = np.asarray(tol_w)
+    return verdict, det
 
 
 def main(argv=None):
@@ -680,7 +684,12 @@ def main(argv=None):
     p.add_argument('--timeout', type=float, default=60.0)
     p.add_argument('--device', default='cpu', choices=['cpu', 'cuda'])
     p.add_argument('--results-file', default=None)
+    p.add_argument('--ce-tol', type=float, default=1e-4,
+                   help='within-tolerance CE DETECTION band (flag-only; '
+                        'verdicts always require strict violation)')
     a = p.parse_args(argv)
+    from .core import attack as _atk
+    _atk.CE_TOL = a.ce_tol
     if a.net.lstrip().startswith('['):
         # network-pair instance (isomorphic/monotonic acasxu): reuse the v1
         # front end to merge the pair into one onnx + v1 spec (exact,

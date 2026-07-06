@@ -24,6 +24,12 @@ import torch
 
 from . import forward
 
+# within-tolerance CE detection band (the official scorer's
+# COUNTEREXAMPLE_ATOL is 1e-4). POLICY: vc2 emits STRICT violations only;
+# a witness inside this band is surfaced as a FLAG on unknown verdicts,
+# never as sat. Overridable via --ce-tol (verify.main).
+CE_TOL = 1e-4
+
 
 def spec_margins(spec, n_out, device, dtype):
     """Per-disjunct margin closure: margins(y) (B, D) where a value < 0
@@ -282,31 +288,26 @@ def validate(onnx_path, spec, witness, log=lambda m: None):
     where info may carry a float32-safe clamped witness ('witness_inbox')
     and the ORT output ('out').
 
-    Two-stage acceptance mirroring the OFFICIAL scorer
-    (SCORING/counterexamples.py + settings.COUNTEREXAMPLE_ATOL = 1e-4):
-    strict violation first; if that fails, a witness violating WITHIN
-    1e-4 is still a valid competition counterexample ("this tool will not
-    receive a penalty, but other tools may still correctly prove UNSAT" --
-    the checker's own comment). The ml4acopf linear-variant sats live
-    exactly there: the official vc1 CE for 118res_p3 is a full box vertex
-    whose margin re-evaluates to +1.000e-06, the same point vc2's SLP
-    polish finds and previously threw away."""
+    STRICT violations only decide `ok`. A witness violating within
+    CE_TOL (the official scorer's COUNTEREXAMPLE_ATOL band, where vc1's
+    accepted ml4acopf variant CEs live -- box vertices at margin +1e-6)
+    is DETECTED and returned in info['within_tol_witness'] so the
+    pipeline can flag it on an unknown verdict; it is never a sat."""
     from ..frontend.witness import _validate_sat_witness
     ok, info = _validate_sat_witness(onnx_path, spec, witness,
                                      atol=1e-4, out_atol=0.0)
     if ok:
         return ok, info
-    ok_tol, info_tol = _validate_sat_witness(onnx_path, spec, witness,
-                                             atol=1e-4, out_atol=1e-4)
-    if ok_tol:
-        # NOT accepted as sat here: a strict unsat proof must still get
-        # its chance (0298's phase-A PGD also plateaus at +1e-6 and the
-        # pipeline PROVES it unsat afterwards -- eager acceptance flipped
-        # it). The caller pipeline stashes this witness and emits it only
-        # when verification ends WITHOUT a verdict, mirroring v1 (its
-        # variant sats land at ~606s, at timeout).
-        info['within_tol_witness'] = np.asarray(
-            info_tol.get('witness_inbox', witness))
-        log('[vc2] within-tolerance witness stashed (margin <= 1e-4, the '
-            'official CE atol); continuing to seek a strict verdict')
+    if CE_TOL > 0:
+        ok_tol, info_tol = _validate_sat_witness(onnx_path, spec, witness,
+                                                 atol=1e-4, out_atol=CE_TOL)
+        if ok_tol:
+            # NEVER accepted as sat (strict-violation policy): a strict
+            # unsat proof must always get its chance (0298's phase-A PGD
+            # also plateaus at +1e-6 and the pipeline PROVES it unsat).
+            # The pipeline stashes this witness and FLAGS it on unknown.
+            info['within_tol_witness'] = np.asarray(
+                info_tol.get('witness_inbox', witness))
+            log(f'[vc2] within-tolerance witness stashed (margin <= '
+                f'{CE_TOL:g}); continuing to seek a strict verdict')
     return ok, info
