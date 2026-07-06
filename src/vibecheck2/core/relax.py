@@ -46,6 +46,12 @@ class Relu:
                          torch.zeros_like(lo))
         return lam, mu, mu.clone()
 
+    def band_alpha(self, lo, hi, alpha, params=None):
+        a = alpha.clamp(0.0, 1.0)
+        lam = (1 - a) * (lo > 0).to(lo.dtype) + a * (hi > 0).to(lo.dtype)
+        bl, bu = _band(self.point, lo, hi, lam, [torch.zeros_like(lo)])
+        return lam, (bl + bu) / 2, (bu - bl) / 2
+
 
 class LeakyRelu:
     """Piecewise-linear with slope a<1 on x<0: convex, so tangents (slope a
@@ -86,11 +92,22 @@ def _band(f, lo, hi, lam, crit_xs):
     at the finitely many stationary points f'(x) = lam (supplied in closed
     form via crit_xs). Returns (bl, bu) with lam*x+bl <= f(x) <= lam*x+bu.
     Ported from v1 nl_sigmoid_tanh._band_from_candidates (sound by
-    construction; no sampling)."""
+    construction; no sampling).
+
+    band_alpha (on each op below) is the nl_alpha hook (v1
+    nonlinear_relax.affine_band_alpha): slope lam = (1-a) f'(lo) + a f'(hi),
+    offsets recomputed HERE for that lam -- so every alpha in [0, 1] yields
+    a sound band and the slope is differentiable in alpha. On ranges where
+    f' is constant (stable relu) the mapping is exact for every alpha."""
     g_lo, g_hi = f(lo) - lam * lo, f(hi) - lam * hi
     gmax = torch.maximum(g_lo, g_hi)
     gmin = torch.minimum(g_lo, g_hi)
     for xc in crit_xs:
+        # detach the LOCATION: at a true extremum dg/dx = 0, so the
+        # location carries no gradient (envelope theorem) -- while the
+        # closed forms behind it (sqrt(1-4lam), arccos(lam)) have INFINITE
+        # gradient at their clamp boundary and would NaN the alpha loop
+        xc = xc.detach() if torch.is_tensor(xc) else xc
         ok = (xc >= lo) & (xc <= hi) & torch.isfinite(xc)
         gx = torch.where(ok, f(xc) - lam * xc, gmin)
         gmin = torch.minimum(gmin, gx)
@@ -198,6 +215,12 @@ class _SShaped:
         bl, bu = _band(f, lo, hi, lam, self._crit(lam))
         return lam, (bl + bu) / 2, (bu - bl) / 2
 
+    def band_alpha(self, lo, hi, alpha, params=None):
+        a = alpha.clamp(0.0, 1.0)
+        lam = (1 - a) * self._slope_at(lo) + a * self._slope_at(hi)
+        bl, bu = _band(self.point, lo, hi, lam, self._crit(lam))
+        return lam, (bl + bu) / 2, (bu - bl) / 2
+
 
 class Sigmoid(_SShaped):
     def point(self, x, params=None):
@@ -248,6 +271,13 @@ class _V1Band:
         # affine_band is SOUND FOR ANY lam (v1 nl_* docstring): the caller may
         # supply an optimized slope; None keeps v1's chord default.
         lam, mu, delta = self._rel(params).affine_band(lo, hi, lam=lam)
+        return (lam.to(lo.dtype), mu.to(lo.dtype), delta.to(lo.dtype))
+
+    def band_alpha(self, lo, hi, alpha, params=None):
+        # v1 affine_band_alpha: lam = (1-a) f'(lo) + a f'(hi), sound offsets
+        # recomputed for that lam by the nl_* module's own closed form
+        lam, mu, delta = self._rel(params).affine_band_alpha(
+            lo, hi, alpha.clamp(0.0, 1.0))
         return (lam.to(lo.dtype), mu.to(lo.dtype), delta.to(lo.dtype))
 
     def planes(self, lo, hi, params=None):
@@ -352,6 +382,16 @@ class Exp:
         al, bl, _au, bu = self.planes(lo, hi)
         return al, (bl + bu) / 2, (bu - bl) / 2
 
+    def band_alpha(self, lo, hi, alpha, params=None):
+        a = alpha.clamp(0.0, 1.0)
+        lam = (1 - a) * torch.exp(lo) + a * torch.exp(hi)
+        # overflowed slopes (exp past fp range) keep a finite band; the
+        # interval state anchors the truly unbounded case upstream
+        lam = torch.nan_to_num(lam, posinf=torch.finfo(lo.dtype).max / 4)
+        lam = lam.clamp_min(1e-30)
+        bl, bu = _band(self.point, lo, hi, lam, [torch.log(lam)])
+        return lam, (bl + bu) / 2, (bu - bl) / 2
+
 
 class Reciprocal:
     """1/y on sign-definite ranges: convex for y>0 (tangent below, chord
@@ -391,6 +431,19 @@ class Reciprocal:
         y_star = torch.sqrt((-1.0 / lam).clamp_min(1e-30))
         y_star = torch.where(lo > 0, y_star, -y_star)
         bl, bu = _band(lambda y: 1.0 / y, lo, hi, lam, [y_star])
+        return lam, (bl + bu) / 2, (bu - bl) / 2
+
+    def band_alpha(self, lo, hi, alpha, params=None):
+        if bool(((lo <= 0) & (hi >= 0)).any()):
+            # same refusal as planes()/band(): no sound linear band across 0
+            raise NotImplementedError(
+                'reciprocal over a range containing 0 is unbounded')
+        a = alpha.clamp(0.0, 1.0)
+        lam = ((1 - a) * (-1.0 / (lo * lo))
+               + a * (-1.0 / (hi * hi))).clamp_max(-1e-30)
+        y_star = torch.sqrt(-1.0 / lam)
+        y_star = torch.where(lo > 0, y_star, -y_star)
+        bl, bu = _band(self.point, lo, hi, lam, [y_star])
         return lam, (bl + bu) / 2, (bu - bl) / 2
 
 

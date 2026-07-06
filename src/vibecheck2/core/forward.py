@@ -22,15 +22,17 @@ from .relax import OUT_RANGE as REL_RANGE, REL
 
 
 
-def _op_const(op, key, dev, build):
-    """Per-(op, key, device) tensor cache for concat bases/positions: these
-    numpy constants were re-uploaded on every forward call, which dominated
-    tight BaB loops (lsnc: 3.2s of a 20s slice in torch.as_tensor)."""
+def _op_const(op, key, dev, build, dtype=None):
+    """Per-(op, key, device, dtype) tensor cache for concat bases/positions:
+    these numpy constants were re-uploaded on every forward call, which
+    dominated tight BaB loops (lsnc: 3.2s of a 20s slice in torch.as_tensor).
+    dtype must be part of the key for value tensors: alpha_zono runs the
+    same net in float64 after float32 phases cached float32 bases."""
     cache = getattr(op, '_tcache', None)
     if cache is None:
         cache = {}
         op._tcache = cache
-    k = (key, str(dev))
+    k = (key, str(dev), str(dtype))
     if k not in cache:
         cache[k] = build()
     return cache[k]
@@ -81,7 +83,8 @@ def point(net, x: torch.Tensor) -> torch.Tensor:
             out = _op_const(op, 'base', x.device,
                             lambda: torch.as_tensor(
                                 op.params['base'], device=x.device,
-                                dtype=x.dtype)).expand(B, -1).clone()
+                                dtype=x.dtype),
+                            dtype=x.dtype).expand(B, -1).clone()
             for si, (src, pos) in enumerate(zip(op.inputs,
                                                 op.params['positions'])):
                 p = _op_const(op, ('pos', si), x.device,
@@ -187,7 +190,8 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
             bc = _op_const(op, 'base', c.device,
                            lambda: torch.as_tensor(
                                op.params['base'], device=c.device,
-                               dtype=c.dtype)).expand(B, -1).clone()
+                               dtype=c.dtype),
+                           dtype=c.dtype).expand(B, -1).clone()
             br = torch.zeros_like(bc)
             for si, (src, pos) in enumerate(zip(op.inputs,
                                                 op.params['positions'])):
@@ -302,10 +306,11 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     clamp_bounds: optional {nonlin op: (lo, hi)} EXTERNAL pre-activation
     bounds (e.g. CROWN-refined) intersected before each band; sound, and
     the resulting bands/state get much tighter.
-    slope_override: optional {relu op: (B, n) lam in [0, 1]} per-neuron
-    slopes (e.g. a query's optimized alphas); the band offset is recomputed
-    for the given slope (relu deviation spans [0, max(-lam*l, (1-lam)*h)]),
-    so ANY slope in [0, 1] stays sound."""
+    slope_override: optional {nonlin op: (B, n) alpha in [0, 1]} per-neuron
+    band-slope parameters for any op with a RelaxLib band_alpha (relu,
+    sigmoid/tanh, sin/cos/pow, exp, reciprocal): lam = (1-a) f'(lo) +
+    a f'(hi) with the offsets recomputed in closed form for that lam, so
+    ANY alpha in [0, 1] stays sound (v1's nl_alpha mechanism)."""
     lo, hi = _as2d(lo), _as2d(hi)
     B, n = lo.shape
     dev, dt = lo.device, lo.dtype
@@ -376,9 +381,15 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 zh = torch.minimum(zh, torch.maximum(ch, zl))
             # generic DeepZ affine band: y = lam*x + mu + delta*e_new
             # (relu: DeepZ triangle; sigmoid/tanh: chord band; each op's
-            # RelaxLib entry owns its closed-form construction)
+            # RelaxLib entry owns its closed-form construction). An override
+            # routes through band_alpha: the slope becomes the caller's
+            # optimizable parameter, offsets recomputed for that slope.
+            ov = (slope_override.get(name) if slope_override else None)
             try:
-                lam, mu, delta = rel.band(zl, zh, op.params)
+                if ov is not None and hasattr(rel, 'band_alpha'):
+                    lam, mu, delta = rel.band_alpha(zl, zh, ov, op.params)
+                else:
+                    lam, mu, delta = rel.band(zl, zh, op.params)
             except NotImplementedError:
                 if 'out_lo' not in op.params:
                     raise
@@ -387,14 +398,6 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                                           + op.params['out_hi']) / 2)
                 delta = torch.full_like(zl, (op.params['out_hi']
                                              - op.params['out_lo']) / 2)
-            if (slope_override and op.fn == 'relu'
-                    and name in slope_override):
-                lam_o = slope_override[name].clamp(0.0, 1.0)
-                unst = (zl < 0) & (zh > 0)
-                dev_max = torch.maximum(-lam_o * zl, (1 - lam_o) * zh)
-                lam = torch.where(unst, lam_o, lam)
-                mu = torch.where(unst, dev_max / 2, mu)
-                delta = torch.where(unst, dev_max / 2, delta)
             if record is not None and op.fn == 'relu':
                 # pre-activation snapshot for dual_lp.build_state:
                 # z_j = c_pre[j] + G_pre[j] . e  and  y = lam z + mu + mu e_new
@@ -419,7 +422,8 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
             z_parts = [state[s] for s in op.inputs]
             base = _op_const(op, 'base', dev,
                              lambda: torch.as_tensor(op.params['base'],
-                                                     device=dev, dtype=dt))
+                                                     device=dev, dtype=dt),
+                             dtype=dt)
             n_out = op.params['n_out']
             # union the symbol lists (shared prefix + tails, as in add)
             syms, gmap = [], []
@@ -441,8 +445,12 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 G2[:, p.unsqueeze(1), torch.as_tensor(cols, device=dev)] = zp.G
             state[name] = ZonoState(c2, G2, syms)
         elif op.kind == 'mul':
-            # bilinear product: sound box collapse (correlation through the
-            # product is dropped; McCormick-in-zono can tighten later)
+            # bilinear product: sound box collapse. The correlation-exact
+            # first-order product (v1 _torch_zono_mul_bilinear) was built
+            # and MEASURED on ml4acopf 0298: bit-identical alpha_zono
+            # margin, 2x slower (extra generator columns) -- the mul band
+            # is not binding at the optimum there. Reintroduce only with a
+            # case it wins.
             za, zb = state[op.inputs[0]], state[op.inputs[1]]
             (la, ha), (lb_, hb_) = za.bounds(), zb.bounds()
             cands = torch.stack([la * lb_, la * hb_, ha * lb_, ha * hb_])
@@ -472,3 +480,102 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     if return_state:
         return lo_o, hi_o, state
     return lo_o, hi_o
+
+
+def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
+               budget=None, patience=40, clamp_bounds=None, disj_idx=None):
+    """Adam-optimized band slopes over the forward zonotope (v1's nl_alpha,
+    verify_graph.py _nonlinear_alpha_opt).
+
+    One alpha per element of EVERY nonlin op with a RelaxLib band_alpha
+    (relu, sigmoid/tanh, sin/cos/pow, exp, reciprocal), shared across query
+    rows -- the whole forward state is differentiable in the slopes, so the
+    optimizer tightens every relaxation jointly against the spec margin
+    (backward CROWN relaxes each op once per direction and its per-op alpha
+    measured bit-identical on ml4acopf; the forward composition is where
+    the slope leverage lives: v1 climbs -12.76 -> +2.7e-7 on 0298 with this
+    exact mechanism).
+
+    disj_idx: optional (q,) disjunct index per query row. When given, the
+    objective is v1's: maximize min over disjuncts of (max over the
+    disjunct's rows) -- all gradient goes to the worst OPEN disjunct, and
+    the phase exits as soon as every disjunct has a positive row. Without
+    it, a hinged sum over rows.
+
+    Returns (B, q) lower bounds on W @ y. Sound: every alpha in [0, 1]
+    yields a bracketing zonotope (offsets recomputed per slope), so the
+    elementwise-best iterate is a valid bound; iterate 0 uses the default
+    bands, so the result is never worse than plain zono. clamp_bounds
+    (CROWN-refined intermediates) mirrors v1's tight_bounds."""
+    lo, hi = _as2d(lo), _as2d(hi)
+    B = lo.shape[0]
+    q = W.shape[-2]
+
+    def margins(override):
+        _, _, st = zono(net, lo, hi, return_state=True,
+                        slope_override=override, clamp_bounds=clamp_bounds)
+        z = st[net.output_name]
+        return z.c @ W.T - torch.matmul(W, z.G).abs().sum(-1)
+
+    best = margins(None).detach()
+    from .relax import REL
+    a_ops = [nm for nm in net.order if net.ops[nm].kind == 'nonlin'
+             and hasattr(REL[net.ops[nm].fn], 'band_alpha')]
+    if not a_ops or iters <= 0:
+        return best
+    alphas = {nm: torch.full((B, net.ops[nm].n), 0.5, device=lo.device,
+                             dtype=lo.dtype, requires_grad=True)
+              for nm in a_ops}
+    opt = torch.optim.Adam(list(alphas.values()), lr=lr)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode='max', factor=0.5, patience=15, min_lr=1e-3)
+    thr = (torch.zeros(q, device=lo.device, dtype=lo.dtype)
+           if thresholds is None else thresholds)
+    gidx = None
+    if disj_idx is not None:
+        groups = {}
+        for i, d in enumerate(disj_idx.tolist()):
+            groups.setdefault(d, []).append(i)
+        gidx = [torch.tensor(v, device=lo.device) for v in groups.values()]
+    stall = 0
+    for _ in range(max(1, iters)):
+        if budget is not None and budget.over():
+            break
+        lb = margins(alphas)
+        gained = bool((lb.detach() > best).any())
+        best = torch.maximum(best, lb.detach())
+        if gidx is not None:
+            done = all(bool((best[0][g] > thr[g]).any()) for g in gidx)
+        else:
+            done = bool((best > thr.unsqueeze(0)).all())
+        if done:
+            break                       # every disjunct has a positive row
+        stall = 0 if gained else stall + 1
+        if stall > patience:
+            break
+        if gidx is not None:
+            m = lb[0] - thr             # margins past threshold, worst first
+            obj = torch.stack([m[g].max() for g in gidx]).min()
+        else:
+            obj = torch.minimum(lb, thr.unsqueeze(0) + 1.0).sum()
+        objf = float(obj.detach())
+        if objf != objf:                # NaN iterate: best (detached) stands
+            break
+        opt.zero_grad(set_to_none=True)
+        (-obj).backward()
+        with torch.no_grad():
+            for t in alphas.values():
+                if t.grad is not None:
+                    # crit-point closed forms (arccos, sqrt) have INFINITE
+                    # gradient at their clamp boundary; the true gradient
+                    # through a stationary point is 0 (envelope theorem),
+                    # so zeroing the non-finite entries is exact there and
+                    # merely freezes the rare boundary-pinned element
+                    torch.nan_to_num_(t.grad, nan=0.0,
+                                      posinf=0.0, neginf=0.0)
+        opt.step()
+        sched.step(objf)
+        with torch.no_grad():
+            for t in alphas.values():
+                t.clamp_(0.0, 1.0)
+    return best

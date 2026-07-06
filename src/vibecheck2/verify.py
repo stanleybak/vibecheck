@@ -468,6 +468,57 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                                 len(spec.disjuncts))
             log(f'[vc2] alpha-polish: worst={float((lb + b).min()):.4f} '
                 f'open={len(open_d)}/{len(spec.disjuncts)}')
+    if verdict != 'unsat' and budget.remaining() > 15 \
+            and any((op.kind == 'nonlin' and op.fn != 'relu')
+                    or op.kind == 'mul' for op in net.ops.values()):
+        # forward-zono alpha (v1's nl_alpha): jointly optimize the band
+        # slope of EVERY nonlinearity (relu, sigmoid/tanh, sin/cos/pow,
+        # exp, reciprocal) over the differentiable forward zonotope,
+        # against the worst-open-disjunct margin. On mixed-nonlinearity
+        # nets this beats the whole backward stack: 0298 measured -11.84
+        # backward -> +2.2e-7 here (216/216 disjuncts, ~30s), matching
+        # v1. float64 like v1: the closing margins are ~1e-7, below
+        # float32 resolution at output scale. UNclamped: CROWN clamps
+        # measurably trap the optimizer (-0.24 vs closed, same net).
+        # Admission is predictive (memory.py discipline): the zonotope
+        # holds every edge as (n, g) with g bounded by wide inputs +
+        # unstable relus + non-relu band symbols + mul collapses, times 2
+        # for the autograd tape, in float64 (0298: est 6.4 GiB fits).
+        from .core import memory
+        n_unst_r = sum(int(((inter[nm][0] < 0) & (inter[nm][1] > 0)).sum())
+                       for nm in net.order
+                       if net.ops[nm].kind == 'nonlin'
+                       and net.ops[nm].fn == 'relu')
+        n_band = sum(op.n for op in net.ops.values()
+                     if (op.kind == 'nonlin' and op.fn != 'relu')
+                     or op.kind in ('mul', 'bmm'))
+        g_est = n_wide + n_unst_r + n_band
+        mem_est = sum(op.n for op in net.ops.values()) * g_est * 8 * 2
+        if mem_est <= memory.free_bytes(dev) * memory.SAFETY:
+            try:
+                sub = Budget(min(0.35 * budget.remaining(), 60.0),
+                             margin=0.0)
+                lb_f = forward.alpha_zono(net, lo.double(), hi.double(),
+                                          W.double(),
+                                          thresholds=(-b).double(),
+                                          budget=sub, disj_idx=di)[0]
+                verdict, open_d = _verdict_from_lbs(
+                    lb_f + b.double(), di, len(spec.disjuncts))
+                # feed downstream f32 phases a DIRECTED-rounded cast (a
+                # nearest-cast could round the bound up = unsound)
+                lb0 = torch.maximum(lb0, torch.nextafter(
+                    lb_f.to(lb0.dtype),
+                    torch.full_like(lb0, -torch.inf)))
+                log(f'[vc2] fzono-alpha: '
+                    f'worst={float((lb_f + b.double()).min()):.4e} '
+                    f'open={len(open_d)}/{len(spec.disjuncts)}')
+            except NotImplementedError as e:
+                # an op without a forward band yet is a feature boundary
+                # for this escalation only; the phases below still run
+                log(f'[vc2] fzono-alpha skipped ({e})')
+        else:
+            log(f'[vc2] fzono-alpha skipped (est {mem_est / 2**30:.1f} GiB '
+                f'> budget)')
     if verdict != 'unsat' and len(open_d) == 1 and n_nonlin <= 20000:
         # zono-lift (v1 phase 2.5): exact box+halfspace LP tightening of
         # every pre-activation under the open disjunct's own output rows.
