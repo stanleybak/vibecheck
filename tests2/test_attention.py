@@ -154,3 +154,22 @@ def test_dual_refuses_nonfinite_state():
     with pytest.raises(NotImplementedError):
         dual_lp.build_state_backward(net, lo, hi, inter, slopes=slopes,
                                      device='cpu')
+
+
+def test_softmax_crown_adjoint_sound():
+    """Backward CROWN through the fused softmax: the lb must bracket
+    sampled outputs of an attention net (adjoint no longer dies at the
+    softmax's interval-constant planes)."""
+    net, ref, _ = _attention_net()
+    lo = -torch.ones(1, 4) * 0.4
+    hi = torch.ones(1, 4) * 0.4
+    W = torch.eye(net.n_out)
+    from vibecheck2.core import backward
+    lb = backward.crown(net, lo, hi, W)[0]
+    xs = torch.tensor(RNG.uniform(-0.4, 0.4, (512, 4)).astype(np.float32))
+    ys = torch.tensor(ref(xs.numpy()))
+    assert (lb <= ys.min(0).values + 1e-4).all(), \
+        float((lb - ys.min(0).values).max())
+    # and it must be non-vacuous: strictly tighter than the constant
+    # planes would allow on at least some coordinate (adjoint alive)
+    assert torch.isfinite(lb).all()

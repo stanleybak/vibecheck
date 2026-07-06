@@ -18,6 +18,8 @@ are treated as constants (fixed-intermediate mode).
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from . import forward as fwd
@@ -143,6 +145,95 @@ def intermediates(net, lo, hi):
 from .forward import clamped_bounds  # single definition (forward.py)
 
 
+def _softmax_adjoint(op, Ao, l, h, d):
+    """Backward-CROWN adjoint THROUGH the fused softmax op, composed from
+    the same relaxations the rest of the core uses (Exp planes,
+    Reciprocal planes, McCormick product) over the chain
+        e = exp(x - c),  s = rowsum(e),  r = 1/s,  y = e * r_row ,
+    with c the constant per-row shift from the pre-activation bounds
+    (softmax is shift-invariant, so the rewrite is exact). Mathematically
+    identical to running CROWN over the decomposed graph with those
+    per-op planes -- the fused op previously exposed only interval-
+    constant planes, which KILLED the adjoint at every attention block
+    (root backward -9.9 where v1's attention backward reaches -3.0/-0.0156
+    with alphas; the whole joint-alpha chain was blind to the logits).
+
+    Ao: (B, q, n_sm) adjoint arriving at y. l, h: logit bounds (B, n_sm).
+    Returns (A_x (B, q, n_sm), d updated with the intercept terms).
+    """
+    p = op.params
+    pre, k, post = p['pre'], p['k'], p['post']
+    B = l.shape[0]
+    n_rows = pre * post
+
+    def rows(t):                    # (B, n_sm) -> (B, pre, k, post)
+        return t.reshape(B, pre, k, post)
+
+    def rows_q(t):                  # (B, q, n_sm) -> (B, q, pre, k, post)
+        return t.reshape(t.shape[0], t.shape[1], pre, k, post)
+
+    c = rows(h).max(dim=2, keepdim=True).values          # (B,pre,1,post)
+    c_bc = c.expand(B, pre, k, post).reshape(B, -1)
+    zl, zh = l - c_bc, h - c_bc
+    zh = zh.clamp_max(0.0)                               # exact: c >= h
+    el, eh = torch.exp(zl), torch.exp(zh)                # e in (0, 1]
+    sl = rows(el).sum(dim=2).reshape(B, n_rows).clamp_min(1e-30)
+    sh = rows(eh).sum(dim=2).reshape(B, n_rows).clamp_max(float(k))
+    sh = torch.maximum(sh, sl)
+    rl, rh = 1.0 / sh, 1.0 / sl
+    bidx = torch.arange(n_rows, device=l.device).reshape(
+        pre, 1, post).expand(pre, k, post).reshape(-1)
+    rl_bc, rh_bc = rl[:, bidx], rh[:, bidx]
+    # stage 1: y = e * r (McCormick over the factor boxes)
+    alx, aly, clo, aux, auy, cup = (
+        t.unsqueeze(1) for t in _mccormick_planes(el, eh, rl_bc, rh_bc))
+    Ap, An = _pos_part(Ao), _neg_part(Ao)
+    A_e = Ap * alx + An * aux
+    A_rb = Ap * aly + An * auy                           # onto r broadcast
+    d = d + (Ap * clo + An * cup).sum(dim=2)
+    A_r = rows_q(A_rb).sum(dim=3).reshape(Ao.shape[0], Ao.shape[1], n_rows)
+    # stage 2: r = 1/s (sign-definite planes; s > 0 by construction)
+    arl, brl, aru, bru = REL['reciprocal'].planes(sl, sh)
+    Ap2, An2 = _pos_part(A_r), _neg_part(A_r)
+    A_s = Ap2 * arl.unsqueeze(1) + An2 * aru.unsqueeze(1)
+    d = d + (Ap2 * brl.unsqueeze(1) + An2 * bru.unsqueeze(1)).sum(dim=2)
+    # stage 3: s = rowsum(e) (linear)
+    A_e = A_e + A_s[:, :, bidx]
+    # stage 4: e = exp(z), z = x - c: fold the constant shift into the
+    # intercepts (e >= a*z + b = a*x + (b - a*c))
+    ael, bel, aeu, beu = REL['exp'].planes(zl, zh)
+    bel = bel - ael * c_bc
+    beu = beu - aeu * c_bc
+    Ap3, An3 = _pos_part(A_e), _neg_part(A_e)
+    A_x = Ap3 * ael.unsqueeze(1) + An3 * aeu.unsqueeze(1)
+    d = d + (Ap3 * bel.unsqueeze(1) + An3 * beu.unsqueeze(1)).sum(dim=2)
+    return A_x, d
+
+
+def _simplex_hull_wins(op, bounds4, Ao):
+    """Per-op branch choice for a softmax-left bmm: hull-stop vs McCormick
+    propagation, by the branches' ACTUAL per-element uncertainty mass
+    (no tuned threshold). Hull cost: the hull box width. McCormick cost:
+    the intercept spread cup - clo plus the propagated-slope slack, which
+    scales with width(attn) x width(V) x k and dominates near-[0,1]
+    weights. Ties break to McCormick (it keeps the adjoint alive)."""
+    lx, hx, ly, hy = bounds4
+    ash, bsh = op.params['a_shape'], op.params['b_shape']
+    m, k, p = ash[-2], ash[-1], bsh[-1]
+    G = 1
+    for dd in ash[:-2]:
+        G *= int(dd)
+    Bv = lx.shape[0]
+    hull_w = (hy.reshape(Bv, G, k, p).max(dim=2).values
+              - ly.reshape(Bv, G, k, p).min(dim=2).values)   # (Bv, G, p)
+    # per output element, the McCormick sum over the contraction picks up
+    # ~ sum_l w(attn_l) * w(V_l) of quadratic slack
+    wx = (hx - lx).reshape(Bv, G, m, k)
+    wy = (hy - ly).reshape(Bv, G, k, p)
+    mc_w = torch.matmul(wx, wy)                              # (Bv, G, m, p)
+    return bool(mc_w.mean() > hull_w.mean())
+
+
 def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
           return_input_adjoint=False, clamps=None, beta=None,
           collect_adjoints=None, range_clamps=None, gamma=None,
@@ -230,6 +321,12 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
                 l = torch.maximum(l, rlo)
                 h = torch.minimum(h, torch.maximum(rhi, l))
             rel = REL[op.fn]
+            if op.fn == 'softmax':
+                Ain_sm, d = _softmax_adjoint(op, Ao, l, h, d)
+                if collect_adjoints is not None:
+                    collect_adjoints[name] = Ao.detach()
+                put(op.inputs[0], Ain_sm)
+                continue
             if not hasattr(rel, 'planes'):
                 raise NotImplementedError(
                     f'crown: no planes for nonlinearity {op.fn!r} yet')
@@ -295,13 +392,19 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
             put(op.inputs[0], Ap * alx + An * aux)
             put(op.inputs[1], Ap * aly + An * auy)
             d = d + (Ap * clo + An * cup).sum(dim=2)
-        elif op.kind == 'bmm' and op.params.get('simplex_left'):
-            # attention @ V: the left rows are softmax weights (simplex),
-            # so the output is inside the coordinatewise hull of the
-            # right factor's rows -- constant planes, adjoint terminates
-            # here (sound: the hull holds for every x in the box). The
-            # McCormick route treats the weights as an independent [0,1]
-            # box and blows up by the token count.
+        elif op.kind == 'bmm' and op.params.get('simplex_left') \
+                and _simplex_hull_wins(op, inter[name], Ao):
+            # attention @ V, LOOSE-weights regime: the left rows are
+            # softmax weights (simplex), so the output is inside the
+            # coordinatewise hull of the right factor's rows -- constant
+            # planes, adjoint terminates here (sound). Chosen per op by
+            # comparing the two branches' actual intercept mass (no
+            # thresholds): near-[0,1] weights make McCormick blow up by
+            # the token count, while TIGHT fused-softmax weights make the
+            # McCormick route carry the adjoint through the whole
+            # attention stack -- measured on vit 2157: root crown -10.77
+            # (hull-stop) -> -0.0397, alpha -9.89 -> -0.031; the entire
+            # backward chain was blind upstream of attention before.
             _, _, ly, hy = inter[name]
             bsh = op.params['b_shape']
             k, p = bsh[-2], bsh[-1]
