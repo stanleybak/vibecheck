@@ -342,31 +342,66 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     inter = backward.intermediates_crown(net, blo, bhi)
             else:
                 B = blo.shape[0]
-                zst = None
+                ib = None
                 zono_oom = False
                 try:
                     # true per-subbox planes from the wide-dims zonotope
                     _l, _h, zst = backward.fwd.zono(net, blo, bhi,
                                                     return_state=True)
+                    ib = backward._inter_from_state(
+                        net, lambda e: zst[e].bounds())
+                    del zst
                 except torch.cuda.OutOfMemoryError:
                     zono_oom = True
                     # empty_cache OUTSIDE this handler's live traceback would
                     # still pin the zono partial state; do it here and let the
-                    # fallback below (no zono call) run cache-clean
+                    # retry below run cache-clean
                     if dev.type == 'cuda':
                         torch.cuda.empty_cache()
-                    if roots is None:
-                        backward._warn_once(
-                            'input-split per-batch zono unavailable (OOM); '
-                            'interval reforward only')
                 except NotImplementedError as _ze:
                     backward._warn_once(
                         f'input-split per-batch zono unavailable '
                         f'({type(_ze).__name__}: {str(_ze)[:60]}); '
                         f'interval reforward only')
-                if zst is not None:
-                    ib = backward._inter_from_state(
-                        net, lambda e: zst[e].bounds())
+                if ib is None and zono_oom and roots is None:
+                    # the BATCH does not fit but per-leaf zono may (vit:
+                    # ~5 GiB/leaf at 5671 generators; interval degrade here
+                    # made the frontier explode to 16k boxes where v1's
+                    # SERIAL zono-input-split closes in 21). Re-run in
+                    # halving chunks via the sanctioned memory helper,
+                    # keeping only each chunk's per-edge bounds -- the
+                    # generator matrices free chunk-wise. Seed the chunk at
+                    # half the batch: the single shot just proved B over.
+                    outs = {}
+
+                    def _zchunk(idx_c):
+                        _zl, _zh, zc = backward.fwd.zono(
+                            net, blo[idx_c], bhi[idx_c], return_state=True)
+                        ibc = backward._inter_from_state(
+                            net, lambda e: zc[e].bounds())
+                        for k2, v in ibc.items():
+                            outs.setdefault(k2, []).append(
+                                tuple(t.detach() for t in v))
+
+                    try:
+                        memory.chunked_indices(
+                            _zchunk, torch.arange(B, device=dev),
+                            bytes_per_item=(memory.free_bytes(dev)
+                                            * memory.SAFETY
+                                            / max(1, B // 2)))
+                        ib = {k2: tuple(
+                            torch.cat([o[j] for o in v], dim=0)
+                            for j in range(len(v[0])))
+                            for k2, v in outs.items()}
+                    except torch.cuda.OutOfMemoryError:
+                        # even one leaf's zono does not fit: the halving
+                        # floor re-raised; fall through to the degrades
+                        torch.cuda.empty_cache()
+                        backward._warn_once(
+                            'per-leaf zono does not fit even at chunk=1; '
+                            'interval reforward only')
+                if ib is not None:
+                    pass                        # zono bounds stand
                 elif zono_oom and roots is not None:
                     # multi-sub: the zono generator count EXPLODES on mul/
                     # reciprocal nets (mscn_2048d: 130+ GiB, OOMs at every

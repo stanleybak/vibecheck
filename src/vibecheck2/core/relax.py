@@ -392,6 +392,26 @@ class Exp:
         bl, bu = _band(self.point, lo, hi, lam, [torch.log(lam)])
         return lam, (bl + bu) / 2, (bu - bl) / 2
 
+    def alpha_planes(self, lo, hi, alpha, params=None):
+        """Convex: the chord (upper) is optimal; the LOWER tangent's touch
+        point is the alpha (any tangent lies below a convex f, so every
+        alpha in [0, 1] is sound). Channel 0 moves the lower plane;
+        channel 1 is unused (the chord upper has no free parameter).
+        vit's softmax path is exp -> sum -> reciprocal: with fixed planes
+        alpha-CROWN cannot tighten it at all (root stuck at -11.86 where
+        v1's attention alpha reaches -3.0)."""
+        w = (hi - lo).clamp_min(1e-12)
+        chord = (torch.exp(hi) - torch.exp(lo)) / w
+        chord = torch.where(hi > lo, chord, torch.exp(lo))
+        bu = torch.exp(lo) - chord * lo
+        t = lo + alpha[..., 0, :].clamp(0.0, 1.0) * (hi - lo)
+        s = torch.exp(t)                        # f'(t) = f(t) for exp
+        al = s
+        bl = s - s * t                          # f(t) - f'(t) t
+        au = torch.broadcast_to(chord, al.shape)
+        bu = torch.broadcast_to(bu, al.shape)
+        return al, bl, au, bu
+
 
 class Reciprocal:
     """1/y on sign-definite ranges: convex for y>0 (tangent below, chord
@@ -445,6 +465,28 @@ class Reciprocal:
         y_star = torch.where(lo > 0, y_star, -y_star)
         bl, bu = _band(self.point, lo, hi, lam, [y_star])
         return lam, (bl + bu) / 2, (bu - bl) / 2
+
+    def alpha_planes(self, lo, hi, alpha, params=None):
+        """Sign-definite 1/y: convex on y>0 (tangent below/chord above),
+        concave on y<0 (mirrored). The tangent's touch point is the alpha
+        (sound for every alpha in [0, 1] by convexity); the chord side is
+        parameter-free. Same motivation as Exp.alpha_planes: the softmax
+        denominator's fixed midpoint tangent froze alpha-CROWN on vit."""
+        if bool(((lo <= 0) & (hi >= 0)).any()):
+            raise NotImplementedError(
+                'reciprocal over a range containing 0 is unbounded')
+        t = lo + alpha[..., 0, :].clamp(0.0, 1.0) * (hi - lo)
+        t = torch.where(t.abs() < 1e-12, torch.full_like(t, 1e-12), t)
+        tan_a = -1.0 / (t * t)
+        tan_b = 2.0 / t
+        chord_a = -1.0 / (lo * hi)
+        chord_b = 1.0 / lo + 1.0 / hi
+        pos = torch.broadcast_to(lo > 0, tan_a.shape)
+        al = torch.where(pos, tan_a, torch.broadcast_to(chord_a, tan_a.shape))
+        bl = torch.where(pos, tan_b, torch.broadcast_to(chord_b, tan_a.shape))
+        au = torch.where(pos, torch.broadcast_to(chord_a, tan_a.shape), tan_a)
+        bu = torch.where(pos, torch.broadcast_to(chord_b, tan_a.shape), tan_b)
+        return al, bl, au, bu
 
 
 class Pow(_V1Band):

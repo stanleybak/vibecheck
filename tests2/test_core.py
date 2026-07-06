@@ -359,3 +359,23 @@ def test_stabilize_intermediates_sound(tmp_path):
         # never looser than the base bounds
         assert (v[0] >= inter[nm][0] - 1e-6).all(), nm
         assert (v[1] <= inter[nm][1] + 1e-6).all(), nm
+
+
+def test_alpha_planes_sound_exp_reciprocal():
+    """Tangent-position alpha planes for the convex softmax ops: sound for
+    every alpha (tangents under convex f; chord above), validated by
+    sampling."""
+    tr = torch.rand
+    cases = [('exp', -3 + 4 * tr(48), 0.1 + 2 * tr(48)),
+             ('reciprocal', 0.2 + 2 * tr(48), 0.1 + 2 * tr(48)),
+             ('reciprocal', -4 + 1.5 * tr(48), 0.1 + 2 * tr(48))]
+    for fn, lo, w in cases:
+        hi = lo + w
+        rel = REL[fn]
+        for a in (0.0, 0.31, 0.5, 0.77, 1.0):
+            alpha = torch.full((2, lo.shape[0]), a)
+            al, bl, au, bu = rel.alpha_planes(lo, hi, alpha)
+            xs = lo + (hi - lo) * torch.rand(400, lo.shape[0])
+            y = rel.point(xs)
+            assert bool((al * xs + bl <= y + 1e-5).all()), (fn, a)
+            assert bool((y <= au * xs + bu + 1e-5).all()), (fn, a)

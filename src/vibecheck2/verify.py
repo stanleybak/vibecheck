@@ -568,9 +568,16 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # (MILP-eligible nets already had their exact shot ABOVE, before the
         # wide route, so the dual needs no reserve here.)
         from .core.dual_lp import certify_queries
+        # reserve a BaB slice: the dual's per-query BnB happily consumes
+        # the whole remaining budget failing on a stubborn disjunct (vit
+        # 1151: ~30s of time_limit nodes, then input_split_bab got 0
+        # bounds where v1 closes it in 21 boxes/25s). The dual keeps 55%
+        # of what is left; survivors fall through with real time.
         refuted = certify_queries(
             net, spec, W, b, di, lo, hi, inter, open_d,
-            deadline=t0 + timeout - 2.0, device=device, log=log)
+            deadline=min(t0 + timeout - 2.0,
+                         time.time() + 0.55 * budget.remaining()),
+            device=device, log=log)
         open_d = [d for d in open_d if d not in refuted]
         log(f'[vc2] dual-lp: {len(refuted)} disjuncts refuted, '
             f'{len(open_d)} open')
