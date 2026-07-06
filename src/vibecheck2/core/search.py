@@ -679,7 +679,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
 def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                    device='cpu', batch=256, beta_iters=None, onnx_path=None,
-                   attack_every=16, root_inter=None, log=lambda m: None):
+                   attack_every=16, root_inter=None, bound='crown',
+                   warm_alphas=None, log=lambda m: None):
     """ReLU-phase splitting BaB (no-reforward): intermediates stay ROOT
     bounds; each domain carries sign clamps, and the bound comes from
     alpha+beta CROWN under those clamps (v1 _crown_bab_noreforward / abcrown
@@ -712,6 +713,10 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         root_inter = backward.intermediates(net, lo1, hi1)
     relu_edges = [nm for nm in net.order
                   if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'relu']
+    relu_set = set(relu_edges)
+    softmax_set = {nm for nm in net.order
+                   if net.ops[nm].kind == 'nonlin'
+                   and net.ops[nm].fn == 'softmax'}
     # smooth single-input nonlins are RANGE-splittable: same action ranking,
     # children constrain the pre-activation interval instead of a sign
     smooth_edges = [nm for nm in net.order
@@ -771,20 +776,29 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                         clamps[nm][bi, j] = spec_
             # reforward-IBP under the clamps, intersected with the (tighter at
             # the root, clamp-blind) root intermediates: best of both regimes
-            ib_state = backward.fwd.interval(net, blo, bhi, return_state=True,
-                                             clamps=clamps,
-                                             range_clamps=range_clamps)
-            ib = backward._inter_from_state(net, lambda e: ib_state[e])
-            inter = {}
-            for k2, v in root_inter.items():
-                rv = tuple(t.expand(B, -1) for t in v)
-                iv = ib[k2]
-                merged = []
-                for j2 in range(0, len(rv), 2):
-                    merged.append(torch.maximum(rv[j2], iv[j2]))
-                    merged.append(torch.minimum(rv[j2 + 1], iv[j2 + 1]))
-                inter[k2] = tuple(merged)
-            if n_relu_total <= 2000:
+            if bound == 'zono':
+                # lean round: the sign clamps act INSIDE the zono via
+                # clamp_bounds; the reforward-IBP merge and the crown
+                # scoring pass cost more than the bound itself (measured
+                # 0.7 s/domain vs the zono's 95 ms at B=16)
+                inter = {k2: tuple(t.expand(B, -1) for t in v)
+                         for k2, v in root_inter.items()}
+            else:
+                ib_state = backward.fwd.interval(net, blo, bhi,
+                                                 return_state=True,
+                                                 clamps=clamps,
+                                                 range_clamps=range_clamps)
+                ib = backward._inter_from_state(net, lambda e: ib_state[e])
+                inter = {}
+                for k2, v in root_inter.items():
+                    rv = tuple(t.expand(B, -1) for t in v)
+                    iv = ib[k2]
+                    merged = []
+                    for j2 in range(0, len(rv), 2):
+                        merged.append(torch.maximum(rv[j2], iv[j2]))
+                        merged.append(torch.minimum(rv[j2 + 1], iv[j2 + 1]))
+                    inter[k2] = tuple(merged)
+            if bound != 'zono' and n_relu_total <= 2000:
                 # small net (acasxu class): per-batch CROWN refinement of the
                 # merged bounds under the clamps. NOT for wide layers: the
                 # identity blocks scale with unstable count x batch (malbeware,
@@ -795,14 +809,79 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                      clamps=clamps,
                                                      range_clamps=range_clamps)
             adj = {}
-            lbq, a_in = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
-                                       range_clamps=range_clamps,
-                                       collect_adjoints=adj,
-                                       return_input_adjoint=True)
-            lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter, clamps,
-                                              iters=beta_iters, thresholds=-bias,
-                                              range_clamps=range_clamps)
-            lbq = torch.maximum(lbq, lb_ab)
+            zono_scores = {}
+            zono_range_scores = {}
+            if bound == 'zono':
+                # v1's vit beta-bab regime (its trace: 1583 domains close
+                # 2157's last query at ~32 ms/domain): the FORWARD zono --
+                # the only bound that is tight on attention nets (backward
+                # crown: -9.9 vs zono -0.04 at the root) -- evaluated
+                # under the domain's sign clamps via clamp_bounds. The
+                # BaBSR adjoint signal comes from a crown pass over the
+                # same clamps (scoring only; its bound is not used).
+                cb = {}
+                for nm, cl in clamps.items():
+                    l0, h0 = inter[nm][0], inter[nm][1]
+                    cb[nm] = (torch.where(cl > 0, l0.clamp_min(0.0), l0),
+                              torch.where(cl < 0, h0.clamp_max(0.0), h0))
+                for nm, (rlo, rhi) in (range_clamps or {}).items():
+                    l0, h0 = inter[nm][0], inter[nm][1]
+                    cb[nm] = (torch.maximum(l0, rlo),
+                              torch.maximum(torch.minimum(h0, rhi),
+                                            torch.maximum(l0, rlo)))
+                _dbg = os.environ.get('VC2_DEBUG_CLIP')
+                _tz = time.time()
+                so = None
+                if warm_alphas is not None:
+                    # the root fzono's optimized slopes, expanded per
+                    # domain: default bands measured ~10x looser
+                    so = {nm: t.to(dev).expand(B, -1)
+                          for nm, t in warm_alphas.items()}
+                _zl, _zh, zst = backward.fwd.zono(net, blo, bhi,
+                                                  return_state=True,
+                                                  clamp_bounds=cb,
+                                                  slope_override=so)
+                if _dbg:
+                    torch.cuda.synchronize() if dev.type == 'cuda' else None
+                    log(f'[vc2/rbab] round={rounds} zono {time.time()-_tz:.2f}s B={B}')
+                    _tz = time.time()
+                zo = zst[net.output_name]
+                WG = torch.matmul(W, zo.G)               # (B, q, g)
+                lbq = torch.matmul(zo.c, W.T) - WG.abs().sum(-1)
+                # SLACK ATTRIBUTION scoring (v1's BBPS intent, exact in
+                # the zono frame): each relu fresh column's |W @ G[:,col]|
+                # IS that neuron's relaxation contribution to the margin
+                zono_scores = {}
+                zono_range_scores = {}
+                for col, sm in enumerate(zo.sym):
+                    nm_s, j_s = sm
+                    if nm_s in relu_set:
+                        zono_scores.setdefault(nm_s, []).append(
+                            (j_s, WG[:, :, col].abs().amax(dim=1)))
+                    elif nm_s.endswith('/e') and nm_s[:-2] in softmax_set:
+                        # fused-softmax exp band columns map 1:1 to the
+                        # softmax INPUT elements -> range-splittable
+                        # (v1 splits the attention internals; the fused
+                        # op hid them from the edge lists)
+                        zono_range_scores.setdefault(nm_s[:-2], []).append(
+                            (j_s, WG[:, :, col].abs().amax(dim=1)))
+                a_in = None
+                del zst, zo, WG
+                if _dbg:
+                    torch.cuda.synchronize() if dev.type == 'cuda' else None
+                    log(f'[vc2/rbab] round={rounds} scoring {time.time()-_tz:.2f}s '
+                        f'g_cols={len(zono_scores) and sum(len(v) for v in zono_scores.values())}')
+            else:
+                lbq, a_in = backward.crown(net, blo, bhi, W, inter,
+                                           clamps=clamps,
+                                           range_clamps=range_clamps,
+                                           collect_adjoints=adj,
+                                           return_input_adjoint=True)
+                lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter,
+                                                  clamps, iters=beta_iters,
+                                                  thresholds=-bias,
+                                                  range_clamps=range_clamps)
+                lbq = torch.maximum(lbq, lb_ab)
         except (torch.cuda.OutOfMemoryError,
                 torch.AcceleratorError):
             # round-level OOM recovery (mirrors input_split_bab): push
@@ -812,11 +891,12 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             torch.cuda.empty_cache()
             for dom in batch_doms:
                 heapq.heappush(heap, dom)
-            if batch <= 8:
+            if batch <= 1:
                 return 'timeout', {'frontier': len(heap),
                                    'bounded': n_bounded,
                                    'reason': 'oom_floor'}
-            batch = max(8, B // 2)
+            batch = max(1, B // 2)
+            log(f'[vc2/rbab] round={rounds} OOM at B={B}; batch -> {batch}')
             continue
         n_bounded += B
         refuted = refuted_of(lbq)
@@ -830,6 +910,43 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             best_j = torch.zeros(B, dtype=torch.long, device=dev)
             best_mid = torch.zeros(B, device=dev)
             best_kind = [''] * B
+            if bound == 'zono' and (zono_scores or zono_range_scores):
+                for nm, cols in zono_scores.items():
+                    sc = torch.zeros(B, net.ops[nm].n, device=dev)
+                    for j_s, v_s in cols:
+                        sc[:, j_s] = v_s
+                    cl = clamps.get(nm)
+                    if cl is not None:
+                        sc = sc * (cl == 0)      # already-split: not again
+                    v, j = sc.max(dim=1)
+                    better = v > best_score
+                    best_score = torch.where(better, v, best_score)
+                    best_j[better] = j[better]
+                    for bi in torch.nonzero(better,
+                                            as_tuple=False).flatten().tolist():
+                        best_edge[bi] = nm
+                        best_kind[bi] = 'sign'
+                for nm, cols in zono_range_scores.items():
+                    sc = torch.zeros(B, net.ops[nm].n, device=dev)
+                    for j_s, v_s in cols:
+                        sc[:, j_s] = torch.maximum(sc[:, j_s], v_s)
+                    l_r, h_r = inter[nm][0], inter[nm][1]
+                    if nm in range_clamps:
+                        l_r = torch.maximum(l_r, range_clamps[nm][0])
+                        h_r = torch.minimum(h_r, range_clamps[nm][1])
+                    mid_r = (l_r + h_r) / 2
+                    v, j = sc.max(dim=1)
+                    better = v > best_score
+                    best_score = torch.where(better, v, best_score)
+                    best_j[better] = j[better]
+                    best_mid[better] = mid_r.gather(
+                        1, j.unsqueeze(1))[:, 0][better]
+                    for bi in torch.nonzero(better,
+                                            as_tuple=False).flatten().tolist():
+                        best_edge[bi] = nm
+                        best_kind[bi] = 'range'
+
+            skip_babsr = bound == 'zono' and bool(zono_scores)
 
             def consider(nm, s_scores, kind, mid=None):
                 nonlocal best_score
@@ -844,7 +961,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     best_edge[bi] = nm
                     best_kind[bi] = kind
 
-            for nm in relu_edges:
+            for nm in (() if skip_babsr else relu_edges):
                 l, h = inter[nm]
                 cl = clamps.get(nm)
                 if cl is not None:
@@ -858,7 +975,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                               else torch.ones_like(l)) * intercept * unstable,
                          'sign')
             from .relax import REL
-            for nm in smooth_edges:
+            for nm in (() if skip_babsr else smooth_edges):
                 l, h = inter[nm]
                 _lam, _mu, delta = REL[net.ops[nm].fn].band(
                     l, h, net.ops[nm].params)
@@ -897,7 +1014,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 nz = torch.nonzero(((m_bq <= 0)
                                     & open_mask.unsqueeze(1)).flatten(),
                                    as_tuple=False).flatten()
-                if nz.numel():
+                if a_in is not None and nz.numel():
                     pick = nz[m_bq.flatten()[nz].argsort()[:64]]
                     Af = a_in.reshape(-1, a_in.shape[-1])[pick]
                     mid = (lo1[0] + hi1[0]) / 2
@@ -916,7 +1033,9 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                             vinfo.get('witness_inbox', cand))}
                     if vinfo.get('within_tol_witness') is not None:
                         tol_witness = vinfo['within_tol_witness']
-        if rounds % 16 == 0:
+        if rounds % 16 == 0 or (bound == 'zono' and rounds % 4 == 0):
+            _wl = float((lbq + bias).min()) if lbq.numel() else float('nan')
             log(f'[vc2/rbab] round={rounds} frontier={len(heap)} '
-                f'bounded={n_bounded} t={time.time() - t0:.1f}s')
+                f'bounded={n_bounded} worst={_wl:+.4f} '
+                f't={time.time() - t0:.1f}s')
     return 'unsat', {'bounded': n_bounded, 'rounds': rounds}

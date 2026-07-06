@@ -267,6 +267,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     budget = Budget(timeout, margin=0.0)
     budget.t0 = t0
     budget.deadline = t0 + timeout - 2.0
+    fz_alphas = None      # fzono's optimized band slopes (BaB warm start)
     tol_w = None          # within-tolerance witness: emitted ONLY if the
                           # pipeline ends without a strict verdict (v1's
                           # variant sats land at timeout, not at phase A)
@@ -511,12 +512,15 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # (and the dual/BaB measurably never rescue this class).
             sub = Budget(min(0.7 * budget.remaining(), 300.0),
                          margin=0.0)
-            lb_f = memory.attempt(
+            fz = memory.attempt(
                 lambda: forward.alpha_zono(net, lo.double(), hi.double(),
                                            W.double(), iters=1000,
                                            thresholds=(-b).double(),
-                                           budget=sub, disj_idx=di)[0],
+                                           budget=sub, disj_idx=di,
+                                           return_alphas=True),
                 tag='fzono-alpha')
+            lb_f, fz_alphas = (None, None) if fz is None \
+                else (fz[0][0], fz[1])
             if lb_f is None:
                 log('[vc2] fzono-alpha skipped (oom)')
             else:
@@ -575,10 +579,17 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     f'open={len(open_d)}/{len(spec.disjuncts)}')
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
-    if verdict != 'unsat':
+    zono_bab_route = (verdict != 'unsat' and n_wide > 32
+                      and len(open_d) <= 2
+                      and any((op.kind == 'nonlin' and op.fn != 'relu')
+                              or op.kind in ('mul', 'bmm')
+                              for op in net.ops.values()))
+    if verdict != 'unsat' and not zono_bab_route:
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
-        # refuter. The state builds BACKWARD (unstable rows only, chunked),
+        # refuter. SKIPPED on the zono-BaB route: measured on every vit
+        # row, the per-query dual burns its whole slice at time_limit
+        # (3.2M nodes) while the zono BaB needs exactly that budget. The state builds BACKWARD (unstable rows only, chunked),
         # so no forward-zonotope gate; survivors fall through to BaB.
         # (MILP-eligible nets already had their exact shot ABOVE, before the
         # wide route, so the dual needs no reserve here.)
@@ -643,8 +654,23 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                         or op.kind in ('mul', 'bmm')
                         for op in net.ops.values())
         kw = {}
-        if n_wide <= 32 or (len(open_d) <= 2 and has_mixed):
+        if n_wide <= 32:
             bab = input_split_bab
+        elif len(open_d) <= 2 and has_mixed:
+            # v1's vit beta-bab regime (its 2157 trace: relu/bilinear sign
+            # splits bounded by the ZONO close the last query in 1583
+            # domains/51s; input splits measured immobile and backward
+            # crown is -9.9 where the zono is -0.04)
+            bab = relu_split_bab
+            kw['root_inter'] = inter
+            kw['bound'] = 'zono'
+            kw['batch'] = 16    # measured on vit: B=16 fits (8.4 GiB), B=64 OOMs
+            # the root fzono's optimized band slopes: bounding domains
+            # with DEFAULT bands measured ~10x looser (-0.46-quality vs
+            # the root's -0.043) and the tree barely pruned
+            if fz_alphas is not None:
+                kw['warm_alphas'] = {nm: t.float()
+                                     for nm, t in fz_alphas.items()}
         else:
             bab = relu_split_bab
             kw['root_inter'] = inter        # the crown-refined root bounds

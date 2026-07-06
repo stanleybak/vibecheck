@@ -351,6 +351,11 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     G[:, wide, torch.arange(wide.numel(), device=dev)] = r[:, wide]
     sym = [('input', int(i)) for i in wide.tolist()]
     state = {net.input_name: ZonoState(c, G, sym)}
+    # free edges as their last consumer runs (same discipline as point():
+    # holding every edge's (B, n, g) matrix alive put vit's zono at ~5 GiB
+    # per leaf and made per-domain BaB bounding hopeless; v1's ~32 ms/domain
+    # beta-bab rate implies a live-frontier footprint)
+    remaining = {e: len(c2) for e, c2 in net.consumers().items()}
 
     def lin_cols(lmap, G):
         Bv, nv, g = G.shape
@@ -503,6 +508,11 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 'load (graph.py) so no maxpool survives into relaxation')
         else:
             raise NotImplementedError(f'zono: op kind {op.kind!r}')
+        for e in op.inputs:
+            remaining[e] -= 1
+            if (remaining[e] == 0 and e != net.output_name
+                    and not return_state):
+                del state[e]
     zout = state[net.output_name]
     lo_o, hi_o = zout.bounds()
     if return_state:
@@ -702,7 +712,8 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
 
 
 def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
-               budget=None, patience=40, clamp_bounds=None, disj_idx=None):
+               budget=None, patience=40, clamp_bounds=None, disj_idx=None,
+               return_alphas=False):
     """Adam-optimized band slopes over the forward zonotope (v1's nl_alpha,
     verify_graph.py _nonlinear_alpha_opt).
 
@@ -757,6 +768,8 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
             groups.setdefault(d, []).append(i)
         gidx = [torch.tensor(v, device=lo.device) for v in groups.values()]
     stall = 0
+    best_alphas = None
+    best_obj = -torch.inf
     for _ in range(max(1, iters)):
         if budget is not None and budget.over():
             break
@@ -780,6 +793,10 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         objf = float(obj.detach())
         if objf != objf:                # NaN iterate: best (detached) stands
             break
+        if return_alphas and objf > best_obj:
+            best_obj = objf
+            best_alphas = {nm: t.detach().clone()
+                           for nm, t in alphas.items()}
         opt.zero_grad(set_to_none=True)
         (-obj).backward()
         with torch.no_grad():
@@ -797,4 +814,6 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         with torch.no_grad():
             for t in alphas.values():
                 t.clamp_(0.0, 1.0)
+    if return_alphas:
+        return best, best_alphas
     return best
