@@ -227,3 +227,22 @@ def test_box_remainder_relu_record_and_columns():
     ys = (1 / (1 + np.exp(-h)) + np.maximum(h, 0)) @ lm2.W.T + lm2.b
     assert (ys >= rl.numpy() - 1e-5).all()
     assert (ys <= rh.numpy() + 1e-5).all()
+
+
+def test_sym_budget_zono_sound():
+    """Input-symbol budget: only top-K wide dims get columns, the rest
+    box into rad; bounds still bracket the true image and the column
+    count respects the budget."""
+    from vibecheck2.core import forward as fwd
+    net, ref, _ = _attention_net()
+    lo = torch.tensor([[-1.0, -0.5, 0.0, -0.8]])
+    hi = torch.tensor([[0.5, 1.0, 0.7, 0.2]])
+    rl, rh, rst = fwd.zono(net, lo, hi, return_state=True,
+                           box_remainder=True, sym_budget=2)
+    zi = rst[net.input_name]
+    assert sum(1 for s in zi.sym if s[0] == 'input') == 2
+    xs = RNG.uniform(lo.numpy(), hi.numpy(),
+                     size=(4096, 4)).astype(np.float32)
+    ys = ref(xs)
+    assert (ys >= rl.numpy() - 1e-5).all()
+    assert (ys <= rh.numpy() + 1e-5).all()

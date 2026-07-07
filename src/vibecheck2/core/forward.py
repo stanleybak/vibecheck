@@ -329,7 +329,7 @@ class ZonoState:
 
 
 def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
-         slope_override=None, box_remainder=False):
+         slope_override=None, box_remainder=False, sym_budget=None):
     """DeepZ forward. Boxes (B, n_in) -> output bounds (+ per-edge states).
 
     record: optional dict; when given, each relu op stores its
@@ -348,7 +348,13 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     columns the BaB scores and splits) accumulates in ZonoState.rad
     instead of dense generator columns. Sound (see ZonoState); trades the
     dropped cross-element correlations for the memory/FLOPs of ~60% of
-    the generator columns (the per-domain BaB regime)."""
+    the generator columns (the per-domain BaB regime).
+    sym_budget: cap on INPUT symbol columns (requires box_remainder).
+    Only the top-budget wide dims by radius get columns; the rest start
+    in the remainder. This is ab-crown's vggnet16 recipe
+    (bound_prop_method dynamic-forward, forward.max_dim 100): a 150k-dim
+    ImageNet box cannot carry one column per pixel, and a ~100-symbol
+    forward + input-split BaB is what officially closes that class."""
     lo, hi = _as2d(lo), _as2d(hi)
     B, n = lo.shape
     dev, dt = lo.device, lo.dtype
@@ -364,10 +370,18 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     # so the input block shrinks 100x)
     r = (hi - lo) / 2
     wide = torch.nonzero((r > 0).any(dim=0), as_tuple=False).flatten()
+    rad0 = torch.zeros(B, n, device=dev, dtype=dt) if box_remainder else None
+    if sym_budget is not None and wide.numel() > sym_budget:
+        assert box_remainder, 'sym_budget needs the box remainder'
+        keep = r.amax(dim=0)[wide].argsort(descending=True)[:sym_budget]
+        keep_idx = wide[keep.sort().values]
+        spill = torch.ones(n, dtype=torch.bool, device=dev)
+        spill[keep_idx] = False
+        rad0 = rad0 + r * spill                 # boxed input noise
+        wide = keep_idx
     G = torch.zeros(B, n, wide.numel(), device=dev, dtype=dt)
     G[:, wide, torch.arange(wide.numel(), device=dev)] = r[:, wide]
     sym = [('input', int(i)) for i in wide.tolist()]
-    rad0 = torch.zeros(B, n, device=dev, dtype=dt) if box_remainder else None
     state = {net.input_name: ZonoState(c, G, sym, rad0)}
     # free edges as their last consumer runs (same discipline as point():
     # holding every edge's (B, n, g) matrix alive put vit's zono at ~5 GiB
@@ -474,9 +488,15 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
             c2 = lam * z.c + mu
             G2 = lam.unsqueeze(2) * z.G
             rad2 = lam.abs() * z.rad if z.rad is not None else None
-            if rad2 is not None and op.fn != 'relu':
-                # unlabeled band delta -> remainder (relu fresh columns are
-                # the BaB's split/score/beta handles and stay dense)
+            if rad2 is not None and (op.fn != 'relu'
+                                     or box_remainder == 'all'):
+                # unlabeled band delta -> remainder. relu fresh columns
+                # stay dense at box_remainder=True (they are the relu
+                # BaB's split/score/beta handles) but spill too under
+                # 'all': the input-split regime (ab's vggnet16
+                # dynamic-forward, max_dim ~100) carries INPUT symbols
+                # only -- vgg's 25 relu layers would otherwise add
+                # millions of columns and the pass OOMs at any budget
                 rad2 = rad2 + delta
                 state[name] = ZonoState(c2, G2, list(z.sym), rad2)
                 continue
