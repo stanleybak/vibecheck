@@ -551,6 +551,20 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
                             as_tuple=False).flatten()
         if not idx.numel():
             continue
+        if net.ops[e].n > 65536 and clamps is None and range_clamps is None:
+            # huge conv edge: the dense identity block (idx x n_prev) is
+            # unrunnable (vgg16-7: 3.2M queries x 150k); the patch walk
+            # refines ALL elements at window cost (M5). Falls through to
+            # dense on the first unpatchable op.
+            try:
+                from .patches import patch_refine
+                lb_p, ub_p = patch_refine(net, e, lo, hi, inter)
+                l0 = torch.maximum(l0, lb_p)
+                h0 = torch.minimum(h0, torch.maximum(ub_p, l0))
+                inter[name] = (l0, h0)
+                continue
+            except NotImplementedError:
+                pass                          # dense path below
         # identity blocks per chunk (never a full n x n eye); both signs in
         # one walk so lo and hi share it. A deep walk holds several live
         # adjoints plus conv temporaries, hence the generous per-row factor;
