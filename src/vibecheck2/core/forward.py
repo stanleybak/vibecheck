@@ -835,7 +835,8 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
 
 def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
                budget=None, patience=40, clamp_bounds=None, disj_idx=None,
-               return_alphas=False, known=None, init_alphas=None):
+               return_alphas=False, known=None, init_alphas=None,
+               abort_on_gain=False):
     """Adam-optimized band slopes over the forward zonotope (v1's nl_alpha,
     verify_graph.py _nonlinear_alpha_opt).
 
@@ -936,6 +937,17 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         if budget is not None and budget.over():
             break
         lb = margins(alphas)
+        if abort_on_gain and known is not None \
+                and bool((lb.detach()
+                          > known.to(lb.dtype) + 1e-12).any()):
+            # PROBE role: the caller only needs to know whether this
+            # frame LEADS the known bound; the real optimization then
+            # reruns at full precision with a cold init (measured on
+            # ml4acopf p3: warm-starting f64 from the f32 stage's
+            # noise-floored optimum closed 1/276 fewer disjuncts than
+            # the cold f64 run, and the f32 stage burned ~90s first)
+            best = torch.maximum(best, lb.detach())
+            return (best, None) if return_alphas else best
         best = torch.maximum(best, lb.detach())
         if gidx is not None:
             done = all(bool((best[0][g] > thr[g]).any()) for g in gidx)

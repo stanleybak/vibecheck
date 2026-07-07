@@ -546,7 +546,6 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # at output scale) does the f64 stage run, warm-started
             # from the f32 alphas. A row whose f32 optimum sits clearly
             # negative (vit: -0.04) can never be resolved by precision.
-            worst_pre = float((lb0 + b).min())
             sub = Budget(min(0.35 * budget.remaining(), 150.0),
                          margin=0.0)
             fz = memory.attempt(
@@ -554,12 +553,12 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                            thresholds=-b,
                                            budget=sub, disj_idx=di,
                                            return_alphas=True,
-                                           known=lb0.reshape(1, -1)),
+                                           known=lb0.reshape(1, -1),
+                                           abort_on_gain=True),
                 tag='fzono-alpha')
             lb_f, fz_alphas = (None, None) if fz is None \
                 else (fz[0][0].double(), fz[1])
             if lb_f is not None:
-                worst32 = float((lb_f + b.double()).min())
                 gain32 = bool((lb_f > lb0.double() + 1e-12).any())
                 # escalate to f64 iff the zono frame LEADS (gain32; on
                 # crown-led nets precision cannot help a bound fzono
@@ -570,9 +569,14 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                 # absolute 1e-2 band missed this by 1.45x and REGRESSED
                 # the sentinel) or it claims a razor-thin closure that
                 # needs the f64 confirmation the always-f64 phase gave.
-                near_done = (worst32 < 0
-                             and abs(worst32) < 0.1 * abs(worst_pre))
-                if gain32 and (near_done or 0 <= worst32 < 1e-2):
+                if gain32:
+                    # the zono frame LEADS: the f32 stage was only the
+                    # probe (it aborts on first gain); the real
+                    # optimization is the COLD f64 run with the full
+                    # slice -- the regime that closes ml4acopf p3
+                    # 276/276 at ~95s (warm f32->f64 measured 1/276
+                    # short, and a near_done gate on the f32 optimum
+                    # regressed the sentinel twice)
                     sub = Budget(min(0.7 * budget.remaining(), 300.0),
                                  margin=0.0)
                     fz = memory.attempt(
@@ -580,8 +584,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                             net, lo.double(), hi.double(), W.double(),
                             iters=1000, thresholds=(-b).double(),
                             budget=sub, disj_idx=di, return_alphas=True,
-                            known=lb0.double().reshape(1, -1),
-                            init_alphas=fz_alphas),
+                            known=lb0.double().reshape(1, -1)),
                         tag='fzono-alpha64')
                     if fz is not None:
                         lb_f, fz_alphas = fz[0][0], fz[1]
