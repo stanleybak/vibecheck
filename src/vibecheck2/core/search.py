@@ -45,7 +45,7 @@ def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
     Returns lbq elementwise-maxed with the tightened bounds."""
     B, q, g = WG.shape
     out = lbq.clone()
-    for bi, (_, _, splits, _fl, _bd) in enumerate(batch_doms):
+    for bi, (_, _, splits, _fl, _bd, _ad) in enumerate(batch_doms):
         if not splits:
             continue
         zc_rows, zg_rows, zr_rows, off = [], [], [], []
@@ -948,10 +948,13 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     # 4493: without it the frontier worst DRIFTED -0.034 -> -0.074 as
     # looser deep-domain beta optima re-opened queries the parent had
     # already refuted)
-    # 5th slot: the parent's optimized split betas {(edge, j): float},
-    # warm-starting each child's alpha/beta pass (ab-crown transfers
-    # this state; from-zero re-optimization loses deep trees)
-    heap = [(-float('inf'), 0, (), None, {})]
+    # 5th slot: the parent's optimized split betas {(edge, j): float};
+    # 6th: the parent's optimized alpha state {edge: (qd, n) fp16 numpy}
+    # -- ab-crown transfers both (set_bounds); measured on vit 2157,
+    # per-domain bound quality tracks optimization effort (cold 12-iter
+    # -0.0138 vs 30-iter -0.0094 at equal domains) and the transfer
+    # buys converged-quality starts at low iteration counts
+    heap = [(-float('inf'), 0, (), None, {}, None)]
     tick = 1
     n_bounded = rounds = 0
     tol_witness = None
@@ -985,7 +988,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             bhi = hi1.expand(B, -1)
             clamps = {}
             range_clamps = {}
-            for bi, (_, _, splits, _fl, _bd) in enumerate(batch_doms):
+            for bi, (_, _, splits, _fl, _bd, _ad) in enumerate(batch_doms):
                 for nm, j, spec_ in splits:
                     if isinstance(spec_, tuple):          # smooth range split
                         if nm not in range_clamps:
@@ -1039,6 +1042,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                      range_clamps=range_clamps)
             adj = {}
             beta_out = {}
+            alpha_out = {}
             zono_scores = {}
             zono_range_scores = {}
             if bound == 'zono':
@@ -1121,11 +1125,30 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                             ib_beta[nm] = torch.zeros(
                                 B, 1, net.ops[nm].n, device=dev)
                         ib_beta[nm][bi, 0, j] = bv
-                lb_ab, beta_out = backward.alpha_beta_crown(
+                # per-domain alpha transfer: batch rows with stored state
+                # start there, the rest from the root alphas
+                ib_alpha = None
+                if any(dom[5] is not None for dom in batch_doms):
+                    ib_alpha = {}
+                    for bi, dom in enumerate(batch_doms):
+                        for nm, a16 in (dom[5] or {}).items():
+                            if nm not in ib_alpha:
+                                base = (root_alphas[nm].mean(
+                                    dim=1, keepdim=True)
+                                    if root_alphas and nm in root_alphas
+                                    else torch.full(
+                                        (1, 1, net.ops[nm].n), 0.5))
+                                ib_alpha[nm] = base.to(dev).float() \
+                                    .expand(B, -1, -1).contiguous()
+                            ib_alpha[nm][bi] = torch.as_tensor(
+                                a16, device=dev, dtype=torch.float32)
+                lb_ab, beta_out, alpha_out = backward.alpha_beta_crown(
                     net, blo, bhi, W, inter, clamps, iters=beta_iters,
                     thresholds=-bias, range_clamps=range_clamps,
-                    init_alpha=root_alphas, init_beta=ib_beta or None,
-                    return_beta=True)
+                    init_alpha=(ib_alpha if ib_alpha is not None
+                                else root_alphas),
+                    init_beta=ib_beta or None,
+                    return_beta=True, return_alpha=True)
                 lbq = torch.maximum(lbq, lb_ab)
         except (torch.cuda.OutOfMemoryError,
                 torch.AcceleratorError):
@@ -1275,11 +1298,18 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                             and beta_out[nm2].numel():
                         bd_ch[(nm2, j2)] = float(
                             beta_out[nm2][bi, :, j2].max())
+                ad_ch = ({nm2: a[bi].detach().to(torch.float16)
+                          .cpu().numpy()
+                          for nm2, a in alpha_out.items()
+                          if a.dim() == 3}    # relu alphas only: the
+                         # (B, qd, 2, n) S-shaped entries would need
+                         # their own base shape in the batch rebuild
+                         if alpha_out else None)
                 for ch in children:
                     heapq.heappush(heap, (float(w_dom[bi]), tick,
                                           base + ((best_edge[bi],
                                                    int(best_j[bi]), ch),),
-                                          fl_ch, bd_ch))
+                                          fl_ch, bd_ch, ad_ch))
                     tick += 1
             if onnx_path is not None and rounds % attack_every == 1:
                 # BaB-GUIDED seeds (v1 _pgd_refine): each open (domain,

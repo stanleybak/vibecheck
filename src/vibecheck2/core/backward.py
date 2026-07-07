@@ -608,7 +608,7 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
 def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                      thresholds=None, budget=None, share_q=None,
                      range_clamps=None, init_alpha=None, init_beta=None,
-                     return_beta=False):
+                     return_beta=False, return_alpha=False):
     """Jointly Adam-optimized alpha (relaxation slopes) + beta (split
     multipliers) lower bounds for a batch of BaB domains under sign clamps.
     Every iterate is a sound bound (beta projected to >= 0); returns the
@@ -637,14 +637,16 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
             if cl is not None:
                 l, h = clamped_bounds((l, h), cl)
             if init_alpha is not None and name in init_alpha:
-                # warm start from the ROOT's optimized alphas (ab-crown
-                # keeps per-domain alpha state; a 12-iter Adam run from
-                # chord init lands measurably short of the root's
-                # 60-iter optimum, making every domain bound looser
-                # than the root it descends from)
+                # warm start: either the ROOT's optimized alphas
+                # ((1, q, n): reduce/expand) or PER-DOMAIN transferred
+                # state ((B, qd, n): use as-is -- ab-crown's set_bounds
+                # regime; measured on vit 2157, per-domain bound quality
+                # tracks optimization effort and cold 12-iter runs stall
+                # the tree at -0.014 where 30 iters reach -0.009)
                 a0 = init_alpha[name].detach().to(l.device, l.dtype)
-                a0 = (a0.mean(dim=1, keepdim=True) if qd == 1
-                      else a0[:, :qd]).expand(B, qd, l.shape[1])
+                if a0.shape[0] != B or a0.shape[1] != qd:
+                    a0 = (a0.mean(dim=1, keepdim=True) if qd == 1
+                          else a0[:, :qd]).expand(B, qd, l.shape[1])
                 alpha[name] = a0.contiguous().requires_grad_(True)
             else:
                 al0 = REL['relu'].planes(l, h)[0]
@@ -676,7 +678,9 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
     if not params:
         lb0_ = crown(net, lo, hi, W, inter, clamps=clamps,
                      range_clamps=range_clamps)
-        return (lb0_, {}) if return_beta else lb0_
+        extras = ([{}] if return_beta else []) \
+            + ([{}] if return_alpha else [])
+        return (lb0_, *extras) if extras else lb0_
     opt = torch.optim.Adam(params, lr=lr)
     thr = (torch.zeros(q, device=dev, dtype=dt) if thresholds is None
            else thresholds.to(dev, dt))
@@ -699,9 +703,14 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
     lb = crown(net, lo, hi, W, inter, alpha=alpha, clamps=clamps, beta=beta,
                range_clamps=range_clamps)
     best = torch.maximum(best, lb.detach())
+    extras = []
     if return_beta:
-        return best, {k: v.detach().clamp_min(0.0) for k, v in beta.items()}
-    return best
+        extras.append({k: v.detach().clamp_min(0.0)
+                       for k, v in beta.items()})
+    if return_alpha:
+        extras.append({k: v.detach().clamp(0.0, 1.0)
+                       for k, v in alpha.items()})
+    return (best, *extras) if extras else best
 
 
 def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
