@@ -908,6 +908,18 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                 log(f'[vc2/dual] kernel failed for row {r}: '
                     f'{str(e)[:70]}; skipping')
                 continue
+            _nodes = max(1, int(info.get('nodes', 1)))
+            _diverged = (verdict != 'unsat'
+                         and int(info.get('open', 0)) > 0.4 * _nodes)
+            if _diverged:
+                # pure frontier doubling (open ~ nodes/2, zero pruning):
+                # the state is structurally too loose for this disjunct
+                # and the gamma retry + sibling rows share it -- measured
+                # on TinyYOLO prop_000024, the dual burned 217s of 300s
+                # this way while ab closes the row in 38s of BaB
+                log(f'[vc2/dual] disj {d} row {r}: DIVERGED '
+                    f'(open={info.get("open")}/{_nodes}); ceding to BaB')
+                break
             if (verdict != 'unsat'
                     and info.get('reason') != 'splits_exhausted'
                     and deadline - time.time() > 5.0):

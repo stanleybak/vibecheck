@@ -496,13 +496,15 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             log(f'[vc2] joint-inter alpha: worst={float((lb + b).min()):.4f} '
                 f'open={len(open_d)}/{len(spec.disjuncts)}')
             worst = float((lb + b).min())
-        if verdict != 'unsat' and -1.0 < worst <= 0 and budget.remaining() > 20:
+        if verdict != 'unsat' and -5.0 < worst <= 0 and budget.remaining() > 20:
             # near-zero gap: a longer, lower-lr polish often closes it
             # outright (abcrown runs ~100 root iters; the quick pass is
-            # 20). Iterations scale with the net: 150 crown passes on a
+            # 20). Gate widened -1 -> -5: TinyYOLO prop_000024 sat at
+            # -4.43 with the 20-iter alpha barely moving (-4.448 ->
+            # -4.433) while ab's ~100-iter root closes the row in 38s.
+            # Iterations still scale with the net (150 crown passes on a
             # 460k-neuron conv net is ~2.5 minutes -- it silently ate the
-            # whole budget on challenging_certified and the dual + BaB
-            # got literally zero seconds.
+            # whole budget on challenging_certified once).
             p_iters = 150 if n_nonlin <= 50_000 else 30
             lb2, root_alphas = backward.alpha_crown(net, lo, hi, W, inter,
                                                     iters=p_iters,
