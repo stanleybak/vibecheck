@@ -451,6 +451,11 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # marginal leaves AND steers splits off-tree via the adopted
         # linearizations). Stage 1 costs nothing when it wins.
         for ai, frac in ((8, 0.7), (20, 0.9)):
+            if budget.remaining() < 5:
+                # a 20s-budget instance (nn4sys mscn) measured 6.4s of
+                # OVERRUN from stage 2 + the dual + the final BaB all
+                # launching after the deadline had already passed
+                break
             slice_end = time.time() + max(20.0, frac * budget.remaining())
             verdict, binfo = input_split_bab(
                 net, spec, W, b, di, lo[0], hi[0],
@@ -541,6 +546,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # at output scale) does the f64 stage run, warm-started
             # from the f32 alphas. A row whose f32 optimum sits clearly
             # negative (vit: -0.04) can never be resolved by precision.
+            worst_pre = float((lb0 + b).min())
             sub = Budget(min(0.35 * budget.remaining(), 150.0),
                          margin=0.0)
             fz = memory.attempt(
@@ -555,15 +561,18 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             if lb_f is not None:
                 worst32 = float((lb_f + b.double()).min())
                 gain32 = bool((lb_f > lb0.double() + 1e-12).any())
-                if gain32 and abs(worst32) < 1e-2:
-                    # within f32 noise of the closing boundary (either
-                    # side: a barely-positive f32 claim needs the f64
-                    # confirmation the always-f64 phase used to give)
-                    # AND the zono frame actually leads somewhere --
-                    # precision cannot help a bound fzono didn't produce
-                    # (vit 1151: the seeded -0.0085 is crown's, and the
-                    # f64 stage burned 38s failing to sharpen it):
-                    # escalate
+                # escalate to f64 iff the zono frame LEADS (gain32; on
+                # crown-led nets precision cannot help a bound fzono
+                # didn't produce -- vit 1151 measured 38s of waste) AND
+                # either f32 closed MOST of the gap but stalled short
+                # (relative: p3 went -36.36 -> -0.0145, then the f32
+                # noise floor blocks the last 26 disjuncts -- an
+                # absolute 1e-2 band missed this by 1.45x and REGRESSED
+                # the sentinel) or it claims a razor-thin closure that
+                # needs the f64 confirmation the always-f64 phase gave.
+                near_done = (worst32 < 0
+                             and abs(worst32) < 0.1 * abs(worst_pre))
+                if gain32 and (near_done or 0 <= worst32 < 1e-2):
                     sub = Budget(min(0.7 * budget.remaining(), 300.0),
                                  margin=0.0)
                     fz = memory.attempt(
@@ -642,7 +651,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     f'open={len(open_d)}/{len(spec.disjuncts)}')
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
-    if verdict != 'unsat':
+    if verdict != 'unsat' and budget.remaining() > 5:
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
         # refuter. (A temporary skip on the vit route was REVERTED: with
@@ -709,7 +718,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                             len(spec.disjuncts))
         log(f'[vc2] stabilize: worst={float((lb0 + b).min()):.4f} '
             f'open={len(open_d)}/{len(spec.disjuncts)}')
-    if verdict != 'unsat':
+    if verdict != 'unsat' and budget.remaining() > 3:
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
         # target; the two loops share bound/attack machinery meanwhile).

@@ -271,7 +271,17 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     n_bounded = n_split = rounds = 0
     tol_witness = None
     _round_wall, _round_B = 1.0, 1
-    z_rad_mode = False   # flips permanently after the first dense-zono OOM
+    # box-remainder mode: flips permanently after the first dense-zono
+    # OOM, and starts ON when the dense estimate cannot fit at even a
+    # modest batch (mscn_2048d: the dense attempt + OOM burned 7.8s of a
+    # 20s budget before the switch; the estimate only ever SKIPS a doomed
+    # attempt, rad-mode bounds stay sound)
+    z_rad_mode = (roots is not None
+                  and backward._zono_cost_bytes(net, 16)
+                  > memory.free_bytes(dev) * memory.SAFETY)
+    if z_rad_mode:
+        log('[vc2/bab] dense zono projected over budget at B=16; '
+            'starting in box-remainder mode')
     t0 = time.time()
     n_nonlin = sum(net.ops[nm].n for nm in net.order
                    if net.ops[nm].kind == 'nonlin')
