@@ -827,3 +827,45 @@ in 180s with ZERO closures -- the malbeware signature (per-split gain
 Gurobi conv->MILP route at 536 of 550s. MILP-class; vc2 core stays
 Gurobi-free, handlers/ escalation remains the open decision for the
 class {malbeware Wintrim, challenging idx3310}.
+
+### M5 design: patch-structured intermediate CROWN (vgg/yolo/traffic class)
+
+Target rows (all ab-only; v1 officially ERRORS on vgg16-7 spec15/16/17):
+vgg16-7 spec15 (ab unsat 1082s/1200) and spec16 (ab 1243s); TinyYOLO
+prop_000024; traffic_signs idx_10645. Measured scoping (2026-07-07, CPU
+under memory caps): vc2 loads vgg16-7 fine (9.8s; 96 ops, in=150528,
+25 relus); spec15 parses in 0.4s (142,883 wide dims, one disjunct);
+interval explodes (1.4e16); the budget forward
+(zono sym_budget=K, box_remainder='all') runs at K=96 in 29.5s/9.8GB
+CPU but is interval-grade through 25 mass-unstable relu layers. So the
+closing bound is backward CROWN whose INTERMEDIATE bounds are computed
+per edge with patch-structured adjoints (ab: auto_LiRPA patches +
+dynamic-forward max_dim 100 + input-split sb BaB, batch 1).
+
+Build plan, in order:
+1. PatchAdjoint: a second adjoint representation for the backward pass,
+   (B, q, C, kh, kw) window values + spatial (offset, stride)
+   bookkeeping, valid while the chain is conv/elementwise. An identity
+   query at a conv pre-activation starts as a 1x1 patch; Conv2d.lin_t
+   composes kernel windows (receptive-field growth); Scale/ScaleShift
+   and relu planes multiply per-position values gathered at the
+   window's positions; bias terms accumulate as scalars per query.
+   Falls back to dense (materialize) at the first op that cannot stay
+   patched (Dense/Select/concat) -- by then n is small on this class.
+   LinMap gains lin_t_patch alongside lin_t; the crown loop dispatches
+   on the adjoint's type. One representation, one dispatch point.
+2. backward.intermediates_crown consumes PatchAdjoint for conv-edge
+   identity queries: memory O(q x receptive_field) instead of
+   O(q x n_layer) (dense identity at 224x224x64 = 3.2M queries never
+   fits). Chunked as today; the cascade (earlier edges feed later
+   relaxations) is unchanged.
+3. The dual's sparse state is the same object: the per-unstable-row
+   (row_indices, row_values) it needs ARE the patch windows -- build
+   them from PatchAdjoint instead of skipping at the dense-GB estimate
+   (m5 memory note: TinyYOLO 3.1GB/24k rows, traffic 59.5GB/116k rows).
+4. Route: huge-input conv nets -> input_split_bab over the
+   sym_budget forward dims (ab's sb branching analog: score = input
+   adjoint x radius, already input_split's currency), bound = crown
+   with the patch intermediates.
+Soundness gates as usual: every patch op unit-tested against the dense
+adjoint on small random convs (bit-parity), plus MC sampling brackets.
