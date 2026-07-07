@@ -89,3 +89,36 @@ def test_patch_planes_parity():
     assert torch.allclose(got, A, atol=1e-5), float((got - A).abs().max())
     assert torch.allclose(d, d_ref, atol=1e-5), \
         float((d - d_ref).abs().max())
+
+
+def test_patch_refine_parity_conv_relu_conv():
+    """patch_refine == the dense identity-crown refinement on a
+    conv->relu->conv net (both bounds, all elements)."""
+    import torch
+    from vibecheck2.core.graph import Net, Op
+    from vibecheck2.core import backward
+    from vibecheck2.core.patches import patch_refine
+
+    lm1, s1 = _conv(2, 4, 3, 1, 1, (2, 7, 7))
+    lm2, s2 = _conv(4, 3, 3, 2, 1, s1)
+    n_in = 2 * 7 * 7
+    ops = {
+        'x': Op('x', 'input', (), (n_in,), n_in),
+        'c1': Op('c1', 'linmap', ('x',), s1, int(np.prod(s1)), lm=lm1),
+        'r1': Op('r1', 'nonlin', ('c1',), s1, int(np.prod(s1)), fn='relu'),
+        'c2': Op('c2', 'linmap', ('r1',), s2, int(np.prod(s2)), lm=lm2),
+    }
+    net = Net(ops, ['c1', 'r1', 'c2'], 'x', 'c2')
+    lo = -torch.rand(1, n_in)
+    hi = torch.rand(1, n_in)
+    inter = backward.intermediates(net, lo, hi)
+    lb_p, ub_p = patch_refine(net, 'c2', lo, hi, inter)
+    # dense reference: +/- identity rows through backward.crown
+    n2 = int(np.prod(s2))
+    Wc = torch.cat([torch.eye(n2), -torch.eye(n2)])
+    out = backward.crown(net, lo, hi, Wc.unsqueeze(0), inter, start='c2')
+    lb_d, ub_d = out[:, :n2], -out[:, n2:]
+    assert torch.allclose(lb_p, lb_d, atol=1e-4), \
+        float((lb_p - lb_d).abs().max())
+    assert torch.allclose(ub_p, ub_d, atol=1e-4), \
+        float((ub_p - ub_d).abs().max())

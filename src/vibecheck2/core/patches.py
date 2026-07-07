@@ -164,3 +164,114 @@ class PatchAdjoint:
                           self.edge_shape)
         pa.chan_lo = getattr(self, 'chan_lo', 0)
         return pa, d
+
+
+def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
+    """Bounds for EVERY element of conv edge `edge` via patch-structured
+    backward CROWN: identity queries per (channel, y, x), chunked by
+    channel, walked back to the network input while every op stays
+    patchable (Conv2d / Scale / ScaleShift linmaps, relu planes, add of
+    two aligned patch paths). Raises NotImplementedError at the first op
+    it cannot keep patched -- the caller falls back to the dense path.
+
+    Returns (lb, ub) each (B, n_edge). Memory is O(chunk x window),
+    never O(chunk x n_layer): the dense identity refinement on
+    vgg16-7's 3.2M-neuron edges is unrunnable at any chunk size.
+    """
+    from .linmap import Conv2d, Scale, ScaleShift
+    from .relax import REL
+    op_of = dict(net.ops)      # net.order excludes the input op
+    B = lo.shape[0]
+    dev = lo.device
+    eop = op_of[edge]
+    if eop.kind != 'linmap' or not isinstance(eop.lm, Conv2d):
+        # the grid query needs a (C, H, W) edge; conv outputs carry it
+        raise NotImplementedError(f'patch_refine: {edge} is not a conv edge')
+    C, H, W = eop.lm.out_shape
+    c_in = (hi + lo) / 2
+    r_in = (hi - lo) / 2
+
+    def walk(pa, d, nm):
+        """Backward from edge `nm`'s OUTPUT patch to the input; returns
+        concretized (lb, ub is via caller sign trick) contributions."""
+        while True:
+            op = op_of[nm]
+            if op.kind == 'input':
+                cw = pa.gather_edge(c_in)
+                rw = pa.gather_edge(r_in)
+                lb = d + (pa.v * cw).sum(dim=(2, 3, 4)) \
+                    - (pa.v.abs() * rw).sum(dim=(2, 3, 4))
+                return lb
+            if op.kind == 'linmap':
+                lm = op.lm
+                if isinstance(lm, Conv2d):
+                    if lm.b is not None:
+                        bv = torch.as_tensor(
+                            lm.bias_vec(pa.v), device=dev,
+                            dtype=pa.v.dtype).unsqueeze(0).expand(B, -1)
+                        d = d + (pa.v * pa.gather_edge(bv)).sum(
+                            dim=(2, 3, 4))
+                    pa = pa.through_conv(lm.kernel, lm.stride, lm.padding,
+                                         lm.in_shape)
+                    nm = op.inputs[0]
+                    continue
+                if isinstance(lm, Scale):
+                    pa = PatchAdjoint(pa.v * lm.a, pa.grid, pa.base,
+                                      pa.step, pa.edge_shape)
+                    pa.chan_lo = getattr(pa, 'chan_lo', 0)
+                    nm = op.inputs[0]
+                    continue
+                if isinstance(lm, ScaleShift):
+                    n_e = op_of[op.inputs[0]].n
+                    if lm.b is not None:
+                        sht = torch.as_tensor(
+                            lm.b, device=dev,
+                            dtype=pa.v.dtype).reshape(1, -1).expand(B, n_e)
+                        d = d + (pa.v * pa.gather_edge(sht)).sum(
+                            dim=(2, 3, 4))
+                    if lm.a is not None:
+                        sct = torch.as_tensor(
+                            lm.a, device=dev,
+                            dtype=pa.v.dtype).reshape(1, -1).expand(B, n_e)
+                        v2 = pa.v * pa.gather_edge(sct)
+                        cl = getattr(pa, 'chan_lo', 0)
+                        pa = PatchAdjoint(v2, pa.grid, pa.base, pa.step,
+                                          pa.edge_shape)
+                        pa.chan_lo = cl
+                    nm = op.inputs[0]
+                    continue
+                raise NotImplementedError(
+                    f'patch_refine: linmap {type(lm).__name__}')
+            if op.kind == 'nonlin' and op.fn == 'relu':
+                l0, h0 = inter[nm]
+                al, bl, au, bu = REL['relu'].planes(l0, h0)
+                pa, d = pa.through_planes(al, bl, au, bu, d)
+                nm = op.inputs[0]
+                continue
+            if op.kind == 'add':
+                cl = getattr(pa, 'chan_lo', 0)
+                pa_a = PatchAdjoint(pa.v, pa.grid, pa.base, pa.step,
+                                    pa.edge_shape)
+                pa_a.chan_lo = cl
+                pa_b = PatchAdjoint(pa.v.clone(), pa.grid, pa.base,
+                                    pa.step, pa.edge_shape)
+                pa_b.chan_lo = cl
+                lb_a = walk(pa_a, d, op.inputs[0])
+                lb_b = walk(pa_b, torch.zeros_like(d), op.inputs[1])
+                return lb_a + lb_b
+            raise NotImplementedError(
+                f'patch_refine: op {op.kind}/{getattr(op, "fn", "")}')
+
+    lbs = torch.empty(B, C, H * W, device=dev, dtype=lo.dtype)
+    ubs = torch.empty(B, C, H * W, device=dev, dtype=lo.dtype)
+    for c0 in range(0, C, chan_chunk):
+        for ch in range(c0, min(c0 + chan_chunk, C)):
+            pa = PatchAdjoint.identity((C, H, W), ch, B=B, device=dev,
+                                       dtype=lo.dtype)
+            d0 = torch.zeros(B, H * W, device=dev, dtype=lo.dtype)
+            lbs[:, ch] = walk(pa, d0, edge)
+            pa2 = PatchAdjoint.identity((C, H, W), ch, B=B, device=dev,
+                                        dtype=lo.dtype)
+            pa2.v = -pa2.v
+            ubs[:, ch] = -walk(pa2, torch.zeros_like(d0), edge)
+    return lbs.reshape(B, -1), ubs.reshape(B, -1)
