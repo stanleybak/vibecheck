@@ -117,3 +117,50 @@ class PatchAdjoint:
                 out[:, qi, cw0:cw0 + Cw, yy[qi], xx[qi]] = \
                     self.v[:, qi, :, u, v].permute(1, 0, 2)
         return out.reshape(B, Q, C * H * W)
+
+    def gather_edge(self, t):
+        """Window-aligned values of an edge tensor t (B, C*H*W) ->
+        (B, Q, Cw, ph, pw): element (q, c, u, v) reads t at this window
+        element's edge position (out-of-range -> 0). The regular anchor
+        grid makes this one padded unfold."""
+        B, Q, Cw, ph, pw = self.v.shape
+        C, H, W = self.edge_shape
+        gh, gw = self.grid
+        sy, sx = self.step
+        by, bx = self.base
+        t4 = t.reshape(B, C, H, W)
+        # pad so every anchor lands in-range: left/top by -base (if
+        # negative), right/bottom to cover the last window
+        pl, pt = max(0, -bx), max(0, -by)
+        pr = max(0, bx + (gw - 1) * sx + pw - W)
+        pb = max(0, by + (gh - 1) * sy + ph - H)
+        t4 = F.pad(t4, (pl, pr, pt, pb))
+        u = F.unfold(t4, (ph, pw), stride=(sy, sx))    # (B, C*ph*pw, L)
+        u = u.reshape(B, C, ph, pw, -1)
+        gh_a = (t4.shape[2] - ph) // sy + 1
+        gw_a = (t4.shape[3] - pw) // sx + 1
+        u = u.reshape(B, C, ph, pw, gh_a, gw_a)
+        # anchor (0,0) of the query grid sits at padded coord
+        # (by+pt, bx+pl), stride-aligned by construction
+        oy, ox = (by + pt) // sy, (bx + pl) // sx
+        u = u[:, :, :, :, oy:oy + gh, ox:ox + gw]
+        u = u.permute(0, 4, 5, 1, 2, 3).reshape(B, Q, C, ph, pw)
+        cw0 = getattr(self, 'chan_lo', 0)
+        return u[:, :, cw0:cw0 + Cw]
+
+    def through_planes(self, lam_lo, b_lo, lam_hi, b_hi, d):
+        """Compose with a nonlin's two-sided linear planes (lower-bound
+        adjoint): positive window coefficients take the lower plane,
+        negative the upper; intercepts accumulate into d (B, Q).
+        Returns (new PatchAdjoint, d)."""
+        ll = self.gather_edge(lam_lo)
+        lh = self.gather_edge(lam_hi)
+        bl = self.gather_edge(b_lo)
+        bh = self.gather_edge(b_hi)
+        pos = self.v > 0
+        v2 = self.v * torch.where(pos, ll, lh)
+        d = d + (self.v * torch.where(pos, bl, bh)).sum(dim=(2, 3, 4))
+        pa = PatchAdjoint(v2, self.grid, self.base, self.step,
+                          self.edge_shape)
+        pa.chan_lo = getattr(self, 'chan_lo', 0)
+        return pa, d

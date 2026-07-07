@@ -61,3 +61,31 @@ def test_patch_memory_is_window_sized():
     pa = pa.through_conv(lm1.kernel, lm1.stride, lm1.padding, (3, 32, 32))
     # 1024 queries x 3 ch x 3x3 window vs dense 1024 x 3072
     assert pa.v.numel() == 1024 * 3 * 3 * 3
+
+
+def test_patch_planes_parity():
+    """conv -> planes -> conv: patch lower-bound adjoint + intercepts
+    match the dense computation elementwise."""
+    lm1, s1 = _conv(2, 4, 3, 1, 1, (2, 7, 7))
+    lm2, s2 = _conv(4, 3, 3, 1, 1, s1)
+    n1 = int(np.prod(s1))
+    ll = torch.rand(1, n1) * 0.9
+    lh = torch.rand(1, n1) * 0.9 + 0.1
+    bl = torch.randn(1, n1) * 0.1
+    bh = torch.randn(1, n1) * 0.1 + 0.3
+    ch = 1
+    pa = PatchAdjoint.identity(s2, ch)
+    d = torch.zeros(1, pa.v.shape[1])
+    pa = pa.through_conv(lm2.kernel, lm2.stride, lm2.padding, s1)
+    pa, d = pa.through_planes(ll, bl, lh, bh, d)
+    pa = pa.through_conv(lm1.kernel, lm1.stride, lm1.padding, (2, 7, 7))
+    got = pa.to_dense()
+    # dense reference
+    A = _dense_adjoint([lm2], s2, ch)[0]         # (Q, n1)
+    pos = A > 0
+    d_ref = (A * torch.where(pos, bl, bh)).sum(dim=1, keepdim=True).T
+    A = A * torch.where(pos, ll, lh)
+    A = lm1.lin_t(A).unsqueeze(0)
+    assert torch.allclose(got, A, atol=1e-5), float((got - A).abs().max())
+    assert torch.allclose(d, d_ref, atol=1e-5), \
+        float((d - d_ref).abs().max())
