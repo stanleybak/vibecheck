@@ -183,11 +183,10 @@ def _verify_groups(net, spec, groups, onnx_path, timeout, device,
             # peak frontier. Done INSIDE the BaB so the weight-dedup + setup is
             # paid ONCE, not per wave (the caller-loop repeated it and was 3x
             # slower). mg=200 matches v1; small root sets never explode anyway.
-            # mg=200 matched v1's dense-bound regime; with the
-            # box-remainder zono the per-batch bound is ~10x cheaper and
-            # 200 STARVED admission (mscn_2048d at the 20s wall: 600 of
-            # 1000 roots never admitted while the frontier sat at 4.6k)
-            mg = 500 if n_roots > 500 else None
+            # mg=200 (v1 parity). mg=500 MEASURED WORSE with the cheap
+            # rad-mode bound (mscn_2048d: frontier exploded 4.6k -> 18.5k
+            # while bounded stayed flat; the cap IS the tree discipline)
+            mg = 200 if n_roots > 500 else None
             verdict, binfo = input_split_bab(
                 net, spec, W, b, di, r_lo.min(dim=0).values,
                 r_hi.max(dim=0).values, deadline=t0 + timeout - 2.0,
