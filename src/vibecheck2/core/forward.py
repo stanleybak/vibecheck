@@ -307,18 +307,29 @@ class ZonoState:
     one column per relu-introduced symbol); a sample where the neuron was
     stable simply has a zero column. `sym` names the op/element each column
     came from so BaB splitting can address them.
+
+    rad (B, n) >= 0, optional: BOX REMAINDER -- aggregate magnitude of
+    unlabeled noise (bmm remainders, non-relu band deltas) kept as a
+    per-element radius instead of dense generator columns. Equivalent to
+    carrying each source as its own diagonal column EXCEPT that distinct
+    sources merge (their cross-element correlation is dropped), which is
+    sound: |sum_s a_s u_s| <= sum_s |a_s| for independent u_s in [-1, 1].
+    Measured on vit 2157: the dense form carries ~7.7k such columns of a
+    13.4k-generator state, and the per-domain BaB zono pass OOMs at B=8.
     """
 
-    def __init__(self, c, G, sym):
-        self.c, self.G, self.sym = c, G, sym
+    def __init__(self, c, G, sym, rad=None):
+        self.c, self.G, self.sym, self.rad = c, G, sym, rad
 
     def bounds(self):
         r = self.G.abs().sum(dim=2)
+        if self.rad is not None:
+            r = r + self.rad
         return self.c - r, self.c + r
 
 
 def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
-         slope_override=None):
+         slope_override=None, box_remainder=False):
     """DeepZ forward. Boxes (B, n_in) -> output bounds (+ per-edge states).
 
     record: optional dict; when given, each relu op stores its
@@ -331,7 +342,13 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     band-slope parameters for any op with a RelaxLib band_alpha (relu,
     sigmoid/tanh, sin/cos/pow, exp, reciprocal): lam = (1-a) f'(lo) +
     a f'(hi) with the offsets recomputed in closed form for that lam, so
-    ANY alpha in [0, 1] stays sound (v1's nl_alpha mechanism)."""
+    ANY alpha in [0, 1] stays sound (v1's nl_alpha mechanism).
+    box_remainder: when True, unlabeled fresh noise (bmm/mul remainders,
+    band deltas of every op EXCEPT relu and the softmax exp stage, whose
+    columns the BaB scores and splits) accumulates in ZonoState.rad
+    instead of dense generator columns. Sound (see ZonoState); trades the
+    dropped cross-element correlations for the memory/FLOPs of ~60% of
+    the generator columns (the per-domain BaB regime)."""
     lo, hi = _as2d(lo), _as2d(hi)
     B, n = lo.shape
     dev, dt = lo.device, lo.dtype
@@ -350,7 +367,8 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
     G = torch.zeros(B, n, wide.numel(), device=dev, dtype=dt)
     G[:, wide, torch.arange(wide.numel(), device=dev)] = r[:, wide]
     sym = [('input', int(i)) for i in wide.tolist()]
-    state = {net.input_name: ZonoState(c, G, sym)}
+    rad0 = torch.zeros(B, n, device=dev, dtype=dt) if box_remainder else None
+    state = {net.input_name: ZonoState(c, G, sym, rad0)}
     # free edges as their last consumer runs (same discipline as point():
     # holding every edge's (B, n, g) matrix alive put vit's zono at ~5 GiB
     # per leaf and made per-domain BaB bounding hopeless; v1's ~32 ms/domain
@@ -375,7 +393,9 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
         op = net.ops[name]
         if op.kind == 'linmap':
             z = state[op.inputs[0]]
-            state[name] = ZonoState(op.lm.point(z.c), lin_cols(op.lm, z.G), z.sym)
+            state[name] = ZonoState(
+                op.lm.point(z.c), lin_cols(op.lm, z.G), z.sym,
+                op.lm.lin_abs(z.rad) if z.rad is not None else None)
         elif op.kind == 'add':
             za, zb = state[op.inputs[0]], state[op.inputs[1]]
             ga, gb = za.G.shape[2], zb.G.shape[2]
@@ -390,7 +410,9 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 G = torch.cat([za.G[:, :, :k] + zb.G[:, :, :k],
                                za.G[:, :, k:], zb.G[:, :, k:]], dim=2)
                 sym = za.sym[:k] + za.sym[k:] + zb.sym[k:]
-            state[name] = ZonoState(za.c + zb.c, G, sym)
+            state[name] = ZonoState(za.c + zb.c, G, sym,
+                                    za.rad + zb.rad
+                                    if za.rad is not None else None)
         elif op.kind == 'nonlin':
             rel = REL[op.fn]
             if op.fn != 'softmax' and not hasattr(rel, 'band'):
@@ -415,6 +437,8 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                     record[name] = {'c_pre': z.c.detach(),
                                     'G_pre': z.G.detach(),
                                     'sym': list(z.sym)}
+                    if z.rad is not None:
+                        record[name]['rad'] = z.rad.detach()
                 state[name] = _softmax_zono(op, z, zl, zh, B, dev, dt)
                 continue
             # generic DeepZ affine band: y = lam*x + mu + delta*e_new
@@ -443,8 +467,19 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                                 'sym': list(z.sym), 'lam': lam.detach(),
                                 'mu': mu.detach(), 'lo': zl.detach(),
                                 'hi': zh.detach()}
+                if z.rad is not None:
+                    # the constraint row z = c + G.e (+ rad.u) is short its
+                    # rad noise; consumers (beta) must charge |beta|*rad
+                    record[name]['rad'] = z.rad.detach()
             c2 = lam * z.c + mu
             G2 = lam.unsqueeze(2) * z.G
+            rad2 = lam.abs() * z.rad if z.rad is not None else None
+            if rad2 is not None and op.fn != 'relu':
+                # unlabeled band delta -> remainder (relu fresh columns are
+                # the BaB's split/score/beta handles and stay dense)
+                rad2 = rad2 + delta
+                state[name] = ZonoState(c2, G2, list(z.sym), rad2)
+                continue
             # fresh symbol per element with a nonzero band ANYWHERE in batch
             new_idx = torch.nonzero((delta > 0).any(dim=0),
                                     as_tuple=False).flatten()
@@ -455,7 +490,7 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                     delta[:, new_idx]
                 G2 = torch.cat([G2, cols], dim=2)
             sym = z.sym + [(name, int(i)) for i in new_idx.tolist()]
-            state[name] = ZonoState(c2, G2, sym)
+            state[name] = ZonoState(c2, G2, sym, rad2)
         elif op.kind == 'concat':
             z_parts = [state[s] for s in op.inputs]
             base = _op_const(op, 'base', dev,
@@ -476,12 +511,16 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 gmap.append(cols)
             c2 = base.expand(B, -1).clone()
             G2 = torch.zeros(B, n_out, len(syms), device=dev, dtype=dt)
+            rad2 = (torch.zeros(B, n_out, device=dev, dtype=dt)
+                    if box_remainder else None)
             for zp, cols, pos in zip(z_parts, gmap,
                                      op.params['positions']):
                 p = torch.as_tensor(pos, device=dev)
                 c2[:, p] = zp.c
                 G2[:, p.unsqueeze(1), torch.as_tensor(cols, device=dev)] = zp.G
-            state[name] = ZonoState(c2, G2, syms)
+                if rad2 is not None:
+                    rad2[:, p] = zp.rad
+            state[name] = ZonoState(c2, G2, syms, rad2)
         elif op.kind == 'mul':
             # bilinear product: sound box collapse. The correlation-exact
             # first-order product (v1 _torch_zono_mul_bilinear) was built
@@ -500,9 +539,14 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 mhi = torch.maximum(mhi.clamp_max(op.params['out_hi']), mlo)
             c2 = (mhi + mlo) / 2
             delta = (mhi - mlo) / 2
-            G2 = torch.diag_embed(delta)
-            sym = [(name, i) for i in range(c2.shape[1])]
-            state[name] = ZonoState(c2, G2, sym)
+            if box_remainder:
+                state[name] = ZonoState(
+                    c2, torch.zeros(B, c2.shape[1], 0, device=dev, dtype=dt),
+                    [], delta)
+            else:
+                G2 = torch.diag_embed(delta)
+                sym = [(name, i) for i in range(c2.shape[1])]
+                state[name] = ZonoState(c2, G2, sym)
         elif op.kind == 'bmm':
             za, zb = state[op.inputs[0]], state[op.inputs[1]]
             state[name] = _bmm_zono(op, name, za, zb, B, dev, dt)
@@ -573,6 +617,17 @@ def _bmm_zono(op, name, za, zb, B, dev, dt):
     radA = Ga.abs().sum(dim=2).reshape(B, Gr, m, k)
     radB = Gb.abs().sum(dim=2).reshape(B, Gr, k, pp)
     box = (torch.matmul(radA, radB) - 0.5 * diag_abs).clamp_min(0.0)
+    rad_out = None
+    if za.rad is not None:
+        # box-remainder cross terms: every product involving a remainder
+        # factor is first-order in ITS noise but unlabeled, so the whole
+        # family lands in the output remainder (|a.u| <= |a|):
+        #   c*rb + ra*c  (center x remainder)
+        #   G*rb + ra*G  (generator x remainder)   ra*rb (quadratic)
+        ra = za.rad.reshape(B, Gr, m, k)
+        rb = zb.rad.reshape(B, Gr, k, pp)
+        rad_out = (torch.matmul(caM.abs() + radA + ra, rb)
+                   + torch.matmul(ra, cbM.abs() + radB))
     n_out = Gr * m * pp
     y_c = c_out.reshape(B, n_out)
     y_G = G_out.reshape(B, g, n_out).permute(0, 2, 1)
@@ -580,10 +635,16 @@ def _bmm_zono(op, name, za, zb, B, dev, dt):
     # hybrid vs the interval corner product (+ simplex hull when tagged):
     # the interval path is exact per element; collapse where affine+box
     # is wider (both sound)
-    ilo, ihi = _bmm_interval(op, (za.c, za.G.abs().sum(dim=2)),
-                             (zb.c, zb.G.abs().sum(dim=2)))
-    aff_lo = y_c - y_G.abs().sum(dim=2) - box
-    aff_hi = y_c + y_G.abs().sum(dim=2) + box
+    ra_tot = za.G.abs().sum(dim=2)
+    rb_tot = zb.G.abs().sum(dim=2)
+    if za.rad is not None:
+        ra_tot = ra_tot + za.rad
+        rb_tot = rb_tot + zb.rad
+    ilo, ihi = _bmm_interval(op, (za.c, ra_tot), (zb.c, rb_tot))
+    slack = box + (0 if rad_out is None
+                   else rad_out.reshape(B, n_out))
+    aff_lo = y_c - y_G.abs().sum(dim=2) - slack
+    aff_hi = y_c + y_G.abs().sum(dim=2) + slack
     # threshold 4x (measured: 1x -0.380, 4x -0.149, 100x identical to
     # 4x on vit 1151 -- collapse only guards genuine blow-ups)
     worse = ((aff_hi - aff_lo) > 4.0 * (ihi - ilo) + 1e-12).any(dim=0) \
@@ -591,6 +652,12 @@ def _bmm_zono(op, name, za, zb, B, dev, dt):
     y_c = torch.where(worse, (ihi + ilo) / 2, y_c)
     y_G = torch.where(worse.unsqueeze(2), torch.zeros_like(y_G), y_G)
     box = torch.where(worse, (ihi - ilo) / 2, box)
+    if rad_out is not None:
+        # remainder mode: the box term joins the remainder; a collapsed
+        # element is EXACTLY the interval half-width (replace, not add)
+        rad_out = torch.where(worse, (ihi - ilo) / 2,
+                              rad_out.reshape(B, n_out) + box)
+        return ZonoState(y_c, y_G, sym, rad_out)
     bidx = torch.nonzero((box > 0).any(dim=0), as_tuple=False).flatten()
     if bidx.numel():
         cols = torch.zeros(B, n_out, bidx.numel(), device=dev, dtype=dt)
@@ -634,6 +701,7 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
     lam, mu, delta = REL['exp'].band(el, eh)
     e_c = lam * (z.c - c_bc) + mu
     e_G = lam.unsqueeze(2) * z.G
+    e_rad = lam.abs() * z.rad if z.rad is not None else None
     new_idx = torch.nonzero((delta > 0).any(dim=0),
                             as_tuple=False).flatten()
     if new_idx.numel():
@@ -649,7 +717,11 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
     s_c = e_c.reshape(B, pre, k, post).sum(dim=2).reshape(B, n_rows)
     s_G = e_G.reshape(B, pre, k, post, g_e).sum(dim=2).reshape(B, n_rows,
                                                                g_e)
+    s_rad = (e_rad.reshape(B, pre, k, post).sum(dim=2).reshape(B, n_rows)
+             if e_rad is not None else None)
     rad_s = s_G.abs().sum(dim=2)
+    if s_rad is not None:
+        rad_s = rad_s + s_rad
     s_l = torch.maximum(s_c - rad_s,
                         e_lo.reshape(B, pre, k, post).sum(dim=2)
                         .reshape(B, n_rows))
@@ -660,19 +732,27 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
     lam_r, mu_r, d_r = REL['reciprocal'].band(s_l, s_h)
     r_c = lam_r * s_c + mu_r
     r_G = lam_r.unsqueeze(2) * s_G
-    ridx = torch.nonzero((d_r > 0).any(dim=0), as_tuple=False).flatten()
-    if ridx.numel():
-        cols = torch.zeros(B, n_rows, ridx.numel(), device=dev, dtype=dt)
-        cols[:, ridx, torch.arange(ridx.numel(), device=dev)] = d_r[:, ridx]
-        r_G = torch.cat([r_G, cols], dim=2)
-    sym = e_sym + [(op.name + '/r', int(i)) for i in ridx.tolist()]
+    r_rad = None
+    if s_rad is not None:
+        # remainder mode: the reciprocal delta is unlabeled -> remainder
+        r_rad = lam_r.abs() * s_rad + d_r
+        sym = list(e_sym)
+    else:
+        ridx = torch.nonzero((d_r > 0).any(dim=0), as_tuple=False).flatten()
+        if ridx.numel():
+            cols = torch.zeros(B, n_rows, ridx.numel(), device=dev, dtype=dt)
+            cols[:, ridx, torch.arange(ridx.numel(), device=dev)] = \
+                d_r[:, ridx]
+            r_G = torch.cat([r_G, cols], dim=2)
+        sym = e_sym + [(op.name + '/r', int(i)) for i in ridx.tolist()]
     # broadcast r back over the rows and pad e with the recip columns so
     # both factors live over the SAME symbol list
     grid = torch.arange(n_rows, device=dev).reshape(pre, 1, post)
     bidx = grid.expand(pre, k, post).reshape(-1)
     rb_c = r_c[:, bidx]
     rb_G = r_G[:, bidx, :]
-    if ridx.numel():
+    rb_rad = r_rad[:, bidx] if r_rad is not None else None
+    if r_rad is None and ridx.numel():
         e_G = torch.cat([e_G, torch.zeros(B, n, ridx.numel(), device=dev,
                                           dtype=dt)], dim=2)
     # correlation-exact product y = e * r (shared symbols throughout)
@@ -682,12 +762,19 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
     rad_e = e_G.abs().sum(dim=2)
     rad_r = rb_G.abs().sum(dim=2)
     box = (rad_e * rad_r - 0.5 * prod.abs().sum(dim=2)).clamp_min(0.0)
-    yidx = torch.nonzero((box > 0).any(dim=0), as_tuple=False).flatten()
-    if yidx.numel():
-        cols = torch.zeros(B, n, yidx.numel(), device=dev, dtype=dt)
-        cols[:, yidx, torch.arange(yidx.numel(), device=dev)] = box[:, yidx]
-        y_G = torch.cat([y_G, cols], dim=2)
-    sym = sym + [(op.name, int(i)) for i in yidx.tolist()]
+    y_rad = None
+    if rb_rad is not None:
+        # remainder cross terms of the product (see _bmm_zono)
+        y_rad = (box + (e_c.abs() + rad_e + e_rad) * rb_rad
+                 + e_rad * (rb_c.abs() + rad_r))
+    else:
+        yidx = torch.nonzero((box > 0).any(dim=0), as_tuple=False).flatten()
+        if yidx.numel():
+            cols = torch.zeros(B, n, yidx.numel(), device=dev, dtype=dt)
+            cols[:, yidx, torch.arange(yidx.numel(), device=dev)] = \
+                box[:, yidx]
+            y_G = torch.cat([y_G, cols], dim=2)
+        sym = sym + [(op.name, int(i)) for i in yidx.tolist()]
     # per-element hybrid against the EXACT interval image: on wide rows
     # the composed bands blow past [0, 1] (measured 5.8e34 on a scale-8
     # toy) while softmax_interval is exact -- where the affine form is
@@ -697,6 +784,8 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
     from .relax import softmax_interval
     yl_ex, yh_ex = softmax_interval(zl, zh, p)
     rad_y = y_G.abs().sum(dim=2)
+    if y_rad is not None:
+        rad_y = rad_y + y_rad
     # threshold 4x, MEASURED on vit 1151 with the correlated bmm
     # downstream: 1x collapse -> zono floor -0.38 (correlations severed),
     # 4x -> -0.0421 = v1 parity (v1: -0.0423). The affine form's local
@@ -705,6 +794,9 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
              .unsqueeze(0).expand(B, n))
     y_c = torch.where(worse, (yh_ex + yl_ex) / 2, y_c)
     y_G = torch.where(worse.unsqueeze(2), torch.zeros_like(y_G), y_G)
+    if y_rad is not None:
+        y_rad = torch.where(worse, (yh_ex - yl_ex) / 2, y_rad)
+        return ZonoState(y_c, y_G, sym, y_rad)
     widx = torch.nonzero(worse.any(dim=0), as_tuple=False).flatten()
     if widx.numel():
         cols = torch.zeros(B, n, widx.numel(), device=dev, dtype=dt)
@@ -717,7 +809,7 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
 
 def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
                budget=None, patience=40, clamp_bounds=None, disj_idx=None,
-               return_alphas=False):
+               return_alphas=False, known=None, init_alphas=None):
     """Adam-optimized band slopes over the forward zonotope (v1's nl_alpha,
     verify_graph.py _nonlinear_alpha_opt).
 
@@ -752,14 +844,30 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         return z.c @ W.T - torch.matmul(W, z.G).abs().sum(-1)
 
     best = margins(None).detach()
+    if known is not None:
+        # the pipeline's already-proven bound (crown chain). Seeding best
+        # with it makes the stall rule DOMINANCE-aware: progress counts
+        # only when the zono frame pushes past what is already known, so
+        # a genuinely-climbing-but-dominated run stops after `patience`
+        # iters (vit 2157: 55s of climb toward -0.043 with -0.029 in
+        # hand) while a leading run (ml4acopf: crown is far behind) is
+        # untouched. Returning the max is sound: both are valid bounds.
+        best = torch.maximum(best, known.to(best.dtype))
     from .relax import REL
     a_ops = [nm for nm in net.order if net.ops[nm].kind == 'nonlin'
              and hasattr(REL[net.ops[nm].fn], 'band_alpha')]
     if not a_ops or iters <= 0:
         return best
-    alphas = {nm: torch.full((B, net.ops[nm].n), 0.5, device=lo.device,
-                             dtype=lo.dtype, requires_grad=True)
-              for nm in a_ops}
+    alphas = {}
+    for nm in a_ops:
+        if init_alphas is not None and nm in init_alphas:
+            # warm start (the f32 stage's optimum feeding the f64 stage)
+            t = init_alphas[nm].detach().to(lo.device, lo.dtype) \
+                .clamp(0.0, 1.0).clone().requires_grad_(True)
+        else:
+            t = torch.full((B, net.ops[nm].n), 0.5, device=lo.device,
+                           dtype=lo.dtype, requires_grad=True)
+        alphas[nm] = t
     opt = torch.optim.Adam(list(alphas.values()), lr=lr)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='max', factor=0.5, patience=15, min_lr=1e-3)
@@ -774,19 +882,30 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
     stall = 0
     best_alphas = None
     best_obj = -torch.inf
+    prev_gap = float('inf')
     for _ in range(max(1, iters)):
         if budget is not None and budget.over():
             break
         lb = margins(alphas)
-        gained = bool((lb.detach() > best).any())
         best = torch.maximum(best, lb.detach())
         if gidx is not None:
             done = all(bool((best[0][g] > thr[g]).any()) for g in gidx)
+            ob = torch.stack([(best[0][g] - thr[g]).max()
+                              for g in gidx]).min()
         else:
             done = bool((best > thr.unsqueeze(0)).all())
+            ob = (best - thr.unsqueeze(0)).min()
         if done:
             break                       # every disjunct has a positive row
-        stall = 0 if gained else stall + 1
+        # progress = RELATIVE shrink of the worst-open gap (on the
+        # monotone best). An any-element `gained` test never stalls on a
+        # crawling tail: vit 2157 measured 55s of +1e-6/iter crawl on a
+        # bound the crown chain already dominated, starving the dual/BaB
+        # endgame to 8s each. Relative-to-gap keeps the ml4acopf closers
+        # alive: near zero the required absolute progress shrinks too.
+        gap = float((-ob).clamp_min(0.0))
+        stall = 0 if gap < prev_gap * (1.0 - 1e-3) else stall + 1
+        prev_gap = min(prev_gap, gap)
         if stall > patience:
             break
         if gidx is not None:

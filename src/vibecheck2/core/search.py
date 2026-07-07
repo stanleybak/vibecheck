@@ -45,10 +45,10 @@ def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
     Returns lbq elementwise-maxed with the tightened bounds."""
     B, q, g = WG.shape
     out = lbq.clone()
-    for bi, (_, _, splits) in enumerate(batch_doms):
+    for bi, (_, _, splits, _fl) in enumerate(batch_doms):
         if not splits:
             continue
-        zc_rows, zg_rows, off = [], [], []
+        zc_rows, zg_rows, zr_rows, off = [], [], [], []
         for nm, j, spec_ in splits:
             r = rec.get(nm)
             if r is None:
@@ -57,6 +57,9 @@ def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
             zg = torch.zeros(g, device=dev)
             zg[:gp] = r['G_pre'][bi, j]
             zc = float(r['c_pre'][bi, j])
+            # box-remainder noise of the pre-activation is not in zg;
+            # its worst case charges |beta| * rad per constraint
+            zr = float(r['rad'][bi, j]) if 'rad' in r else 0.0
             if isinstance(spec_, tuple):     # range split: two constraints
                 lo_c = (spec_[0] if spec_[0] > -1e30
                         else float(inter[nm][0][bi, j]))
@@ -64,23 +67,29 @@ def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
                         else float(inter[nm][1][bi, j]))
                 zc_rows += [zc, -zc]
                 zg_rows += [zg, -zg]
+                zr_rows += [zr, zr]
                 off += [lo_c, -hi_c]         # z - lo >= 0 ; (-z) - (-hi) >= 0
             else:                            # sign split: sign * z >= 0
                 zc_rows += [spec_ * zc]
                 zg_rows += [spec_ * zg]
+                zr_rows += [zr]
                 off += [0.0]
         if not zc_rows:
             continue
         zC = torch.tensor(zc_rows, device=dev)           # (S,)
         zG = torch.stack(zg_rows)                        # (S, g)
+        zR = torch.tensor(zr_rows, device=dev)           # (S,)
         offs = torch.tensor(off, device=dev)             # (S,)
         beta = torch.zeros(q, zC.shape[0], device=dev, requires_grad=True)
         opt = torch.optim.Adam([beta], lr=lr)
         base_c = torch.matmul(zo.c[bi], W.T) + bias      # (q,)
+        if zo.rad is not None:
+            base_c = base_c - torch.matmul(W.abs(), zo.rad[bi])
         best = out[bi] + bias
         for _ in range(iters):
             b_ = beta.clamp_min(0.0)
-            cterm = base_c - (b_ * (zC - offs).unsqueeze(0)).sum(1)
+            cterm = base_c - (b_ * (zC - offs).unsqueeze(0)).sum(1) \
+                - (b_ * zR.unsqueeze(0)).sum(1)
             Gterm = WG[bi] - torch.einsum('qs,sg->qg', b_, zG)
             lb = cterm - Gterm.abs().sum(1)
             best = torch.maximum(best, lb.detach())
@@ -790,7 +799,14 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     and net.ops[nm].fn in ('sigmoid', 'tanh', 'sin', 'cos',
                                            'exp', 'reciprocal', 'pow')]
 
-    heap = [(-float('inf'), 0, ())]           # (worst_lb, tiebreak, splits)
+    # (worst_lb, tiebreak, splits, lb_floor): lb_floor is the parent's
+    # per-query bound vector. A child domain is a SUBSET of its parent,
+    # so the parent's bound holds for it; flooring the child's computed
+    # bound there keeps bounds monotone down the tree (measured on vit
+    # 4493: without it the frontier worst DRIFTED -0.034 -> -0.074 as
+    # looser deep-domain beta optima re-opened queries the parent had
+    # already refuted)
+    heap = [(-float('inf'), 0, (), None)]
     tick = 1
     n_bounded = rounds = 0
     tol_witness = None
@@ -824,7 +840,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             bhi = hi1.expand(B, -1)
             clamps = {}
             range_clamps = {}
-            for bi, (_, _, splits) in enumerate(batch_doms):
+            for bi, (_, _, splits, _fl) in enumerate(batch_doms):
                 for nm, j, spec_ in splits:
                     if isinstance(spec_, tuple):          # smooth range split
                         if nm not in range_clamps:
@@ -869,7 +885,9 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 # merged bounds under the clamps. NOT for wide layers: the
                 # identity blocks scale with unstable count x batch (malbeware,
                 # 7842 unstable: 6 domains/s vs the fixed-root regime; abcrown
-                # runs fixed root intermediates + beta only on this class)
+                # runs fixed root intermediates + beta only on this class;
+                # vit measured 145 -> 5 domains/s when this ran through its
+                # bmm factor edges)
                 inter = backward.intermediates_crown(net, blo, bhi,
                                                      base_inter=inter,
                                                      clamps=clamps,
@@ -916,6 +934,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 zo = zst[net.output_name]
                 WG = torch.matmul(W, zo.G)               # (B, q, g)
                 lbq = torch.matmul(zo.c, W.T) - WG.abs().sum(-1)
+                if zo.rad is not None:
+                    lbq = lbq - torch.matmul(zo.rad, W.abs().T)
                 lbq = _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms,
                                     inter, dev)
                 # SLACK ATTRIBUTION scoring (v1's BBPS intent, exact in
@@ -923,18 +943,19 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 # IS that neuron's relaxation contribution to the margin
                 zono_scores = {}
                 zono_range_scores = {}
+                WGa = WG.abs().amax(dim=1)               # (B, g), one kernel
                 for col, sm in enumerate(zo.sym):
                     nm_s, j_s = sm
                     if nm_s in relu_set:
                         zono_scores.setdefault(nm_s, []).append(
-                            (j_s, WG[:, :, col].abs().amax(dim=1)))
+                            (j_s, WGa[:, col]))
                     elif nm_s.endswith('/e') and nm_s[:-2] in softmax_set:
                         # fused-softmax exp band columns map 1:1 to the
                         # softmax INPUT elements -> range-splittable
                         # (v1 splits the attention internals; the fused
                         # op hid them from the edge lists)
                         zono_range_scores.setdefault(nm_s[:-2], []).append(
-                            (j_s, WG[:, :, col].abs().amax(dim=1)))
+                            (j_s, WGa[:, col]))
                 a_in = None
                 del zst, zo, WG
                 if _dbg:
@@ -969,6 +990,15 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             log(f'[vc2/rbab] round={rounds} OOM at B={B}; batch -> {batch}')
             continue
         n_bounded += B
+        floors = [d[3] for d in batch_doms]
+        if any(f is not None for f in floors):
+            fl = torch.stack([
+                torch.as_tensor(f, device=dev, dtype=lbq.dtype)
+                if f is not None
+                else torch.full((q,), -torch.inf, device=dev,
+                                dtype=lbq.dtype)
+                for f in floors])
+            lbq = torch.maximum(lbq, fl)
         refuted = refuted_of(lbq)
         open_mask = ~refuted.all(dim=1)
         if open_mask.any():
@@ -1066,10 +1096,12 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     children = ((-np.inf, m), (m, np.inf))
                 else:
                     children = (1, -1)
+                fl_ch = lbq[bi].detach().cpu().numpy()
                 for ch in children:
                     heapq.heappush(heap, (float(w_dom[bi]), tick,
                                           base + ((best_edge[bi],
-                                                   int(best_j[bi]), ch),)))
+                                                   int(best_j[bi]), ch),),
+                                          fl_ch))
                     tick += 1
             if onnx_path is not None and rounds % attack_every == 1:
                 # BaB-GUIDED seeds (v1 _pgd_refine): each open (domain,

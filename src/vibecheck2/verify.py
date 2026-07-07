@@ -67,8 +67,13 @@ def _subbox_groups(spec):
     return out
 
 
+_T0 = time.time()
+
+
 def _log_flush(m):
-    print(m, flush=True)
+    # elapsed-time stamp: phase budget forensics need to be readable off
+    # any run log (the vit misses were diagnosed blind without this)
+    print(f'[{time.time() - _T0:6.1f}s] {m}', flush=True)
 
 
 def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
@@ -268,6 +273,9 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     budget.t0 = t0
     budget.deadline = t0 + timeout - 2.0
     fz_alphas = None      # fzono's optimized band slopes (BaB warm start)
+    fz_gain = True        # did the zono frame ever beat the crown chain?
+    # (True when fzono did not run: absence of evidence keeps the
+    # measured-on-vit zono-BaB default for mixed nets)
     tol_w = None          # within-tolerance witness: emitted ONLY if the
                           # pipeline ends without a strict verdict (v1's
                           # variant sats land at timeout, not at phase A)
@@ -510,20 +518,60 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # open. The loop self-terminates on close/plateau, so the
             # wide caps only cost time on nets it was losing anyway
             # (and the dual/BaB measurably never rescue this class).
-            sub = Budget(min(0.7 * budget.remaining(), 300.0),
+            # TWO-STAGE by precision (measured on the A10G: fp64 runs
+            # at ~1/30 of fp32 there, so 40 stall iterations of the f64
+            # vit forward alone cost 56s and starved the dual/BaB to 8s
+            # each). Stage 1 optimizes in f32; only when its optimum
+            # lands within f32 forward noise of closing (the ml4acopf
+            # regime: closing margins ~1e-7, far below f32 resolution
+            # at output scale) does the f64 stage run, warm-started
+            # from the f32 alphas. A row whose f32 optimum sits clearly
+            # negative (vit: -0.04) can never be resolved by precision.
+            sub = Budget(min(0.35 * budget.remaining(), 150.0),
                          margin=0.0)
             fz = memory.attempt(
-                lambda: forward.alpha_zono(net, lo.double(), hi.double(),
-                                           W.double(), iters=1000,
-                                           thresholds=(-b).double(),
+                lambda: forward.alpha_zono(net, lo, hi, W, iters=1000,
+                                           thresholds=-b,
                                            budget=sub, disj_idx=di,
-                                           return_alphas=True),
+                                           return_alphas=True,
+                                           known=lb0.reshape(1, -1)),
                 tag='fzono-alpha')
             lb_f, fz_alphas = (None, None) if fz is None \
-                else (fz[0][0], fz[1])
+                else (fz[0][0].double(), fz[1])
+            if lb_f is not None:
+                worst32 = float((lb_f + b.double()).min())
+                gain32 = bool((lb_f > lb0.double() + 1e-12).any())
+                if gain32 and abs(worst32) < 1e-2:
+                    # within f32 noise of the closing boundary (either
+                    # side: a barely-positive f32 claim needs the f64
+                    # confirmation the always-f64 phase used to give)
+                    # AND the zono frame actually leads somewhere --
+                    # precision cannot help a bound fzono didn't produce
+                    # (vit 1151: the seeded -0.0085 is crown's, and the
+                    # f64 stage burned 38s failing to sharpen it):
+                    # escalate
+                    sub = Budget(min(0.7 * budget.remaining(), 300.0),
+                                 margin=0.0)
+                    fz = memory.attempt(
+                        lambda: forward.alpha_zono(
+                            net, lo.double(), hi.double(), W.double(),
+                            iters=1000, thresholds=(-b).double(),
+                            budget=sub, disj_idx=di, return_alphas=True,
+                            known=lb0.double().reshape(1, -1),
+                            init_alphas=fz_alphas),
+                        tag='fzono-alpha64')
+                    if fz is not None:
+                        lb_f, fz_alphas = fz[0][0], fz[1]
             if lb_f is None:
                 log('[vc2] fzono-alpha skipped (oom)')
             else:
+                # did the zono frame beat the crown chain ANYWHERE? This
+                # decides the BaB bound engine below: fzono returns
+                # max(own, known), so equality with lb0 means the crown
+                # chain leads on this instance (the post-adjoint vit
+                # regime; ab-crown closes those rows with relu-split
+                # beta-CROWN, which is exactly the crown-mode BaB)
+                fz_gain = bool((lb_f > lb0.double() + 1e-12).any())
                 verdict, open_d = _verdict_from_lbs(
                     lb_f + b.double(), di, len(spec.disjuncts))
                 # feed downstream f32 phases a DIRECTED-rounded cast (a
@@ -533,7 +581,8 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     torch.full_like(lb0, -torch.inf)))
                 log(f'[vc2] fzono-alpha: '
                     f'worst={float((lb_f + b.double()).min()):.4e} '
-                    f'open={len(open_d)}/{len(spec.disjuncts)}')
+                    f'open={len(open_d)}/{len(spec.disjuncts)} '
+                    f'gain={fz_gain}')
         except NotImplementedError as e:
             # an op without a forward band yet is a feature boundary
             # for this escalation only; the phases below still run
@@ -595,10 +644,23 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # 1151: ~30s of time_limit nodes, then input_split_bab got 0
         # bounds where v1 closes it in 21 boxes/25s). The dual keeps 55%
         # of what is left; survivors fall through with real time.
+        # On the crown-BaB route (mixed net, crown chain leads, few open
+        # disjuncts) the slice is SHORT: measured on all 12 vit rows the
+        # dual there either kills its disjunct instantly (7 rows, <=324
+        # nodes, <1s) or diverges (5 rows: frontier 0.6M-4M and growing
+        # at 25s), while the crown BaB bounds ~140 domains/s and is the
+        # engine that officially closes this class -- every dual second
+        # past the instant-kill window is stolen from the closer.
+        has_mixed = any((op.kind == 'nonlin' and op.fn != 'relu')
+                        or op.kind in ('mul', 'bmm')
+                        for op in net.ops.values())
+        crown_bab_route = (len(open_d) <= 2 and has_mixed
+                           and not fz_gain)
+        dual_slice = (min(12.0, 0.3 * budget.remaining())
+                      if crown_bab_route else 0.55 * budget.remaining())
         refuted = certify_queries(
             net, spec, W, b, di, lo, hi, inter, open_d,
-            deadline=min(t0 + timeout - 2.0,
-                         time.time() + 0.55 * budget.remaining()),
+            deadline=min(t0 + timeout - 2.0, time.time() + dual_slice),
             device=device, log=log)
         open_d = [d for d in open_d if d not in refuted]
         log(f'[vc2] dual-lp: {len(refuted)} disjuncts refuted, '
@@ -648,19 +710,25 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         from .core.search import input_split_bab, relu_split_bab
         has_mixed = any((op.kind == 'nonlin' and op.fn != 'relu')
                         or op.kind in ('mul', 'bmm')
-                        for op in net.ops.values())
+                        for op in net.ops.values())    # (recomputed: the
+        # dual phase above may not have run on this path)
         kw = {}
         if n_wide <= 32:
             bab = input_split_bab
-        elif len(open_d) <= 2 and has_mixed:
-            # v1's vit beta-bab regime (its 2157 trace: relu/bilinear sign
-            # splits bounded by the ZONO close the last query in 1583
-            # domains/51s; input splits measured immobile and backward
-            # crown is -9.9 where the zono is -0.04)
+        elif len(open_d) <= 2 and has_mixed and fz_gain:
+            # zono-bounded BaB: only when the zono frame measurably LEADS
+            # the crown chain on this instance (fz_gain). Where the crown
+            # chain leads (vit post-softmax-adjoint: crown -0.029 vs zono
+            # -0.043 root), the default crown-mode BaB below is the
+            # ab-crown regime that officially closes those rows.
             bab = relu_split_bab
             kw['root_inter'] = inter
             kw['bound'] = 'zono'
-            kw['batch'] = 16    # measured on vit: B=16 fits (8.4 GiB), B=64 OOMs
+            kw['batch'] = 16    # measured on vit: B=16 fits (8.4 GiB), B=64
+            # OOMs. (box_remainder=True measured 2.9x faster/domain here
+            # but HALVED bound quality: -0.083 vs -0.039 on 2157 -- the
+            # merged columns' cross-element cancellation through the
+            # residual adds is load-bearing. Dense stays.)
             # the root fzono's optimized band slopes: bounding domains
             # with DEFAULT bands measured ~10x looser (-0.46-quality vs
             # the root's -0.043) and the tree barely pruned

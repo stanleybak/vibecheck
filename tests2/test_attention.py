@@ -173,3 +173,57 @@ def test_softmax_crown_adjoint_sound():
     # and it must be non-vacuous: strictly tighter than the constant
     # planes would allow on at least some coordinate (adjoint alive)
     assert torch.isfinite(lb).all()
+
+
+def test_box_remainder_zono_sound():
+    """box_remainder=True must still bracket the true image (sampled),
+    carry a nonnegative rad, and use strictly fewer generator columns
+    than the dense form (the point of the representation)."""
+    from vibecheck2.core import forward as fwd
+    net, ref, _ = _attention_net()
+    lo = torch.tensor([[-1.0, -0.5, 0.0, -0.8]])
+    hi = torch.tensor([[0.5, 1.0, 0.7, 0.2]])
+    dl, dh, dst = fwd.zono(net, lo, hi, return_state=True)
+    rl, rh, rst = fwd.zono(net, lo, hi, return_state=True,
+                           box_remainder=True)
+    zo = rst[net.output_name]
+    assert zo.rad is not None and bool((zo.rad >= 0).all())
+    assert zo.G.shape[2] < dst[net.output_name].G.shape[2]
+    xs = RNG.uniform(lo.numpy(), hi.numpy(),
+                     size=(4096, 4)).astype(np.float32)
+    ys = ref(xs)
+    assert (ys >= rl.numpy() - 1e-5).all()
+    assert (ys <= rh.numpy() + 1e-5).all()
+
+
+def test_box_remainder_relu_record_and_columns():
+    """relu fresh columns stay dense under box_remainder (the BaB's split
+    handles) and the record carries the pre-activation remainder."""
+    from vibecheck2.core import forward as fwd
+    from vibecheck2.core.linmap import Dense as _Dense
+    lm1 = _d(3, 5)
+    lm2 = _d(5, 2)
+    ops = {
+        'x': Op('x', 'input', (), (3,), 3),
+        'h': Op('h', 'linmap', ('x',), (5,), 5, lm=lm1),
+        'sg': Op('sg', 'nonlin', ('h',), (5,), 5, fn='sigmoid', params={}),
+        'r': Op('r', 'nonlin', ('h',), (5,), 5, fn='relu', params={}),
+        'a': Op('a', 'add', ('sg', 'r'), (5,), 5),
+        'y': Op('y', 'linmap', ('a',), (2,), 2, lm=lm2),
+    }
+    net = Net(ops, ['h', 'sg', 'r', 'a', 'y'], 'x', 'y')
+    lo = torch.full((1, 3), -1.0)
+    hi = torch.full((1, 3), 1.0)
+    rec = {}
+    rl, rh, rst = fwd.zono(net, lo, hi, return_state=True, record=rec,
+                           box_remainder=True)
+    zo = rst[net.output_name]
+    # sigmoid deltas went to rad (no 'sg' columns); relu fresh cols remain
+    assert not any(s[0] == 'sg' for s in zo.sym)
+    assert any(s[0] == 'r' for s in zo.sym)
+    assert 'rad' in rec['r'] and bool((rec['r']['rad'] >= 0).all())
+    xs = RNG.uniform(-1, 1, size=(2048, 3)).astype(np.float32)
+    h = xs @ lm1.W.T + lm1.b
+    ys = (1 / (1 + np.exp(-h)) + np.maximum(h, 0)) @ lm2.W.T + lm2.b
+    assert (ys >= rl.numpy() - 1e-5).all()
+    assert (ys <= rh.numpy() + 1e-5).all()
