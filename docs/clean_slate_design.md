@@ -869,3 +869,21 @@ Build plan, in order:
    with the patch intermediates.
 Soundness gates as usual: every patch op unit-tested against the dense
 adjoint on small random convs (bit-parity), plus MC sampling brackets.
+
+M5 build state (2026-07-07/08, commits 6a8e232..e340a81): PatchAdjoint
+landed with dense bit-parity (through_conv with intermediate-edge
+clipping, gather_edge via padded unfold, through_planes, Scale/
+ScaleShift, add by two-path duplication); patch_refine walks a conv
+edge's full identity grid to the input at window cost and is routed in
+intermediates_crown for edges > 65536 elements. vgg16-7 probe (GPU,
+incremental): relu1's 3.2M-element edge refines 19 -> 5 unstable in
+1.8s -- the dense path cannot run this at any chunk size. THE WALL:
+every deeper chain hits the decomposed-maxpool trees (Select gathers of
+2x2 window elements + difference edges), so 23/25 relus skip and the
+output crown stays 1e15. Next chunk: Select support in the walk -- a
+pool Select maps output position (c,y,x,elem) to input (c,2y+dy,2x+dx),
+i.e. per-window-element affine grid maps; the patch anchors can absorb
+it by splitting the window into per-element sub-patches (auto_LiRPA
+implements maxpool patches natively for exactly this reason). The
+pool-tree QUERY edges (d0/d1, add ops) also need their (C,H,W) grid
+derived from the tree metadata rather than eop.lm.out_shape.
