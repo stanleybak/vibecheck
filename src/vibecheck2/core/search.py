@@ -271,6 +271,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     n_bounded = n_split = rounds = 0
     tol_witness = None
     _round_wall, _round_B = 1.0, 1
+    z_rad_mode = False   # flips permanently after the first dense-zono OOM
     t0 = time.time()
     n_nonlin = sum(net.ops[nm].n for nm in net.order
                    if net.ops[nm].kind == 'nonlin')
@@ -422,14 +423,39 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 ib = None
                 zono_oom = False
                 try:
-                    # true per-subbox planes from the wide-dims zonotope
-                    _l, _h, zst = backward.fwd.zono(net, blo, bhi,
-                                                    return_state=True)
+                    # true per-subbox planes from the wide-dims zonotope.
+                    # After a dense OOM the run switches PERMANENTLY to
+                    # the box-remainder form: mul/reciprocal collapse
+                    # into the rad vector instead of diagonal columns,
+                    # so the generator count stays ~n_wide (mscn_2048d:
+                    # the dense state needs 130+ GiB and OOMed EVERY
+                    # batch into the slow chunked-CROWN degrade; official
+                    # budget there is 20s)
+                    _l, _h, zst = backward.fwd.zono(
+                        net, blo, bhi, return_state=True,
+                        box_remainder='all' if z_rad_mode else False)
                     ib = backward._inter_from_state(
                         net, lambda e: zst[e].bounds())
                     del zst
                 except torch.cuda.OutOfMemoryError:
-                    zono_oom = True
+                    if not z_rad_mode:
+                        z_rad_mode = True
+                        log('[vc2/bab] dense zono OOM; switching to '
+                            'box-remainder zono for this run')
+                        if dev.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        try:
+                            _l, _h, zst = backward.fwd.zono(
+                                net, blo, bhi, return_state=True,
+                                box_remainder='all')
+                            ib = backward._inter_from_state(
+                                net, lambda e: zst[e].bounds())
+                            del zst
+                        except (torch.cuda.OutOfMemoryError,
+                                NotImplementedError):
+                            zono_oom = True
+                    else:
+                        zono_oom = True
                     # empty_cache OUTSIDE this handler's live traceback would
                     # still pin the zono partial state; do it here and let the
                     # retry below run cache-clean

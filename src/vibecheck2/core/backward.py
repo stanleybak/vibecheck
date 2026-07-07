@@ -104,41 +104,51 @@ def _inter_from_state(net, bounds_of):
 
 
 def intermediates(net, lo, hi):
-    """Pre-activation bounds for every nonlinear edge: forward zonotope when
-    the projected dense cost fits the memory budget, else interval (the
-    CROWN-IBP regime for big conv nets until patches/lifecycle land in M5).
-    Also falls back to interval when zono lacks an op's relaxation."""
+    """Pre-activation bounds for every nonlinear edge: dense forward
+    zonotope when its projected cost fits the memory budget, else the
+    BUDGET forward (top-K input symbols, every fresh delta in the box
+    remainder -- ab-crown's vggnet16 dynamic-forward, max_dim ~100);
+    interval only when zono lacks an op's relaxation. The budget pass is
+    bounded-memory on any net and tighter than interval on the early
+    conv layers, which is what the relu planes there read (the dense
+    pass on vgg16-7 OOMs at any cap; the budget pass runs in ~10 GB)."""
     from . import memory
     B = lo.shape[0]
     ist = fwd.interval(net, lo, hi, return_state=True)
     iiv = _inter_from_state(net, lambda e: ist[e])
-    if _zono_cost_bytes(net, B) < memory.free_bytes(lo.device) * memory.SAFETY:
-        try:
+    dense_fits = (_zono_cost_bytes(net, B)
+                  < memory.free_bytes(lo.device) * memory.SAFETY)
+    try:
+        if dense_fits:
             _lo, _hi, state = fwd.zono(net, lo, hi, return_state=True)
-            izo = _inter_from_state(net, lambda e: state[e].bounds())
-            # intersect with interval per entry (both sound; interval
-            # keeps structurally-positive chains positive where the zono
-            # concretization of band generators goes negative -- the
-            # softmax difference form's sum >= exp(0) = 1)
-            out = {}
-            for k2, zt in izo.items():
-                it = iiv[k2]
-                merged = []
-                for j2 in range(0, len(zt), 2):
-                    lo2 = torch.maximum(zt[j2], it[j2])
-                    hi2 = torch.minimum(zt[j2 + 1], it[j2 + 1])
-                    merged.append(lo2)
-                    merged.append(torch.maximum(hi2, lo2))
-                out[k2] = tuple(merged)
-            return out
-        except NotImplementedError as e:
-            _warn_once(f'intermediates: zono unavailable ({e}); '
-                       f'interval bounds only')
-        except torch.cuda.OutOfMemoryError:
-            # the shape-only cost model missed (band nonlins whose fresh
-            # gens only materialize for crossing elements); interval is
-            # the sanctioned degradation, not a crash
-            torch.cuda.empty_cache()
+        else:
+            _lo, _hi, state = fwd.zono(net, lo, hi, return_state=True,
+                                       box_remainder='all',
+                                       sym_budget=96)
+        izo = _inter_from_state(net, lambda e: state[e].bounds())
+        # intersect with interval per entry (both sound; interval
+        # keeps structurally-positive chains positive where the zono
+        # concretization of band generators goes negative -- the
+        # softmax difference form's sum >= exp(0) = 1)
+        out = {}
+        for k2, zt in izo.items():
+            it = iiv[k2]
+            merged = []
+            for j2 in range(0, len(zt), 2):
+                lo2 = torch.maximum(zt[j2], it[j2])
+                hi2 = torch.minimum(zt[j2 + 1], it[j2 + 1])
+                merged.append(lo2)
+                merged.append(torch.maximum(hi2, lo2))
+            out[k2] = tuple(merged)
+        return out
+    except NotImplementedError as e:
+        _warn_once(f'intermediates: zono unavailable ({e}); '
+                   f'interval bounds only')
+    except torch.cuda.OutOfMemoryError:
+        # the cost model missed (band nonlins whose fresh gens only
+        # materialize for crossing elements); interval is the
+        # sanctioned degradation, not a crash
+        torch.cuda.empty_cache()
     return iiv
 
 

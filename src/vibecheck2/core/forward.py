@@ -537,7 +537,13 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                                      op.params['positions']):
                 p = torch.as_tensor(pos, device=dev)
                 c2[:, p] = zp.c
-                G2[:, p.unsqueeze(1), torch.as_tensor(cols, device=dev)] = zp.G
+                # dtype=long explicitly: an EMPTY cols list (a part whose
+                # symbols all live in the remainder, e.g. a mul output
+                # under box_remainder='all') otherwise infers float and
+                # crashes the advanced indexing
+                G2[:, p.unsqueeze(1),
+                   torch.as_tensor(cols, device=dev,
+                                   dtype=torch.long)] = zp.G
                 if rad2 is not None:
                     rad2[:, p] = zp.rad
             state[name] = ZonoState(c2, G2, syms, rad2)
