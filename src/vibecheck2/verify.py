@@ -767,6 +767,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         if bab is relu_split_bab and kw.get('bound') != 'zono' \
                 and root_alphas:
             kw['root_alphas'] = root_alphas
+            # refine regime for the deep-tree class: with per-domain
+            # alpha transfer, lr 0.1's bias-corrected first steps THRASH
+            # the inherited state back to the cold 12-iter plateau
+            # (2157 ckpt replays: cold/transfer@0.1 both flat -0.0136;
+            # transfer@0.03 reaches -0.0075 by round 32 and falling,
+            # beating 30 cold iters at 12-iter cost)
+            kw['beta_lr'] = 0.03
         ckpt = os.environ.get('VC2_BAB_CKPT')
         if ckpt:
             # dev harness: freeze everything the BaB consumes so search

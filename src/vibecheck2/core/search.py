@@ -894,7 +894,8 @@ def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
 
 
 def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
-                   device='cpu', batch=256, beta_iters=None, onnx_path=None,
+                   device='cpu', batch=256, beta_iters=None, beta_lr=0.1,
+                   onnx_path=None,
                    attack_every=16, root_inter=None, bound='crown',
                    warm_alphas=None, root_alphas=None,
                    log=lambda m: None):
@@ -1133,17 +1134,22 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     for bi, dom in enumerate(batch_doms):
                         for nm, a16 in (dom[5] or {}).items():
                             if nm not in ib_alpha:
-                                base = (root_alphas[nm].mean(
-                                    dim=1, keepdim=True)
-                                    if root_alphas and nm in root_alphas
-                                    else torch.full(
-                                        (1, 1, net.ops[nm].n), 0.5))
+                                qd_s = a16.shape[0]   # stored qd governs
+                                if root_alphas and nm in root_alphas:
+                                    r_a = root_alphas[nm]
+                                    base = (r_a.mean(dim=1, keepdim=True)
+                                            if qd_s == 1
+                                            else r_a[:, :qd_s])
+                                else:
+                                    base = torch.full(
+                                        (1, qd_s, net.ops[nm].n), 0.5)
                                 ib_alpha[nm] = base.to(dev).float() \
                                     .expand(B, -1, -1).contiguous()
                             ib_alpha[nm][bi] = torch.as_tensor(
                                 a16, device=dev, dtype=torch.float32)
                 lb_ab, beta_out, alpha_out = backward.alpha_beta_crown(
                     net, blo, bhi, W, inter, clamps, iters=beta_iters,
+                    lr=beta_lr,
                     thresholds=-bias, range_clamps=range_clamps,
                     init_alpha=(ib_alpha if ib_alpha is not None
                                 else root_alphas),
