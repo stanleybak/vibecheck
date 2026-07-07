@@ -755,6 +755,15 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         if bab is relu_split_bab and kw.get('bound') != 'zono' \
                 and root_alphas:
             kw['root_alphas'] = root_alphas
+        ckpt = os.environ.get('VC2_BAB_CKPT')
+        if ckpt:
+            # dev harness: freeze everything the BaB consumes so search
+            # changes iterate WITHOUT re-running ~50s of root phases
+            # (scratch/clean_slate/bab_from_ckpt.py replays it)
+            torch.save({'W': W, 'b': b, 'di': di, 'lo': lo[0],
+                        'hi': hi[0], 'kw': kw, 'bab': bab.__name__,
+                        'onnx_path': onnx_path}, ckpt)
+            log(f'[vc2] BaB checkpoint saved to {ckpt}')
         verdict, binfo = bab(
             net, spec, W, b, di, lo[0], hi[0],
             deadline=t0 + timeout - 2.0, device=device,

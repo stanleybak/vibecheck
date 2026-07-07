@@ -597,7 +597,8 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
 
 def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                      thresholds=None, budget=None, share_q=None,
-                     range_clamps=None, init_alpha=None):
+                     range_clamps=None, init_alpha=None, init_beta=None,
+                     return_beta=False):
     """Jointly Adam-optimized alpha (relaxation slopes) + beta (split
     multipliers) lower bounds for a batch of BaB domains under sign clamps.
     Every iterate is a sound bound (beta projected to >= 0); returns the
@@ -641,8 +642,13 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                     .expand(B, qd, l.shape[1]).contiguous() \
                     .requires_grad_(True)
             if cl is not None and bool((cl != 0).any()):
-                beta[name] = torch.zeros(B, qd, l.shape[1], device=dev,
-                                         dtype=dt, requires_grad=True)
+                b0 = torch.zeros(B, qd, l.shape[1], device=dev, dtype=dt)
+                if init_beta is not None and name in init_beta:
+                    # warm start from the PARENT domain's optimized betas
+                    # (ab-crown transfers this state; re-optimizing from
+                    # zero in a dozen iters loses depth-20 trees)
+                    b0 = b0 + init_beta[name].to(dev, dt)
+                beta[name] = b0.requires_grad_(True)
         elif hasattr(REL[op.fn], 'alpha_planes'):
             l, h = inter[name]
             if init_alpha is not None and name in init_alpha \
@@ -658,8 +664,9 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                 alpha[name] = t0.requires_grad_(True)
     params = list(alpha.values()) + list(beta.values())
     if not params:
-        return crown(net, lo, hi, W, inter, clamps=clamps,
+        lb0_ = crown(net, lo, hi, W, inter, clamps=clamps,
                      range_clamps=range_clamps)
+        return (lb0_, {}) if return_beta else lb0_
     opt = torch.optim.Adam(params, lr=lr)
     thr = (torch.zeros(q, device=dev, dtype=dt) if thresholds is None
            else thresholds.to(dev, dt))
@@ -681,7 +688,10 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                 t.clamp_(min=0.0)
     lb = crown(net, lo, hi, W, inter, alpha=alpha, clamps=clamps, beta=beta,
                range_clamps=range_clamps)
-    return torch.maximum(best, lb.detach())
+    best = torch.maximum(best, lb.detach())
+    if return_beta:
+        return best, {k: v.detach().clamp_min(0.0) for k, v in beta.items()}
+    return best
 
 
 def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,

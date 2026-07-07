@@ -45,7 +45,7 @@ def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
     Returns lbq elementwise-maxed with the tightened bounds."""
     B, q, g = WG.shape
     out = lbq.clone()
-    for bi, (_, _, splits, _fl) in enumerate(batch_doms):
+    for bi, (_, _, splits, _fl, _bd) in enumerate(batch_doms):
         if not splits:
             continue
         zc_rows, zg_rows, zr_rows, off = [], [], [], []
@@ -912,7 +912,10 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     # 4493: without it the frontier worst DRIFTED -0.034 -> -0.074 as
     # looser deep-domain beta optima re-opened queries the parent had
     # already refuted)
-    heap = [(-float('inf'), 0, (), None)]
+    # 5th slot: the parent's optimized split betas {(edge, j): float},
+    # warm-starting each child's alpha/beta pass (ab-crown transfers
+    # this state; from-zero re-optimization loses deep trees)
+    heap = [(-float('inf'), 0, (), None, {})]
     tick = 1
     n_bounded = rounds = 0
     tol_witness = None
@@ -946,7 +949,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             bhi = hi1.expand(B, -1)
             clamps = {}
             range_clamps = {}
-            for bi, (_, _, splits, _fl) in enumerate(batch_doms):
+            for bi, (_, _, splits, _fl, _bd) in enumerate(batch_doms):
                 for nm, j, spec_ in splits:
                     if isinstance(spec_, tuple):          # smooth range split
                         if nm not in range_clamps:
@@ -999,6 +1002,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                      clamps=clamps,
                                                      range_clamps=range_clamps)
             adj = {}
+            beta_out = {}
             zono_scores = {}
             zono_range_scores = {}
             if bound == 'zono':
@@ -1074,11 +1078,18 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                            range_clamps=range_clamps,
                                            collect_adjoints=adj,
                                            return_input_adjoint=True)
-                lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter,
-                                                  clamps, iters=beta_iters,
-                                                  thresholds=-bias,
-                                                  range_clamps=range_clamps,
-                                                  init_alpha=root_alphas)
+                ib_beta = {}
+                for bi, dom in enumerate(batch_doms):
+                    for (nm, j), bv in (dom[4] or {}).items():
+                        if nm not in ib_beta:
+                            ib_beta[nm] = torch.zeros(
+                                B, 1, net.ops[nm].n, device=dev)
+                        ib_beta[nm][bi, 0, j] = bv
+                lb_ab, beta_out = backward.alpha_beta_crown(
+                    net, blo, bhi, W, inter, clamps, iters=beta_iters,
+                    thresholds=-bias, range_clamps=range_clamps,
+                    init_alpha=root_alphas, init_beta=ib_beta or None,
+                    return_beta=True)
                 lbq = torch.maximum(lbq, lb_ab)
         except (torch.cuda.OutOfMemoryError,
                 torch.AcceleratorError):
@@ -1222,11 +1233,17 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 else:
                     children = (1, -1)
                 fl_ch = lbq[bi].detach().cpu().numpy()
+                bd_ch = dict(batch_doms[bi][4] or {})
+                for nm2, j2, sp2 in base:
+                    if not isinstance(sp2, tuple) and nm2 in beta_out \
+                            and beta_out[nm2].numel():
+                        bd_ch[(nm2, j2)] = float(
+                            beta_out[nm2][bi, :, j2].max())
                 for ch in children:
                     heapq.heappush(heap, (float(w_dom[bi]), tick,
                                           base + ((best_edge[bi],
                                                    int(best_j[bi]), ch),),
-                                          fl_ch))
+                                          fl_ch, bd_ch))
                     tick += 1
             if onnx_path is not None and rounds % attack_every == 1:
                 # BaB-GUIDED seeds (v1 _pgd_refine): each open (domain,

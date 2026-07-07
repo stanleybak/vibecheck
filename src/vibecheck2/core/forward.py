@@ -895,6 +895,10 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         # overtakes and closes). 3x splits those regimes.
         kw_ = _worst_open(known.to(best.dtype).expand_as(best))
         rw_ = _worst_open(raw0)
+        import os as _os
+        if _os.environ.get('VC2_FZ_DEBUG'):
+            print(f'[fz-gate] raw={rw_:+.4f} known={kw_:+.4f} '
+                  f'ratio={(-rw_) / max(-kw_, 1e-30):.2f}', flush=True)
         if kw_ < 0 and rw_ < 0 and -rw_ > 3.0 * -kw_:
             return (best, None) if return_alphas else best
 
