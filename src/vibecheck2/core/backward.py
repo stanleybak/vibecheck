@@ -597,7 +597,7 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
 
 def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                      thresholds=None, budget=None, share_q=None,
-                     range_clamps=None):
+                     range_clamps=None, init_alpha=None):
     """Jointly Adam-optimized alpha (relaxation slopes) + beta (split
     multipliers) lower bounds for a batch of BaB domains under sign clamps.
     Every iterate is a sound bound (beta projected to >= 0); returns the
@@ -625,18 +625,37 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
             cl = clamps.get(name)
             if cl is not None:
                 l, h = clamped_bounds((l, h), cl)
-            al0 = REL['relu'].planes(l, h)[0]
-            alpha[name] = al0.detach().clone().unsqueeze(1) \
-                .expand(B, qd, l.shape[1]).contiguous().requires_grad_(True)
+            if init_alpha is not None and name in init_alpha:
+                # warm start from the ROOT's optimized alphas (ab-crown
+                # keeps per-domain alpha state; a 12-iter Adam run from
+                # chord init lands measurably short of the root's
+                # 60-iter optimum, making every domain bound looser
+                # than the root it descends from)
+                a0 = init_alpha[name].detach().to(l.device, l.dtype)
+                a0 = (a0.mean(dim=1, keepdim=True) if qd == 1
+                      else a0[:, :qd]).expand(B, qd, l.shape[1])
+                alpha[name] = a0.contiguous().requires_grad_(True)
+            else:
+                al0 = REL['relu'].planes(l, h)[0]
+                alpha[name] = al0.detach().clone().unsqueeze(1) \
+                    .expand(B, qd, l.shape[1]).contiguous() \
+                    .requires_grad_(True)
             if cl is not None and bool((cl != 0).any()):
                 beta[name] = torch.zeros(B, qd, l.shape[1], device=dev,
                                          dtype=dt, requires_grad=True)
         elif hasattr(REL[op.fn], 'alpha_planes'):
             l, h = inter[name]
-            crossing = ((l < 0) & (h > 0)).to(l.dtype)
-            t0 = (0.5 * (1 - crossing)).unsqueeze(1).unsqueeze(1) \
-                .expand(B, qd, 2, l.shape[1]).contiguous()
-            alpha[name] = t0.requires_grad_(True)
+            if init_alpha is not None and name in init_alpha \
+                    and init_alpha[name].dim() == 4:
+                a0 = init_alpha[name].detach().to(l.device, l.dtype)
+                a0 = (a0.mean(dim=1, keepdim=True) if qd == 1
+                      else a0[:, :qd]).expand(B, qd, 2, l.shape[1])
+                alpha[name] = a0.contiguous().requires_grad_(True)
+            else:
+                crossing = ((l < 0) & (h > 0)).to(l.dtype)
+                t0 = (0.5 * (1 - crossing)).unsqueeze(1).unsqueeze(1) \
+                    .expand(B, qd, 2, l.shape[1]).contiguous()
+                alpha[name] = t0.requires_grad_(True)
     params = list(alpha.values()) + list(beta.values())
     if not params:
         return crown(net, lo, hi, W, inter, clamps=clamps,

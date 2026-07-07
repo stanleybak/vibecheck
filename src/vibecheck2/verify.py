@@ -273,6 +273,8 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     budget.t0 = t0
     budget.deadline = t0 + timeout - 2.0
     fz_alphas = None      # fzono's optimized band slopes (BaB warm start)
+    root_alphas = None    # the polish phase's optimized CROWN alphas (the
+    # BaB's per-domain alpha/beta pass and the kFSB probe warm-start here)
     fz_gain = True        # did the zono frame ever beat the crown chain?
     # (True when fzono did not run: absence of evidence keeps the
     # measured-on-vit zono-BaB default for mixed nets)
@@ -309,6 +311,16 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # or a marginal below-zero candidate the chokepoint rejected) with
             # cheap-phase budget to spare; otherwise fall through to bounds.
             if ainfo['best_margin'] >= 0.05 or budget.remaining() < 15:
+                break
+            if any((op.kind == 'nonlin' and op.fn != 'relu')
+                   or op.kind in ('mul', 'bmm')
+                   for op in net.ops.values()):
+                # the near-miss escalation is the hidden-CE lesson and
+                # those live in small pure-relu nets (soundnessbench:
+                # crosses zero at r=256). Mixed nets sit near-zero
+                # because they are HARD UNSAT rows (vit: +0.012 margins
+                # on all 12 rows); two extra OSI rounds cost 8s of the
+                # exact budget the BaB endgame needs.
                 break
             restarts = int(restarts * 2.5)
 
@@ -484,10 +496,12 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # whole budget on challenging_certified and the dual + BaB
             # got literally zero seconds.
             p_iters = 150 if n_nonlin <= 50_000 else 30
-            lb2 = backward.alpha_crown(net, lo, hi, W, inter, iters=p_iters,
-                                       lr=0.1, thresholds=-b,
-                                       budget=budget)[0]
-            lb = torch.maximum(lb, lb2)
+            lb2, root_alphas = backward.alpha_crown(net, lo, hi, W, inter,
+                                                    iters=p_iters,
+                                                    lr=0.1, thresholds=-b,
+                                                    budget=budget,
+                                                    return_alpha=True)
+            lb = torch.maximum(lb, lb2[0])
             verdict, open_d = _verdict_from_lbs(lb + b, di,
                                                 len(spec.disjuncts))
             log(f'[vc2] alpha-polish: worst={float((lb + b).min()):.4f} '
@@ -738,6 +752,9 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         else:
             bab = relu_split_bab
             kw['root_inter'] = inter        # the crown-refined root bounds
+        if bab is relu_split_bab and kw.get('bound') != 'zono' \
+                and root_alphas:
+            kw['root_alphas'] = root_alphas
         verdict, binfo = bab(
             net, spec, W, b, di, lo[0], hi[0],
             deadline=t0 + timeout - 2.0, device=device,

@@ -752,10 +752,116 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                      'rounds': rounds}
 
 
+
+def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
+               relu_maps, open_idx, lbq, dev, root_alphas=None,
+               k=8, chunk=256):
+    """kFSB branching (ab-crown's default, its vit 2157 trace: 786 domains
+    visited, frontier 51->29->9->2->0, ~half of each round spent in
+    `decision`): the BaBSR proxy NOMINATES the top-k relu candidates per
+    open domain, a real planes-only crown pass bounds both children of
+    every candidate, and the pick maximizes min(child lb) (reduceop min).
+    The proxy alone measured a flat 6k-domain tree at -0.015 on the same
+    row the probe-based pick closes.
+
+    Returns {domain_row: (edge, neuron)} for the open domains (may omit
+    rows whose candidates all scored empty)."""
+    from . import backward as bwd
+    edges = sorted(relu_maps)
+    widths = [relu_maps[nm].shape[1] for nm in edges]
+    flat = torch.cat([relu_maps[nm] for nm in edges], dim=1)   # (B, ncat)
+    k_eff = min(k, flat.shape[1])
+    top_v, top_i = flat[open_idx].topk(k_eff, dim=1)           # (Bo, k)
+    force = os.environ.get('VC2_KFSB_FORCE')
+    if force:
+        offs = [0]
+        for w in widths:
+            offs.append(offs[-1] + w)
+        cols = []
+        for tok in force.split(','):
+            ei, j = tok.split(':')
+            cols.append(offs[int(ei)] + int(j))
+        fc = torch.tensor(cols, device=dev).unsqueeze(0) \
+            .expand(open_idx.numel(), -1)
+        top_i = torch.cat([top_i, fc], dim=1)
+        top_v = torch.cat([top_v, flat[open_idx].gather(1, fc)], dim=1)
+        top_v = torch.maximum(top_v, torch.full_like(top_v, 1e-9))
+        k_eff = top_i.shape[1]
+    edge_of = torch.repeat_interleave(
+        torch.arange(len(edges), device=dev),
+        torch.tensor(widths, device=dev))
+    j_of = torch.cat([torch.arange(w, device=dev) for w in widths])
+    Bo = open_idx.numel()
+    # child rows: (bo, cand, sign) flattened; sign alternates fastest
+    rows = open_idx.repeat_interleave(2 * k_eff)               # (Bo*2k,)
+    cand = top_i.repeat_interleave(2, dim=1).reshape(-1)       # (Bo*2k,)
+    signs = torch.tensor([1, -1], device=dev, dtype=torch.int8) \
+        .repeat(Bo * k_eff)
+    valid = top_v.repeat_interleave(2, dim=1).reshape(-1) > 0
+    m_ch = torch.full((Bo * 2 * k_eff,), -torch.inf, device=dev)
+    for c0 in range(0, rows.numel(), chunk):
+        sl = slice(c0, min(c0 + chunk, rows.numel()))
+        r = rows[sl]
+        if not bool(valid[sl].any()):
+            continue
+        cc = {nm: cl[r].clone() for nm, cl in clamps.items()}
+        for ei, nm in enumerate(edges):
+            if nm not in cc:
+                cc[nm] = torch.zeros(r.numel(), net.ops[nm].n,
+                                     device=dev, dtype=torch.int8)
+        e_sel = edge_of[cand[sl]]
+        j_sel = j_of[cand[sl]]
+        ar = torch.arange(r.numel(), device=dev)
+        for ei, nm in enumerate(edges):
+            m = e_sel == ei
+            if bool(m.any()):
+                cc[nm][ar[m], j_sel[m]] = signs[sl][m]
+        ic = {k2: tuple(t[r] for t in v) for k2, v in inter.items()}
+        rc = {k2: tuple(t[r] for t in v)
+              for k2, v in (range_clamps or {}).items()}
+        lo_r = lo1.expand(r.numel(), -1)
+        hi_r = hi1.expand(r.numel(), -1)
+        # probe with the ROOT's optimized alphas: the plain-planes probe
+        # measured every child at the parent floor (all candidates tied,
+        # argmax degenerated to the proxy pick and the tree was
+        # bit-identical); the candidates only separate at a bound
+        # quality near the root's
+        al = (None if root_alphas is None else
+              {nm: a.expand(r.numel(), *a.shape[1:])
+               for nm, a in root_alphas.items()})
+        lb_c = bwd.crown(net, lo_r, hi_r, W, ic, al, clamps=cc,
+                         range_clamps=rc)
+        # NO parent floor here: the floor is a sound BOUND but it masks
+        # candidate separation (measured: with it, every candidate's
+        # children scored exactly the parent bound and the pick
+        # degenerated to the proxy). The probe wants the RAW effect of
+        # each clamp on the crown pass.
+        m_ch[sl] = (lb_c + bias).min(dim=1).values
+    m_ch = torch.where(valid, m_ch, torch.full_like(m_ch, -torch.inf))
+    sc = m_ch.reshape(Bo, k_eff, 2).min(dim=2).values          # (Bo, k)
+    if os.environ.get('VC2_KFSB_DEBUG'):
+        mm = m_ch.reshape(Bo, k_eff, 2)
+        for c in range(k_eff):
+            ci = int(top_i[0, c])
+            print(f'[kfsb] cand ({edges[int(edge_of[ci])]}, '
+                  f'{int(j_of[ci])}) children '
+                  f'{float(mm[0, c, 0]):+.4f}/{float(mm[0, c, 1]):+.4f} '
+                  f'proxy={float(top_v[0, c]):.4g}', flush=True)
+    best = sc.argmax(dim=1)                                    # (Bo,)
+    picks = {}
+    for i, bo in enumerate(open_idx.tolist()):
+        if not bool(torch.isfinite(sc[i, best[i]])):
+            continue
+        ci = int(top_i[i, best[i]])
+        picks[bo] = (edges[int(edge_of[ci])], int(j_of[ci]))
+    return picks
+
+
 def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                    device='cpu', batch=256, beta_iters=None, onnx_path=None,
                    attack_every=16, root_inter=None, bound='crown',
-                   warm_alphas=None, log=lambda m: None):
+                   warm_alphas=None, root_alphas=None,
+                   log=lambda m: None):
     """ReLU-phase splitting BaB (no-reforward): intermediates stay ROOT
     bounds; each domain carries sign clamps, and the bound comes from
     alpha+beta CROWN under those clamps (v1 _crown_bab_noreforward / abcrown
@@ -971,7 +1077,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter,
                                                   clamps, iters=beta_iters,
                                                   thresholds=-bias,
-                                                  range_clamps=range_clamps)
+                                                  range_clamps=range_clamps,
+                                                  init_alpha=root_alphas)
                 lbq = torch.maximum(lbq, lb_ab)
         except (torch.cuda.OutOfMemoryError,
                 torch.AcceleratorError):
@@ -1061,6 +1168,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     best_edge[bi] = nm
                     best_kind[bi] = kind
 
+            relu_maps = {}
             for nm in (() if skip_babsr else relu_edges):
                 l, h = inter[nm]
                 cl = clamps.get(nm)
@@ -1071,9 +1179,11 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     continue
                 intercept = (-h * l / (h - l).clamp_min(1e-30)).clamp_min(0.0)
                 a = adj.get(nm)
-                consider(nm, (a.abs().amax(dim=1) if a is not None
-                              else torch.ones_like(l)) * intercept * unstable,
-                         'sign')
+                sc_nm = (a.abs().amax(dim=1) if a is not None
+                         else torch.ones_like(l)) * intercept * unstable
+                if bound != 'zono':
+                    relu_maps[nm] = sc_nm
+                consider(nm, sc_nm, 'sign')
             from .relax import REL
             for nm in (() if skip_babsr else smooth_edges):
                 l, h = inter[nm]
@@ -1083,6 +1193,21 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 consider(nm, (a.abs().amax(dim=1) if a is not None
                               else torch.ones_like(l)) * delta,
                          'range', mid=(l + h) / 2)
+            if bound != 'zono' and relu_maps:
+                try:
+                    picks = _kfsb_pick(net, W, bias, lo1, hi1, inter,
+                                       clamps, range_clamps, relu_maps,
+                                       torch.nonzero(open_mask,
+                                                     as_tuple=False)
+                                       .flatten(), lbq, dev,
+                                       root_alphas=root_alphas)
+                    for bo, (nm, j) in picks.items():
+                        best_edge[bo] = nm
+                        best_j[bo] = j
+                        best_kind[bo] = 'sign'
+                except torch.cuda.OutOfMemoryError:
+                    # probe pass is advisory; the proxy picks stand
+                    torch.cuda.empty_cache()
             w_dom = (lbq + bias).min(dim=1).values
             for bi in torch.nonzero(open_mask, as_tuple=False).flatten().tolist():
                 if best_edge[bi] is None:

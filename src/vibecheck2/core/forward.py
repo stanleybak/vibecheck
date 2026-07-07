@@ -844,6 +844,7 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         return z.c @ W.T - torch.matmul(W, z.G).abs().sum(-1)
 
     best = margins(None).detach()
+    raw0 = best
     if known is not None:
         # the pipeline's already-proven bound (crown chain). Seeding best
         # with it makes the stall rule DOMINANCE-aware: progress counts
@@ -879,6 +880,24 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         for i, d in enumerate(disj_idx.tolist()):
             groups.setdefault(d, []).append(i)
         gidx = [torch.tensor(v, device=lo.device) for v in groups.values()]
+    def _worst_open(bnd):
+        if gidx is not None:
+            return float(torch.stack([(bnd[0][g] - thr[g]).max()
+                                      for g in gidx]).min())
+        return float((bnd - thr.unsqueeze(0)).min())
+
+    if known is not None:
+        # start-ratio gate: when the DEFAULT-band zono starts an order
+        # of magnitude further from closing than the bound already in
+        # hand, the frame does not overtake within any observed budget
+        # (vit: raw -0.38 vs crown -0.029, 13x, optimum -0.043 still
+        # dominated after 55s; ml4acopf p3: raw -12 vs crown -9, 1.3x,
+        # overtakes and closes). 3x splits those regimes.
+        kw_ = _worst_open(known.to(best.dtype).expand_as(best))
+        rw_ = _worst_open(raw0)
+        if kw_ < 0 and rw_ < 0 and -rw_ > 3.0 * -kw_:
+            return (best, None) if return_alphas else best
+
     stall = 0
     best_alphas = None
     best_obj = -torch.inf
