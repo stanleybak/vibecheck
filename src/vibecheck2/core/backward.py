@@ -622,7 +622,7 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
 def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                      thresholds=None, budget=None, share_q=None,
                      range_clamps=None, init_alpha=None, init_beta=None,
-                     return_beta=False, return_alpha=False):
+                     return_beta=False, return_alpha=False, lr_beta=None):
     """Jointly Adam-optimized alpha (relaxation slopes) + beta (split
     multipliers) lower bounds for a batch of BaB domains under sign clamps.
     Every iterate is a sound bound (beta projected to >= 0); returns the
@@ -695,7 +695,17 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
         extras = ([{}] if return_beta else []) \
             + ([{}] if return_alpha else [])
         return (lb0_, *extras) if extras else lb0_
-    opt = torch.optim.Adam(params, lr=lr)
+    # split learning rates (ab-crown's beta-crown defaults: lr_alpha
+    # 0.01, lr_beta 0.1): betas grow FROM ZERO and need large steps;
+    # warm alphas need small refining ones. A single shared lr measured
+    # both failure modes (vit: lr 0.1 thrashed transferred alphas;
+    # yolo: beta contributions ~0 at small lrs).
+    if lr_beta is None or not beta:
+        opt = torch.optim.Adam(params, lr=lr)
+    else:
+        opt = torch.optim.Adam([
+            {'params': list(alpha.values()), 'lr': lr},
+            {'params': list(beta.values()), 'lr': lr_beta}])
     thr = (torch.zeros(q, device=dev, dtype=dt) if thresholds is None
            else thresholds.to(dev, dt))
     best = None

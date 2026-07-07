@@ -921,10 +921,14 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     if beta_iters is None:
         # each beta iteration is a full backward pass; on a 460k-neuron
         # conv net 12 iterations make ONE round cost ~40s (bounded=0 at
-        # the halt). Scale effort to the net so rounds complete.
+        # the halt). Scale effort to the net so rounds complete -- but
+        # 4 iterations optimizes NOTHING (TinyYOLO: alpha/beta both
+        # flat while ab runs 20 iters at batch 128 and closes in 38s);
+        # the middle tier takes 12.
         n_nl = sum(net.ops[nm].n for nm in net.order
                    if net.ops[nm].kind == 'nonlin')
-        beta_iters = 12 if n_nl <= 50_000 else 4
+        beta_iters = (20 if n_nl <= 50_000
+                      else 12 if n_nl <= 1_000_000 else 4)
 
     if root_inter is None:
         root_inter = backward.intermediates(net, lo1, hi1)
@@ -1148,7 +1152,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                 a16, device=dev, dtype=torch.float32)
                 lb_ab, beta_out, alpha_out = backward.alpha_beta_crown(
                     net, blo, bhi, W, inter, clamps, iters=beta_iters,
-                    lr=beta_lr,
+                    lr=beta_lr, lr_beta=0.1,
                     thresholds=-bias, range_clamps=range_clamps,
                     init_alpha=(ib_alpha if ib_alpha is not None
                                 else root_alphas),
