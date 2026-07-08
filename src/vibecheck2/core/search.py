@@ -1286,11 +1286,17 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                          'range', mid=(l + h) / 2)
             if bound != 'zono' and relu_maps:
                 try:
+                    op_idx = torch.nonzero(open_mask,
+                                           as_tuple=False).flatten()
+                    if op_idx.numel() > 64:
+                        # probe only the WORST 64 open domains (they
+                        # drive the tree; the rest keep the proxy pick):
+                        # the probe was ~half the round cost at B=256
+                        wq = (lbq + bias).min(dim=1).values[op_idx]
+                        op_idx = op_idx[wq.argsort()[:64]]
                     picks = _kfsb_pick(net, W, bias, lo1, hi1, inter,
                                        clamps, range_clamps, relu_maps,
-                                       torch.nonzero(open_mask,
-                                                     as_tuple=False)
-                                       .flatten(), lbq, dev,
+                                       op_idx, lbq, dev,
                                        root_alphas=root_alphas)
                     for bo, (nm, j) in picks.items():
                         best_edge[bo] = nm
