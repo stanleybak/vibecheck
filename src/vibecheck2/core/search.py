@@ -1154,8 +1154,18 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                         (1, qd_s, net.ops[nm].n), 0.5)
                                 ib_alpha[nm] = base.to(dev).float() \
                                     .expand(B, -1, -1).contiguous()
-                            ib_alpha[nm][bi] = torch.as_tensor(
-                                a16, device=dev, dtype=torch.float32)
+                            a_t = torch.as_tensor(a16, device=dev,
+                                                  dtype=torch.float32)
+                            qd_b = ib_alpha[nm].shape[1]
+                            if a_t.shape[0] != qd_b:
+                                # share_q flips with batch size, so
+                                # stored qd differs ACROSS generations
+                                # (sb048 crashed on a 12-vs-1 mix);
+                                # mean-reduce/broadcast -- any [0,1]
+                                # init is sound
+                                a_t = a_t.mean(dim=0, keepdim=True) \
+                                    .expand(qd_b, -1)
+                            ib_alpha[nm][bi] = a_t
                 lb_ab, beta_out, alpha_out = backward.alpha_beta_crown(
                     net, blo, bhi, W, inter, clamps, iters=beta_iters,
                     lr=beta_lr,
