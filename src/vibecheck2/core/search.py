@@ -793,7 +793,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
 def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
                relu_maps, open_idx, lbq, dev, root_alphas=None,
-               k=8, chunk=256):
+               dom_alphas=None, k=8, chunk=256):
     """kFSB branching (ab-crown's default, its vit 2157 trace: 786 domains
     visited, frontier 51->29->9->2->0, ~half of each round spent in
     `decision`): the BaBSR proxy NOMINATES the top-k relu candidates per
@@ -859,14 +859,29 @@ def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
               for k2, v in (range_clamps or {}).items()}
         lo_r = lo1.expand(r.numel(), -1)
         hi_r = hi1.expand(r.numel(), -1)
-        # probe with the ROOT's optimized alphas: the plain-planes probe
-        # measured every child at the parent floor (all candidates tied,
-        # argmax degenerated to the proxy pick and the tree was
-        # bit-identical); the candidates only separate at a bound
-        # quality near the root's
-        al = (None if root_alphas is None else
-              {nm: a.expand(r.numel(), *a.shape[1:])
-               for nm, a in root_alphas.items()})
+        # probe with the batch's DOMAIN alphas when available (each
+        # parent's optimized state, gathered per child row -- strictly
+        # better probe context than the root's), else the root alphas.
+        # A plain-planes probe measured every child at the parent floor
+        # (all candidates tied); candidates only separate at a bound
+        # quality near the domain's.
+        if dom_alphas:
+            q_w = W.shape[0]
+            al = {}
+            for nm, a in dom_alphas.items():
+                if a.dim() != 3:
+                    continue             # relu alphas only (4-dim
+                    # S-shaped entries need their own expand shape)
+                a_r = a.detach()[r]
+                if a_r.shape[1] != q_w:
+                    a_r = a_r.mean(dim=1, keepdim=True) \
+                        .expand(-1, q_w, -1)
+                al[nm] = a_r
+        elif root_alphas is not None:
+            al = {nm: a.expand(r.numel(), *a.shape[1:])
+                  for nm, a in root_alphas.items()}
+        else:
+            al = None
         lb_c = bwd.crown(net, lo_r, hi_r, W, ic, al, clamps=cc,
                          range_clamps=rc)
         # NO parent floor here: the floor is a sound BOUND but it masks
@@ -1307,7 +1322,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     picks = _kfsb_pick(net, W, bias, lo1, hi1, inter,
                                        clamps, range_clamps, relu_maps,
                                        op_idx, lbq, dev,
-                                       root_alphas=root_alphas)
+                                       root_alphas=root_alphas,
+                                       dom_alphas=(alpha_out or None))
                     for bo, (nm, j) in picks.items():
                         best_edge[bo] = nm
                         best_j[bo] = j
