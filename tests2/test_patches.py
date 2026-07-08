@@ -122,3 +122,34 @@ def test_patch_refine_parity_conv_relu_conv():
         float((lb_p - lb_d).abs().max())
     assert torch.allclose(ub_p, ub_d, atol=1e-4), \
         float((ub_p - ub_d).abs().max())
+
+
+def test_peel_output_softmax():
+    """Terminal softmax peels for pure-difference rows; stays for
+    threshold rows (bias)."""
+    from vibecheck2.core.graph import Net, Op
+    from vibecheck2.verify import _peel_output_softmax
+    from vibecheck2.frontend.spec import (VNNSpec, Conjunct, Constraint,
+                                          PairwiseConstraint)
+
+    kern = RNG.standard_normal((4, 3)).astype(np.float32)
+    from vibecheck2.core.linmap import Dense
+    lmA = Dense(kern, None)
+    ops = {
+        'x': Op('x', 'input', (), (3,), 3),
+        'z': Op('z', 'linmap', ('x',), (4,), 4, lm=lmA),
+        'y': Op('y', 'nonlin', ('z',), (4,), 4, fn='softmax',
+                params={'pre': 1, 'k': 4, 'post': 1, 'out_lo': 0.0,
+                        'out_hi': 1.0, 'softmax_axis_len': 4,
+                        'softmax_post': 1}),
+    }
+    net = Net(ops, ['z', 'y'], 'x', 'y')
+    spec = VNNSpec(np.zeros(3), np.ones(3),
+                   [Conjunct([PairwiseConstraint(pred=0, comp=2)])])
+    net2 = _peel_output_softmax(net, spec, lambda m: None)
+    assert net2.output_name == 'z'
+    spec_b = VNNSpec(np.zeros(3), np.ones(3),
+                     [Conjunct([Constraint(index=1, op='>=',
+                                           value=0.5)])])
+    net3 = _peel_output_softmax(net, spec_b, lambda m: None)
+    assert net3.output_name == 'y'

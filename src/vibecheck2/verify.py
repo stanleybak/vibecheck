@@ -22,6 +22,40 @@ from .core import backward, forward
 from .core.graph import load as load_net
 
 
+def _peel_output_softmax(net, spec, log):
+    """Drop a terminal softmax when every spec row is a pure difference
+    (one +1, one -1, zero bias): softmax is strictly monotone per row, so
+    softmax(z)_i - softmax(z)_j and z_i - z_j have the same sign and the
+    property is EQUIVALENT on the logits (ab-crown's
+    peel_off_last_softmax_layer). Measured need (traffic idx_10645, an
+    OFFICIAL-ab sat row): the saturated softmax pins pgd at margin +1.0
+    with zero gradient, and interval/crown explode to 1e30 through it.
+    Returns the (possibly) rewritten net."""
+    out_op = net.ops.get(net.output_name)
+    if out_op is None or out_op.kind != 'nonlin' or out_op.fn != 'softmax':
+        return net
+    n_out = out_op.n
+    try:
+        rows = spec.as_linear_queries(n_out)
+    except Exception:                # noqa: BLE001 -- conservatively skip
+        return net
+    for _, w, bias in rows:
+        wv = np.asarray(w)
+        nz = wv[wv != 0]
+        if abs(float(bias)) > 0 or len(nz) != 2 \
+                or sorted(nz.tolist()) != [-1.0, 1.0]:
+            return net
+    pre = out_op.inputs[0]
+    order = [nm for nm in net.order if nm != net.output_name]
+    ops = {nm: op for nm, op in net.ops.items() if nm != net.output_name}
+    from .core.graph import Net as _Net
+    net2 = _Net(ops, order, net.input_name, pre,
+                onnx_path=getattr(net, 'onnx_path', None))
+    log('[vc2] terminal softmax peeled (pure-difference spec rows: the '
+        'property is equivalent on the logits)')
+    return net2
+
+
 def _spec_queries(spec, n_out, dtype=torch.float32):
     """(W (q, n_out), bias (q,), disj_idx (q,)) from the v1 VNNSpec."""
     rows = spec.as_linear_queries(n_out)
@@ -116,6 +150,7 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
         log(f'[vc2] spec not supported: {e}; verdict unknown')
         return 'unknown', {'reason': f'not_implemented: {e}',
                            'time': time.time() - t0}
+    net = _peel_output_softmax(net, spec, log)
     log(f'[vc2] {net}')
 
     groups = _subbox_groups(spec)
