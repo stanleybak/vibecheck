@@ -111,7 +111,7 @@ def _log_flush(m):
 
 
 def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
-           alpha_iters=20, pgd_budget=5.0, log=_log_flush):
+           alpha_iters=20, pgd_budget=5.0, net_cache=None, log=_log_flush):
     """Returns (verdict, details); details carries 'witness' for 'sat'.
 
     Disjuncts carrying their own input subboxes (acasxu prop_6) decompose
@@ -120,7 +120,17 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     from .frontend.vnnlib_loader import load_vnnlib
     t0 = time.time()
     try:
-        net = load_net(onnx_path)
+        if net_cache and os.path.exists(net_cache):
+            # VNNCOMP prepare-stage cache: the conversion ran once in
+            # prepare; the timed run deserializes (mscn_2048d measured
+            # 5.7s of onnx load against a 20s budget)
+            net = torch.load(net_cache, weights_only=False)
+        else:
+            net = load_net(onnx_path)
+            if net_cache:
+                tmp_c = net_cache + '.tmp'
+                torch.save(net, tmp_c)
+                os.replace(tmp_c, net_cache)
     except Exception as e:                    # noqa: BLE001 - see re-raise
         # a net the graph loader cannot model: try the discrete-grid
         # handler (cctsdb); if the instance is not discrete either,
@@ -862,6 +872,9 @@ def main(argv=None):
     p.add_argument('--ce-tol', type=float, default=1e-4,
                    help='within-tolerance CE DETECTION band (flag-only; '
                         'verdicts always require strict violation)')
+    p.add_argument('--net-cache', default=None,
+                   help='converted-net cache path: load when present, '
+                        'else convert and save (VNNCOMP prepare stage)')
     a = p.parse_args(argv)
     from .core import attack as _atk
     _atk.CE_TOL = a.ce_tol
@@ -889,7 +902,8 @@ def main(argv=None):
         with open(a.results_file, 'w') as f:
             f.write('timeout\n')
     try:
-        verdict, details = verify(a.net, a.spec, a.timeout, a.device)
+        verdict, details = verify(a.net, a.spec, a.timeout, a.device,
+                                  net_cache=a.net_cache)
     except BaseException as e:                # crash -> 'error' (v1 discipline)
         import traceback
         traceback.print_exc()
