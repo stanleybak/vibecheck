@@ -1324,6 +1324,13 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     # probe pass is advisory; the proxy picks stand
                     torch.cuda.empty_cache()
             w_dom = (lbq + bias).min(dim=1).values
+            if os.environ.get('VC2_DEBUG_CLIP') and rounds <= 8:
+                _sd = [f'({best_edge[bi]},{int(best_j[bi])},'
+                       f'{best_kind[bi]})'
+                       for bi in torch.nonzero(open_mask, as_tuple=False)
+                       .flatten().tolist()[:6] if best_edge[bi]]
+                log(f'[vc2/rbab] round={rounds} splits: '
+                    + ' '.join(_sd))
             for bi in torch.nonzero(open_mask, as_tuple=False).flatten().tolist():
                 if best_edge[bi] is None:
                     # no unstable relu left: relaxation exact -> the domain

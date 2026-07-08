@@ -848,6 +848,7 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
             # from the BACKWARD builder (v1 reverse_g port): no forward
             # zonotope, unstable rows only, LinMap-generic.
             if r not in state_cache:
+                _tb = time.time()
                 try:
                     state_cache[r] = _state_for(
                         net, lo, hi, inter,
@@ -868,6 +869,10 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                     log(f'[vc2/dual] state unsupported for row {r} '
                         f'({type(e).__name__}: {str(e)[:60]}); skipping')
                     state_cache[r] = ({}, [])
+                else:
+                    log(f'[vc2/dual] state for row {r} built in '
+                        f'{time.time() - _tb:.1f}s '
+                        f'({len(state_cache[r][1])} keys)')
             state, keys = state_cache[r]
             if not keys:
                 continue
