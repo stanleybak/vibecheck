@@ -186,3 +186,25 @@ def test_lattice_flip_search_sign_net():
                                          topk=3)
     assert fm <= 0, fm
     assert bool((fx >= 3).all())
+
+
+def test_point_taps_capture_sign_inputs():
+    import torch
+    from vibecheck2.core.graph import Net, Op
+    from vibecheck2.core import forward as fwd
+    from vibecheck2.core.linmap import ScaleShift, Dense
+    n = 3
+    sh = ScaleShift(None, np.full(n, -2.5, dtype=np.float32), n)
+    agg = Dense(np.ones((1, n), dtype=np.float32), None)
+    ops = {'x': Op('x', 'input', (), (n,), n),
+           'c': Op('c', 'linmap', ('x',), (n,), n, lm=sh),
+           's': Op('s', 'nonlin', ('c',), (n,), n, fn='sign', params={}),
+           'y': Op('y', 'linmap', ('s',), (1,), 1, lm=agg)}
+    net = Net(ops, ['c', 's', 'y'], 'x', 'y')
+    x = torch.tensor([[1.0, 3.0, 4.0]], requires_grad=True)
+    taps = {'s': None}
+    _ = fwd.point(net, x, taps=taps)
+    assert torch.allclose(taps['s'], x - 2.5)
+    # differentiable through the tap (the attractor loss needs this)
+    g = torch.autograd.grad(taps['s'].abs().sum(), x)[0]
+    assert g is not None and bool((g.abs() > 0).any())

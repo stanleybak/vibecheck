@@ -61,10 +61,14 @@ def _maxpool_point(op, x):
     return y.reshape(B, -1)
 
 
-def point(net, x: torch.Tensor) -> torch.Tensor:
+def point(net, x: torch.Tensor, taps=None) -> torch.Tensor:
     """Exact forward evaluation, (B, n_in) -> (B, n_out). Edges free as
     their last consumer runs (a 640x640 YOLO batch would otherwise hold
-    all ~180 edges live)."""
+    all ~180 edges live).
+
+    taps: optional dict whose KEYS name nonlin ops; on return each maps
+    to that op's live input tensor (graph-connected, so callers can
+    differentiate through it -- the sign-boundary attack loss)."""
     x = _as2d(x)
     state = {net.input_name: x}
     remaining = {e: len(c) for e, c in net.consumers().items()}
@@ -73,6 +77,8 @@ def point(net, x: torch.Tensor) -> torch.Tensor:
         if op.kind == 'linmap':
             state[name] = op.lm.point(state[op.inputs[0]])
         elif op.kind == 'nonlin':
+            if taps is not None and name in taps:
+                taps[name] = state[op.inputs[0]]
             state[name] = REL[op.fn].point(state[op.inputs[0]], op.params)
         elif op.kind == 'add':
             state[name] = state[op.inputs[0]] + state[op.inputs[1]]

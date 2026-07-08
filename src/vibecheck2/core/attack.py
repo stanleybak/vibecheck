@@ -144,8 +144,11 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
     target = torch.arange(x.shape[0], device=dev) % max(D, 1)
     since_improve = 0
     it = 0
+    sign_ops = [nm for nm in net.order
+                if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'sign']
     for it in range(iters):
-        y = forward.point(net, x)
+        taps = {nm: None for nm in sign_ops} if sign_ops else None
+        y = forward.point(net, x, taps=taps)
         m = margins(y)                                # (R, D)
         overall = m.min(dim=1).values                 # (R,)
         overall = torch.nan_to_num(overall, nan=float('inf'))
@@ -157,6 +160,19 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         if (best_m < 0).any():         # VNNLIB constraints are NON-strict:
             break                      # equality satisfies (sat_relu Y_1<=0)
         loss = m.gather(1, target.unsqueeze(1)).clamp(min=-0.05).sum()
+        if sign_ops:
+            # sign-boundary ATTRACTOR (ab custom_pgd_loss
+            # customized_gtrsb_loss): reward pre-sign activations near
+            # their boundary so the STE always has live crossings --
+            # without it the margin landscape is a flat staircase (the
+            # continuous stage plateaued at +16 and the discrete flips
+            # found nothing). Skip the first sign layer (ab does: its
+            # input carries no accumulated error).
+            att = 0.0
+            for nm in sign_ops[1:]:
+                z = taps[nm]
+                att = att + torch.clamp(1e-4 - z.abs(), min=0).mean()
+            loss = loss - att / (10 * 1e-4)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
