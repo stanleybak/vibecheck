@@ -900,13 +900,20 @@ def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
                   f'{int(j_of[ci])}) children '
                   f'{float(mm[0, c, 0]):+.4f}/{float(mm[0, c, 1]):+.4f} '
                   f'proxy={float(top_v[0, c]):.4g}', flush=True)
-    best = sc.argmax(dim=1)                                    # (Bo,)
+    ordr = sc.argsort(dim=1, descending=True)                 # (Bo, k)
     picks = {}
     for i, bo in enumerate(open_idx.tolist()):
-        if not bool(torch.isfinite(sc[i, best[i]])):
-            continue
-        ci = int(top_i[i, best[i]])
-        picks[bo] = (edges[int(edge_of[ci])], int(j_of[ci]))
+        row = []
+        for rk in range(min(2, ordr.shape[1])):
+            c = int(ordr[i, rk])
+            if not bool(torch.isfinite(sc[i, c])):
+                break
+            ci = int(top_i[i, c])
+            cand2 = (edges[int(edge_of[ci])], int(j_of[ci]))
+            if cand2 not in row:
+                row.append(cand2)
+        if row:
+            picks[bo] = row                # [best, (second)]
     return picks
 
 
@@ -1309,6 +1316,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 consider(nm, (a.abs().amax(dim=1) if a is not None
                               else torch.ones_like(l)) * delta,
                          'range', mid=(l + h) / 2)
+            second_pick = {}
             if bound != 'zono' and relu_maps:
                 try:
                     op_idx = torch.nonzero(open_mask,
@@ -1324,10 +1332,12 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                        op_idx, lbq, dev,
                                        root_alphas=root_alphas,
                                        dom_alphas=(alpha_out or None))
-                    for bo, (nm, j) in picks.items():
-                        best_edge[bo] = nm
-                        best_j[bo] = j
+                    for bo, cands in picks.items():
+                        best_edge[bo] = cands[0][0]
+                        best_j[bo] = cands[0][1]
                         best_kind[bo] = 'sign'
+                        if len(cands) > 1:
+                            second_pick[bo] = cands[1]
                 except torch.cuda.OutOfMemoryError:
                     # probe pass is advisory; the proxy picks stand
                     torch.cuda.empty_cache()
@@ -1358,6 +1368,26 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                          # (B, qd, 2, n) S-shaped entries would need
                          # their own base shape in the batch rebuild
                          if alpha_out else None)
+                # DEEP SPLIT while the frontier underfills the batch:
+                # ab splits 2-3 levels per pickout in its first rounds
+                # (8 domains after round 1); our 1-level opening burned
+                # ~5 rounds bounding 1/2/4/8/16 domains at full round
+                # cost. Both split constraints are sound simultaneously
+                # (independent neurons).
+                deep = second_pick.get(bi)
+                if deep is not None and best_kind[bi] == 'sign' \
+                        and len(heap) + 2 * int(open_mask.sum()) < batch:
+                    for ch in children:
+                        for ch2 in (1, -1):
+                            heapq.heappush(
+                                heap,
+                                (float(w_dom[bi]), tick,
+                                 base + ((best_edge[bi],
+                                          int(best_j[bi]), ch),
+                                         (deep[0], deep[1], ch2)),
+                                 fl_ch, bd_ch, ad_ch))
+                            tick += 1
+                    continue
                 for ch in children:
                     heapq.heappush(heap, (float(w_dom[bi]), tick,
                                           base + ((best_edge[bi],
