@@ -386,9 +386,18 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     except OutOfTime:
         return 'timeout', {'time': time.time() - t0}
     lb0 = backward.crown(net, lo, hi, W, inter)[0]
-    verdict, open_d = _verdict_from_lbs(lb0 + b, di, len(spec.disjuncts))
-    log(f'[vc2] crown: worst={float((lb0 + b).min()):.4f} '
-        f'open={len(open_d)}/{len(spec.disjuncts)}')
+    verdict, open_d = None, []
+
+    def _phase(tag, lbv):
+        """Uniform phase epilogue: verdict from the running bound + the
+        one-line log every phase used to hand-roll."""
+        nonlocal verdict, open_d
+        verdict, open_d = _verdict_from_lbs(lbv + b, di,
+                                            len(spec.disjuncts))
+        log(f'[vc2] {tag}: worst={float((lbv + b).min()):.4f} '
+            f'open={len(open_d)}/{len(spec.disjuncts)}')
+
+    _phase('crown', lb0)
     # route by the number of WIDE input dims, not the raw input size:
     # dist_shift is 792-dim with only 8 non-degenerate dims (v1 config
     # split up to 800 dims for exactly this reason). Wide-route instances
@@ -411,18 +420,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         except OutOfTime:
             return 'timeout', {'time': time.time() - t0}
         lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
-        verdict, open_d = _verdict_from_lbs(lb0 + b, di,
-                                            len(spec.disjuncts))
-        log(f'[vc2] crown-inter: worst={float((lb0 + b).min()):.4f} '
-            f'open={len(open_d)}/{len(spec.disjuncts)}')
+        _phase('crown-inter', lb0)
     if verdict != 'unsat' and alpha_iters > 0:
         lb = backward.alpha_crown(net, lo, hi, W, inter,
                                   iters=alpha_iters, thresholds=-b,
                                   budget=budget)[0]
         lb = torch.maximum(lb, lb0)
-        verdict, open_d = _verdict_from_lbs(lb + b, di, len(spec.disjuncts))
-        log(f'[vc2] alpha-crown: worst={float((lb + b).min()):.4f} '
-            f'open={len(open_d)}/{len(spec.disjuncts)}')
+        _phase('alpha-crown', lb)
         worst = float((lb + b).min())
         n_nonlin = sum(net.ops[nm].n for nm in net.order
                        if net.ops[nm].kind == 'nonlin')
@@ -539,10 +543,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                         budget=budget)[0]
             lb = torch.maximum(lb, lb_j)
             lb0 = torch.maximum(lb0, lb)
-            verdict, open_d = _verdict_from_lbs(lb + b, di,
-                                                len(spec.disjuncts))
-            log(f'[vc2] joint-inter alpha: worst={float((lb + b).min()):.4f} '
-                f'open={len(open_d)}/{len(spec.disjuncts)}')
+            _phase('joint-inter alpha', lb)
             worst = float((lb + b).min())
         if verdict != 'unsat' and -5.0 < worst <= 0 and budget.remaining() > 20:
             # near-zero gap: a longer, lower-lr polish often closes it
@@ -560,10 +561,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                                     budget=budget,
                                                     return_alpha=True)
             lb = torch.maximum(lb, lb2[0])
-            verdict, open_d = _verdict_from_lbs(lb + b, di,
-                                                len(spec.disjuncts))
-            log(f'[vc2] alpha-polish: worst={float((lb + b).min()):.4f} '
-                f'open={len(open_d)}/{len(spec.disjuncts)}')
+            _phase('alpha-polish', lb)
     if verdict != 'unsat' and budget.remaining() > 15 \
             and any((op.kind == 'nonlin' and op.fn != 'relu')
                     or op.kind == 'mul' for op in net.ops.values()):
@@ -685,10 +683,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                         iters=alpha_iters, thresholds=-b,
                                         budget=budget)[0]
             lb0 = torch.maximum(lb0, lb_l)
-            verdict, open_d = _verdict_from_lbs(lb0 + b, di,
-                                                len(spec.disjuncts))
-            log(f'[vc2] zono-lift: worst={float((lb0 + b).min()):.4f} '
-                f'open={len(open_d)}/{len(spec.disjuncts)}')
+            _phase('zono-lift', lb0)
             worst_l = float((lb0 + b).min())
             if verdict != 'unsat' and -1.0 < worst_l <= 0 \
                     and budget.remaining() > 20:
@@ -701,10 +696,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                            lr=0.1, thresholds=-b,
                                            budget=budget)[0]
                 lb0 = torch.maximum(lb0, lb2)
-                verdict, open_d = _verdict_from_lbs(lb0 + b, di,
-                                                    len(spec.disjuncts))
-                log(f'[vc2] lift-polish: worst={float((lb0 + b).min()):.4f} '
-                    f'open={len(open_d)}/{len(spec.disjuncts)}')
+                _phase('lift-polish', lb0)
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
     if verdict != 'unsat' and budget.remaining() > 5:
@@ -769,10 +761,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                     iters=max(alpha_iters, 45),
                                     thresholds=-b, budget=budget)[0]
         lb0 = torch.maximum(lb0, lb_s)
-        verdict, open_d = _verdict_from_lbs(lb0 + b, di,
-                                            len(spec.disjuncts))
-        log(f'[vc2] stabilize: worst={float((lb0 + b).min()):.4f} '
-            f'open={len(open_d)}/{len(spec.disjuncts)}')
+        _phase('stabilize', lb0)
     if verdict != 'unsat' and budget.remaining() > 3:
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
