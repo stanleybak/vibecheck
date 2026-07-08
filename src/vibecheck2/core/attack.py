@@ -298,6 +298,27 @@ def validate(onnx_path, spec, witness, log=lambda m: None):
                                      atol=1e-4, out_atol=0.0)
     if ok:
         return ok, info
+    # LATTICE FINISHER (ab gtrsb adv_example_finalizer): quantized nets
+    # (sign ops) change output only when an input crosses a lattice
+    # point, so a near-miss candidate often becomes a strict CE after
+    # snapping to the integer pixel grid. Only tried when the input box
+    # is integer-scaled (span >= 2 and integer bounds), and the snapped
+    # point is re-validated by the SAME exact chokepoint -- soundness
+    # unchanged, this only proposes a different candidate.
+    x_lo = np.asarray(spec.x_lo, dtype=np.float64)
+    x_hi = np.asarray(spec.x_hi, dtype=np.float64)
+    if (np.all(x_hi - x_lo >= 0)
+            and float((x_hi - x_lo).max()) >= 2.0
+            and np.allclose(x_lo, np.round(x_lo))
+            and np.allclose(x_hi, np.round(x_hi))):
+        snapped = np.clip(np.round(np.asarray(witness, dtype=np.float64)),
+                          x_lo, x_hi)
+        if not np.allclose(snapped, np.asarray(witness, dtype=np.float64)):
+            ok_s, info_s = _validate_sat_witness(onnx_path, spec, snapped,
+                                                 atol=1e-4, out_atol=0.0)
+            if ok_s:
+                log('[vc2] lattice-snapped candidate validated strictly')
+                return ok_s, info_s
     if CE_TOL > 0:
         ok_tol, info_tol = _validate_sat_witness(onnx_path, spec, witness,
                                                  atol=1e-4, out_atol=CE_TOL)
