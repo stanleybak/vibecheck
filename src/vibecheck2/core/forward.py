@@ -842,7 +842,7 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
 def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
                budget=None, patience=40, clamp_bounds=None, disj_idx=None,
                return_alphas=False, known=None, init_alphas=None,
-               abort_on_gain=False):
+               abort_on_gain=False, probe_patience=12):
     """Adam-optimized band slopes over the forward zonotope (v1's nl_alpha,
     verify_graph.py _nonlinear_alpha_opt).
 
@@ -973,7 +973,13 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         gap = float((-ob).clamp_min(0.0))
         stall = 0 if gap < prev_gap * (1.0 - 1e-3) else stall + 1
         prev_gap = min(prev_gap, gap)
-        if stall > patience:
+        # a PROBE that has never led (abort_on_gain set, gain never
+        # fired) needs only enough iters to be confident it is
+        # dominated: on gain-y nets the abort fires within the first
+        # few iters (ml4acopf: iter 1-2), so a short patience only
+        # trims the dominated case (vit route: 41 iters/14s -> ~4s)
+        pat = probe_patience if abort_on_gain else patience
+        if stall > pat:
             break
         if gidx is not None:
             m = lb[0] - thr             # margins past threshold, worst first

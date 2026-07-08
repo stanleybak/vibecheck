@@ -727,12 +727,14 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # at 25s), while the crown BaB bounds ~140 domains/s and is the
         # engine that officially closes this class -- every dual second
         # past the instant-kill window is stolen from the closer.
+        # (12 -> 8: the kills cost ~6.5s state build + <1s search; the
+        # extra 4s only ever fed diverging frontiers.)
         has_mixed = any((op.kind == 'nonlin' and op.fn != 'relu')
                         or op.kind in ('mul', 'bmm')
                         for op in net.ops.values())
         crown_bab_route = (len(open_d) <= 2 and has_mixed
                            and not fz_gain)
-        dual_slice = (min(12.0, 0.3 * budget.remaining())
+        dual_slice = (min(8.0, 0.3 * budget.remaining())
                       if crown_bab_route else 0.55 * budget.remaining())
         refuted = certify_queries(
             net, spec, W, b, di, lo, hi, inter, open_d,
