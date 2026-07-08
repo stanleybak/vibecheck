@@ -1158,7 +1158,13 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                 a16, device=dev, dtype=torch.float32)
                 lb_ab, beta_out, alpha_out = backward.alpha_beta_crown(
                     net, blo, bhi, W, inter, clamps, iters=beta_iters,
-                    lr=beta_lr, lr_beta=0.1,
+                    lr=beta_lr,
+                    # WARM state refines at the small lr; big steps are
+                    # only for cold-from-zero betas (yolo). Inherited
+                    # betas at lr 0.1 thrash exactly like inherited
+                    # alphas did (2157 replays: -0.0075 regime lost to
+                    # -0.0134 when the split-lr landed)
+                    lr_beta=(beta_lr if ib_beta else 0.1),
                     thresholds=-bias, range_clamps=range_clamps,
                     init_alpha=(ib_alpha if ib_alpha is not None
                                 else root_alphas),
