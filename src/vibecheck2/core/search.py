@@ -766,7 +766,10 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                  .cpu()])
             n_split += int(w.shape[0])
 
-            if onnx_path is not None and rounds % attack_every == 1:
+            if onnx_path is not None and (
+                    rounds % attack_every == 1
+                    or time.time() - last_atk > 8.0):
+                last_atk = time.time()
                 # attack the worst open subboxes as one batched-box PGD
                 widx = torch.argsort(w)[:64]
                 cand, _ = attack.pgd(net, spec, lo=olo[widx], hi=ohi[widx],
@@ -923,12 +926,13 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         # conv net 12 iterations make ONE round cost ~40s (bounded=0 at
         # the halt). Scale effort to the net so rounds complete -- but
         # 4 iterations optimizes NOTHING (TinyYOLO: alpha/beta both
-        # flat while ab runs 20 iters at batch 128 and closes in 38s);
-        # the middle tier takes 12.
+        # flat); the 50k-1M tier takes 12. (A 20-iter tier for small
+        # nets REGRESSED sb048: rounds 1.4x slower starved the
+        # round-interleaved CE attack -- the sat row needs round 64
+        # by t=82.)
         n_nl = sum(net.ops[nm].n for nm in net.order
                    if net.ops[nm].kind == 'nonlin')
-        beta_iters = (20 if n_nl <= 50_000
-                      else 12 if n_nl <= 1_000_000 else 4)
+        beta_iters = 12 if n_nl <= 1_000_000 else 4
 
     if root_inter is None:
         root_inter = backward.intermediates(net, lo1, hi1)
@@ -959,6 +963,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     # -0.0138 vs 30-iter -0.0094 at equal domains) and the transfer
     # buys converged-quality starts at low iteration counts
     heap = [(-float('inf'), 0, (), None, {}, None)]
+    last_atk = time.time()   # attack cadence is TIME-based too: slow
+    # bound rounds must not starve the CE hunt (sb048's hidden CE)
     tick = 1
     n_bounded = rounds = 0
     tol_witness = None
@@ -1320,7 +1326,10 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                    int(best_j[bi]), ch),),
                                           fl_ch, bd_ch, ad_ch))
                     tick += 1
-            if onnx_path is not None and rounds % attack_every == 1:
+            if onnx_path is not None and (
+                    rounds % attack_every == 1
+                    or time.time() - last_atk > 8.0):
+                last_atk = time.time()
                 # BaB-GUIDED seeds (v1 _pgd_refine): each open (domain,
                 # query)'s relaxed-bound argmin x* = mid - sign(A_in) * rad
                 # attains the CROWN lb under that domain's clamps. Hidden
