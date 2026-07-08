@@ -171,6 +171,22 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
             'time': time.time() - t0}
     log(f'[vc2/pgd] best_margin={info["best_margin"]:+.3e} '
         f'iters={info["iters"]} t={info["time"]:.2f}s')
+    if best_m[order[0]] > 0:
+        # DISCRETE stage for sign nets on integer-scaled boxes: the
+        # continuous stages above plateau far from zero there
+        has_sign = any(op.kind == 'nonlin' and op.fn == 'sign'
+                       for op in net.ops.values())
+        span = (hi - lo)
+        if has_sign and float(span.max()) >= 2.0 \
+                and bool(torch.allclose(lo, torch.round(lo))) \
+                and bool(torch.allclose(hi, torch.round(hi))):
+            xs = [best_x[i] for i in order[:4].tolist()]
+            fx, fm = _lattice_flip_search(
+                net, spec, lo[0], hi[0], xs, dev, margins,
+                time_budget=max(5.0, 0.5 * time_budget), log=log)
+            if fm < float(best_m[order[0]]) and fx is not None:
+                best_m[order[0]] = fm
+                best_x[order[0]] = fx
     if best_m[order[0]] <= 0:
         return best_x[order[0]].detach().cpu().numpy().astype(np.float64), info
     bm = float(best_m[order[0]])
@@ -281,6 +297,65 @@ def _slp_polish(net, spec, x0, lo, hi, device, iters=40, time_budget=8.0,
     # candidates only -- validate() decides; <= 1e-4 covers the official
     # within-tolerance acceptance (see validate's docstring)
     return x0 if fm <= 1e-4 else None
+
+
+def _lattice_flip_search(net, spec, lo1, hi1, x0s, dev, margins,
+                         time_budget=20.0, topk=192, log=lambda m: None):
+    """Greedy discrete descent on the integer input lattice for sign nets
+    (quantized nets change output ONLY at lattice crossings, so gradient
+    steps plateau far from zero -- traffic idx_10645 sat at +16 after the
+    softmax peel while official-ab finds the CE with its custom discrete
+    gtrsb attacker). From each start: rank pixels by the STE gradient of
+    the best disjunct margin, batch-evaluate single-pixel +/-1 flips with
+    one forward, accept the best improvement; random flip batches break
+    plateaus. Returns (x, margin) best found -- a CANDIDATE only, the
+    caller gates through validate()."""
+    from . import forward as fwd
+    t0 = time.time()
+    n = lo1.numel()
+    best_x, best_m = None, float('inf')
+    for x0 in x0s:
+        x = torch.round(x0.detach()).clamp(lo1, hi1)
+        m = float(margins(fwd.point(net, x.unsqueeze(0))).min())
+        stall = 0
+        while time.time() - t0 < time_budget and stall < 6:
+            xg = x.clone().requires_grad_(True)
+            mg = margins(fwd.point(net, xg.unsqueeze(0))).min()
+            g = torch.autograd.grad(mg, xg)[0]
+            idx = g.abs().argsort(descending=True)[:topk]
+            if stall >= 2 or not bool((g != 0).any()):
+                # diversify: the STE gradient is ZERO outside its clip
+                # band, so deep starts are blind and need random probes
+                idx = torch.randperm(n, device=x.device)[:topk]
+            # MULTI-SCALE flips per pixel: +/-1 for local crossings plus
+            # snap-to-lo / snap-to-hi for multi-step plateaus (a sign
+            # threshold can sit several lattice steps away and every
+            # intermediate value scores flat)
+            k = idx.numel()
+            cand = x.unsqueeze(0).repeat(4 * k, 1)
+            ar = torch.arange(k, device=x.device)
+            cand[ar, idx] = (cand[ar, idx] + 1).clamp(lo1[idx], hi1[idx])
+            cand[k + ar, idx] = (cand[k + ar, idx] - 1).clamp(
+                lo1[idx], hi1[idx])
+            cand[2 * k + ar, idx] = lo1[idx]
+            cand[3 * k + ar, idx] = hi1[idx]
+            mc = margins(fwd.point(net, cand)).min(dim=1).values
+            j = int(mc.argmin())
+            if float(mc[j]) < m - 1e-9:
+                m = float(mc[j])
+                x = cand[j]
+                stall = 0
+            else:
+                stall += 1
+            if m <= 0:
+                break
+        if m < best_m:
+            best_m, best_x = m, x
+        if best_m <= 0:
+            break
+    log(f'[vc2/pgd] lattice-flip: best_margin={best_m:+.3e} '
+        f't={time.time() - t0:.2f}s')
+    return best_x, best_m
 
 
 def validate(onnx_path, spec, witness, log=lambda m: None):

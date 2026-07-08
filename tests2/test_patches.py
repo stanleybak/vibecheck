@@ -153,3 +153,36 @@ def test_peel_output_softmax():
                                            value=0.5)])])
     net3 = _peel_output_softmax(net, spec_b, lambda m: None)
     assert net3.output_name == 'y'
+
+
+def test_lattice_flip_search_sign_net():
+    """The discrete stage finds a lattice CE a plateaued start misses."""
+    import torch
+    from vibecheck2.core.graph import Net, Op
+    from vibecheck2.core import attack
+    from vibecheck2.core.linmap import Dense, ScaleShift
+    from vibecheck2.frontend.spec import VNNSpec, Conjunct, Constraint
+
+    # y = sum(sign(x - 2.5)); unsafe iff y >= 3 (all three pixels >= 3)
+    n = 3
+    sh = ScaleShift(None, np.full(n, -2.5, dtype=np.float32), n)
+    agg = Dense(np.ones((1, n), dtype=np.float32), None)
+    ops = {
+        'x': Op('x', 'input', (), (n,), n),
+        'c': Op('c', 'linmap', ('x',), (n,), n, lm=sh),
+        's': Op('s', 'nonlin', ('c',), (n,), n, fn='sign', params={}),
+        'y': Op('y', 'linmap', ('s',), (1,), 1, lm=agg),
+    }
+    net = Net(ops, ['c', 's', 'y'], 'x', 'y')
+    spec = VNNSpec(np.zeros(n), np.full(n, 5.0),
+                   [Conjunct([Constraint(index=0, op='>=', value=3.0)])])
+    dev = torch.device('cpu')
+    margins = attack.spec_margins(spec, 1, dev, torch.float32)
+    lo1 = torch.zeros(n)
+    hi1 = torch.full((n,), 5.0)
+    x0 = torch.full((n,), 1.0)          # margin-flat start (all signs -1)
+    fx, fm = attack._lattice_flip_search(net, spec, lo1, hi1, [x0], dev,
+                                         margins, time_budget=10.0,
+                                         topk=3)
+    assert fm <= 0, fm
+    assert bool((fx >= 3).all())
