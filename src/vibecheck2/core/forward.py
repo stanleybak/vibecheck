@@ -306,6 +306,30 @@ def _nonmono_interval(op, xlo, xhi, flo, fhi):
     return lo_, hi_
 
 
+def _shared_prefix(sa, sb):
+    """Length of the common symbol prefix of two edges (fork ancestry:
+    branches share everything up to the divergence point)."""
+    k = 0
+    m = min(len(sa), len(sb))
+    while k < m and sa[k] == sb[k]:
+        k += 1
+    return k
+
+
+def _append_fresh(G, sym, mag, label, dev, dt):
+    """Append one diagonal generator column per element whose magnitude
+    is nonzero anywhere in the batch -- THE shared pattern for every
+    fresh-noise source (band deltas, bilinear remainders). Returns
+    (G2, sym2)."""
+    B, n = mag.shape
+    idx = torch.nonzero((mag > 0).any(dim=0), as_tuple=False).flatten()
+    if idx.numel():
+        cols = torch.zeros(B, n, idx.numel(), device=dev, dtype=dt)
+        cols[:, idx, torch.arange(idx.numel(), device=dev)] = mag[:, idx]
+        G = torch.cat([G, cols], dim=2)
+    return G, sym + [(label, int(i)) for i in idx.tolist()]
+
+
 class ZonoState:
     """Batched zonotope: c (B,n), G (B,n,g) over shared noise symbols.
 
@@ -420,9 +444,7 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
             za, zb = state[op.inputs[0]], state[op.inputs[1]]
             ga, gb = za.G.shape[2], zb.G.shape[2]
             # shared prefix of symbols is summed; distinct tails concatenate
-            k = 0
-            while k < min(ga, gb) and za.sym[k] == zb.sym[k]:
-                k += 1
+            k = _shared_prefix(za.sym, zb.sym)
             if k == ga == gb:
                 G = za.G + zb.G
                 sym = za.sym
@@ -506,16 +528,7 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 rad2 = rad2 + delta
                 state[name] = ZonoState(c2, G2, list(z.sym), rad2)
                 continue
-            # fresh symbol per element with a nonzero band ANYWHERE in batch
-            new_idx = torch.nonzero((delta > 0).any(dim=0),
-                                    as_tuple=False).flatten()
-            if new_idx.numel():
-                cols = torch.zeros(B, z.c.shape[1], new_idx.numel(),
-                                   device=dev, dtype=dt)
-                cols[:, new_idx, torch.arange(new_idx.numel(), device=dev)] = \
-                    delta[:, new_idx]
-                G2 = torch.cat([G2, cols], dim=2)
-            sym = z.sym + [(name, int(i)) for i in new_idx.tolist()]
+            G2, sym = _append_fresh(G2, list(z.sym), delta, name, dev, dt)
             state[name] = ZonoState(c2, G2, sym, rad2)
         elif op.kind == 'concat':
             z_parts = [state[s] for s in op.inputs]
@@ -624,9 +637,7 @@ def _bmm_zono(op, name, za, zb, B, dev, dt):
         Gr *= int(dd_)
     # align both factors over the union symbol list (shared prefix + tails)
     ga, gb = za.G.shape[2], zb.G.shape[2]
-    kpre = 0
-    while kpre < min(ga, gb) and za.sym[kpre] == zb.sym[kpre]:
-        kpre += 1
+    kpre = _shared_prefix(za.sym, zb.sym)
     sym = za.sym[:kpre] + za.sym[kpre:] + zb.sym[kpre:]
     g = kpre + (ga - kpre) + (gb - kpre)
     Ga = torch.cat([za.G, torch.zeros(B, za.c.shape[1], gb - kpre,
@@ -690,12 +701,7 @@ def _bmm_zono(op, name, za, zb, B, dev, dt):
         rad_out = torch.where(worse, (ihi - ilo) / 2,
                               rad_out.reshape(B, n_out) + box)
         return ZonoState(y_c, y_G, sym, rad_out)
-    bidx = torch.nonzero((box > 0).any(dim=0), as_tuple=False).flatten()
-    if bidx.numel():
-        cols = torch.zeros(B, n_out, bidx.numel(), device=dev, dtype=dt)
-        cols[:, bidx, torch.arange(bidx.numel(), device=dev)] = box[:, bidx]
-        y_G = torch.cat([y_G, cols], dim=2)
-    sym = sym + [(name, int(i)) for i in bidx.tolist()]
+    y_G, sym = _append_fresh(y_G, sym, box, name, dev, dt)
     return ZonoState(y_c, y_G, sym)
 
 
@@ -734,14 +740,8 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
     e_c = lam * (z.c - c_bc) + mu
     e_G = lam.unsqueeze(2) * z.G
     e_rad = lam.abs() * z.rad if z.rad is not None else None
-    new_idx = torch.nonzero((delta > 0).any(dim=0),
-                            as_tuple=False).flatten()
-    if new_idx.numel():
-        cols = torch.zeros(B, n, new_idx.numel(), device=dev, dtype=dt)
-        cols[:, new_idx, torch.arange(new_idx.numel(), device=dev)] = \
-            delta[:, new_idx]
-        e_G = torch.cat([e_G, cols], dim=2)
-    e_sym = z.sym + [(op.name + '/e', int(i)) for i in new_idx.tolist()]
+    e_G, e_sym = _append_fresh(e_G, list(z.sym), delta, op.name + '/e',
+                               dev, dt)
     g_e = e_G.shape[2]
     # exact elementwise exp range (monotone): the band bounds are looser
     e_lo, e_hi = torch.exp(el), torch.exp(eh)
@@ -765,18 +765,15 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
     r_c = lam_r * s_c + mu_r
     r_G = lam_r.unsqueeze(2) * s_G
     r_rad = None
+    n_r_cols = 0
     if s_rad is not None:
         # remainder mode: the reciprocal delta is unlabeled -> remainder
         r_rad = lam_r.abs() * s_rad + d_r
         sym = list(e_sym)
     else:
-        ridx = torch.nonzero((d_r > 0).any(dim=0), as_tuple=False).flatten()
-        if ridx.numel():
-            cols = torch.zeros(B, n_rows, ridx.numel(), device=dev, dtype=dt)
-            cols[:, ridx, torch.arange(ridx.numel(), device=dev)] = \
-                d_r[:, ridx]
-            r_G = torch.cat([r_G, cols], dim=2)
-        sym = e_sym + [(op.name + '/r', int(i)) for i in ridx.tolist()]
+        r_G, sym = _append_fresh(r_G, list(e_sym), d_r, op.name + '/r',
+                                 dev, dt)
+        n_r_cols = len(sym) - len(e_sym)
     # broadcast r back over the rows and pad e with the recip columns so
     # both factors live over the SAME symbol list
     grid = torch.arange(n_rows, device=dev).reshape(pre, 1, post)
@@ -784,8 +781,8 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
     rb_c = r_c[:, bidx]
     rb_G = r_G[:, bidx, :]
     rb_rad = r_rad[:, bidx] if r_rad is not None else None
-    if r_rad is None and ridx.numel():
-        e_G = torch.cat([e_G, torch.zeros(B, n, ridx.numel(), device=dev,
+    if r_rad is None and n_r_cols:
+        e_G = torch.cat([e_G, torch.zeros(B, n, n_r_cols, device=dev,
                                           dtype=dt)], dim=2)
     # correlation-exact product y = e * r (shared symbols throughout)
     prod = e_G * rb_G
@@ -800,13 +797,7 @@ def _softmax_zono(op, z, zl, zh, B, dev, dt):
         y_rad = (box + (e_c.abs() + rad_e + e_rad) * rb_rad
                  + e_rad * (rb_c.abs() + rad_r))
     else:
-        yidx = torch.nonzero((box > 0).any(dim=0), as_tuple=False).flatten()
-        if yidx.numel():
-            cols = torch.zeros(B, n, yidx.numel(), device=dev, dtype=dt)
-            cols[:, yidx, torch.arange(yidx.numel(), device=dev)] = \
-                box[:, yidx]
-            y_G = torch.cat([y_G, cols], dim=2)
-        sym = sym + [(op.name, int(i)) for i in yidx.tolist()]
+        y_G, sym = _append_fresh(y_G, sym, box, op.name, dev, dt)
     # per-element hybrid against the EXACT interval image: on wide rows
     # the composed bands blow past [0, 1] (measured 5.8e34 on a scale-8
     # toy) while softmax_interval is exact -- where the affine form is
@@ -928,10 +919,6 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
         # overtakes and closes). 3x splits those regimes.
         kw_ = _worst_open(known.to(best.dtype).expand_as(best))
         rw_ = _worst_open(raw0)
-        import os as _os
-        if _os.environ.get('VC2_FZ_DEBUG'):
-            print(f'[fz-gate] raw={rw_:+.4f} known={kw_:+.4f} '
-                  f'ratio={(-rw_) / max(-kw_, 1e-30):.2f}', flush=True)
         if kw_ < 0 and rw_ < 0 and -rw_ > 3.0 * -kw_:
             return (best, None) if return_alphas else best
 

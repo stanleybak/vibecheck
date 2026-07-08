@@ -20,6 +20,8 @@ from __future__ import annotations
 import os
 import time
 
+from typing import NamedTuple
+
 import numpy as np
 import torch
 
@@ -45,7 +47,8 @@ def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
     Returns lbq elementwise-maxed with the tightened bounds."""
     B, q, g = WG.shape
     out = lbq.clone()
-    for bi, (_, _, splits, _fl, _bd, _ad) in enumerate(batch_doms):
+    for bi, dom in enumerate(batch_doms):
+        splits = dom.splits
         if not splits:
             continue
         zc_rows, zg_rows, zr_rows, off = [], [], [], []
@@ -791,6 +794,18 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
 
 
+class _Dom(NamedTuple):
+    """One relu-BaB domain on the heap (the design's Domain concept in
+    heap-entry form). Tuple ordering: worst-first by lb, tick unique so
+    comparisons never reach the payload fields."""
+    lb: float                 # parent-inherited worst bound (heap key)
+    tick: int                 # unique push counter (tie-break)
+    splits: tuple             # ((edge, j, sign|range), ...)
+    floor: object             # parent per-query bounds (np array) | None
+    betas: dict               # {(edge, j): optimized beta} | {}
+    alphas: object            # {edge: (qd, n) fp16 numpy} | None
+
+
 def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
                relu_maps, open_idx, lbq, dev, root_alphas=None,
                dom_alphas=None, k=8, chunk=256):
@@ -810,21 +825,6 @@ def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
     flat = torch.cat([relu_maps[nm] for nm in edges], dim=1)   # (B, ncat)
     k_eff = min(k, flat.shape[1])
     top_v, top_i = flat[open_idx].topk(k_eff, dim=1)           # (Bo, k)
-    force = os.environ.get('VC2_KFSB_FORCE')
-    if force:
-        offs = [0]
-        for w in widths:
-            offs.append(offs[-1] + w)
-        cols = []
-        for tok in force.split(','):
-            ei, j = tok.split(':')
-            cols.append(offs[int(ei)] + int(j))
-        fc = torch.tensor(cols, device=dev).unsqueeze(0) \
-            .expand(open_idx.numel(), -1)
-        top_i = torch.cat([top_i, fc], dim=1)
-        top_v = torch.cat([top_v, flat[open_idx].gather(1, fc)], dim=1)
-        top_v = torch.maximum(top_v, torch.full_like(top_v, 1e-9))
-        k_eff = top_i.shape[1]
     edge_of = torch.repeat_interleave(
         torch.arange(len(edges), device=dev),
         torch.tensor(widths, device=dev))
@@ -892,14 +892,6 @@ def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
         m_ch[sl] = (lb_c + bias).min(dim=1).values
     m_ch = torch.where(valid, m_ch, torch.full_like(m_ch, -torch.inf))
     sc = m_ch.reshape(Bo, k_eff, 2).min(dim=2).values          # (Bo, k)
-    if os.environ.get('VC2_KFSB_DEBUG'):
-        mm = m_ch.reshape(Bo, k_eff, 2)
-        for c in range(k_eff):
-            ci = int(top_i[0, c])
-            print(f'[kfsb] cand ({edges[int(edge_of[ci])]}, '
-                  f'{int(j_of[ci])}) children '
-                  f'{float(mm[0, c, 0]):+.4f}/{float(mm[0, c, 1]):+.4f} '
-                  f'proxy={float(top_v[0, c]):.4g}', flush=True)
     best = sc.argmax(dim=1)                                    # (Bo,)
     picks = {}
     for i, bo in enumerate(open_idx.tolist()):
@@ -977,7 +969,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     # per-domain bound quality tracks optimization effort (cold 12-iter
     # -0.0138 vs 30-iter -0.0094 at equal domains) and the transfer
     # buys converged-quality starts at low iteration counts
-    heap = [(-float('inf'), 0, (), None, {}, None)]
+    heap = [_Dom(-float('inf'), 0, (), None, {}, None)]
     last_atk = time.time()   # attack cadence is TIME-based too: slow
     # bound rounds must not starve the CE hunt (sb048's hidden CE)
     tick = 1
@@ -1013,8 +1005,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             bhi = hi1.expand(B, -1)
             clamps = {}
             range_clamps = {}
-            for bi, (_, _, splits, _fl, _bd, _ad) in enumerate(batch_doms):
-                for nm, j, spec_ in splits:
+            for bi, dom in enumerate(batch_doms):
+                for nm, j, spec_ in dom.splits:
                     if isinstance(spec_, tuple):          # smooth range split
                         if nm not in range_clamps:
                             n_e = net.ops[nm].n
@@ -1145,7 +1137,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                            return_input_adjoint=True)
                 ib_beta = {}
                 for bi, dom in enumerate(batch_doms):
-                    for (nm, j), bv in (dom[4] or {}).items():
+                    for (nm, j), bv in (dom.betas or {}).items():
                         if nm not in ib_beta:
                             ib_beta[nm] = torch.zeros(
                                 B, 1, net.ops[nm].n, device=dev)
@@ -1153,10 +1145,10 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 # per-domain alpha transfer: batch rows with stored state
                 # start there, the rest from the root alphas
                 ib_alpha = None
-                if any(dom[5] is not None for dom in batch_doms):
+                if any(dom.alphas is not None for dom in batch_doms):
                     ib_alpha = {}
                     for bi, dom in enumerate(batch_doms):
-                        for nm, a16 in (dom[5] or {}).items():
+                        for nm, a16 in (dom.alphas or {}).items():
                             if nm not in ib_alpha:
                                 qd_s = a16.shape[0]   # stored qd governs
                                 if root_alphas and nm in root_alphas:
@@ -1213,7 +1205,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             log(f'[vc2/rbab] round={rounds} OOM at B={B}; batch -> {batch}')
             continue
         n_bounded += B
-        floors = [d[3] for d in batch_doms]
+        floors = [d.floor for d in batch_doms]
         if any(f is not None for f in floors):
             fl = torch.stack([
                 torch.as_tensor(f, device=dev, dtype=lbq.dtype)
@@ -1338,14 +1330,14 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     # can only be sat; try to falsify, else give up loudly
                     return 'unknown', {'reason': 'exhausted splits',
                                        'bounded': n_bounded}
-                base = batch_doms[bi][2]
+                base = batch_doms[bi].splits
                 if best_kind[bi] == 'range':
                     m = float(best_mid[bi])
                     children = ((-np.inf, m), (m, np.inf))
                 else:
                     children = (1, -1)
                 fl_ch = lbq[bi].detach().cpu().numpy()
-                bd_ch = dict(batch_doms[bi][4] or {})
+                bd_ch = dict(batch_doms[bi].betas or {})
                 for nm2, j2, sp2 in base:
                     if not isinstance(sp2, tuple) and nm2 in beta_out \
                             and beta_out[nm2].numel():
@@ -1359,10 +1351,10 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                          # their own base shape in the batch rebuild
                          if alpha_out else None)
                 for ch in children:
-                    heapq.heappush(heap, (float(w_dom[bi]), tick,
-                                          base + ((best_edge[bi],
-                                                   int(best_j[bi]), ch),),
-                                          fl_ch, bd_ch, ad_ch))
+                    heapq.heappush(heap, _Dom(
+                        float(w_dom[bi]), tick,
+                        base + ((best_edge[bi], int(best_j[bi]), ch),),
+                        fl_ch, bd_ch, ad_ch))
                     tick += 1
             if onnx_path is not None and (
                     rounds % attack_every == 1

@@ -320,6 +320,9 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     budget = Budget(timeout, margin=0.0)
     budget.t0 = t0
     budget.deadline = t0 + timeout - 2.0
+    has_mixed = any((op.kind == 'nonlin' and op.fn != 'relu')
+                    or op.kind in ('mul', 'bmm')
+                    for op in net.ops.values())
     fz_alphas = None      # fzono's optimized band slopes (BaB warm start)
     root_alphas = None    # the polish phase's optimized CROWN alphas (the
     # BaB's per-domain alpha/beta pass and the kFSB probe warm-start here)
@@ -729,9 +732,6 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # past the instant-kill window is stolen from the closer.
         # (12 -> 8: the kills cost ~6.5s state build + <1s search; the
         # extra 4s only ever fed diverging frontiers.)
-        has_mixed = any((op.kind == 'nonlin' and op.fn != 'relu')
-                        or op.kind in ('mul', 'bmm')
-                        for op in net.ops.values())
         crown_bab_route = (len(open_d) <= 2 and has_mixed
                            and not fz_gain)
         dual_slice = (min(8.0, 0.3 * budget.remaining())
@@ -786,10 +786,6 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # depend on. Pure-relu wide nets keep the relu route (cifar
         # idx_8945's 35M-node relu tree is the counter-case).
         from .core.search import input_split_bab, relu_split_bab
-        has_mixed = any((op.kind == 'nonlin' and op.fn != 'relu')
-                        or op.kind in ('mul', 'bmm')
-                        for op in net.ops.values())    # (recomputed: the
-        # dual phase above may not have run on this path)
         kw = {}
         if n_wide <= 32:
             bab = input_split_bab
