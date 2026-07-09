@@ -95,7 +95,7 @@ def next_batch():
 
 
 def driver_running():
-    out = ssh("pgrep -f 'sweep_driver.sh' | head -1")
+    out = ssh("pgrep -f '[s]weep_driver.sh' | head -1")
     return bool(out.strip())
 
 
