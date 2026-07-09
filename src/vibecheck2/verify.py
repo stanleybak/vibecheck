@@ -111,7 +111,8 @@ def _log_flush(m):
 
 
 def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
-           alpha_iters=20, pgd_budget=5.0, net_cache=None, log=_log_flush):
+           alpha_iters=20, pgd_budget=5.0, net_cache=None, attack_off=False,
+           log=_log_flush):
     """Returns (verdict, details); details carries 'witness' for 'sat'.
 
     Disjuncts carrying their own input subboxes (acasxu prop_6) decompose
@@ -164,6 +165,15 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     log(f'[vc2] {net}')
 
     groups = _subbox_groups(spec)
+    if attack_off:
+        # SOUNDNESS sweep: disable ALL falsification -- no root PGD
+        # (pgd_budget 0) and no CE validation anywhere (onnx_path None
+        # gates the in-BaB attack + every attack.validate). With no
+        # attack a counterexample can never be found, so a truly-sat
+        # instance can only return unknown/timeout; an 'unsat' here is a
+        # false-unsat SOUNDNESS violation.
+        onnx_path = None
+        pgd_budget = 0.0
     try:
         return _verify_groups(net, spec, groups, onnx_path, timeout,
                               device, alpha_iters, pgd_budget, log, t0)
@@ -862,6 +872,10 @@ def main(argv=None):
     p.add_argument('--net-cache', default=None,
                    help='converted-net cache path: load when present, '
                         'else convert and save (VNNCOMP prepare stage)')
+    p.add_argument('--no-attack', action='store_true',
+                   help='disable ALL falsification (soundness sweep): no '
+                        'counterexample can be found, so sat instances '
+                        'return unknown/timeout; an unsat is a false-unsat')
     a = p.parse_args(argv)
     from .core import attack as _atk
     _atk.CE_TOL = a.ce_tol
@@ -890,7 +904,8 @@ def main(argv=None):
             f.write('timeout\n')
     try:
         verdict, details = verify(a.net, a.spec, a.timeout, a.device,
-                                  net_cache=a.net_cache)
+                                  net_cache=a.net_cache,
+                                  attack_off=a.no_attack)
     except BaseException as e:                # crash -> 'error' (v1 discipline)
         import traceback
         traceback.print_exc()
