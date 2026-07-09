@@ -104,6 +104,44 @@ def main():
         rows.append((ref_time, cat, ver, onnx_r, vnnlib_r, to,
                      vcv[1] if vcv else '', vcv[2] if vcv else '',
                      abv[1] if abv else '', abv[2] if abv else ''))
+    # network-pair categories (isomorphic/monotonic): instances.csv onnx is
+    # a pair [('f',orig),('g',pert)]. Match to references by vnnlib_rel (the
+    # reference records the ORIGINAL net path + this vnnlib). Encode the pair
+    # in onnx_rel as PAIR|<f_rel>|<g_rel> for the driver's --net arg.
+    import ast
+    ref_by_vnnlib = {}
+    for src in (vc, ab):
+        for (onnx_r, vnnlib_r), (cat, verd, t) in src.items():
+            if verd in ('sat', 'unsat'):
+                ref_by_vnnlib.setdefault(vnnlib_r, []).append(t)
+    for cat in os.listdir(BENCH):
+        catd = os.path.join(BENCH, cat)
+        if not os.path.isdir(catd):
+            continue
+        for ver in os.listdir(catd):
+            ic = os.path.join(catd, ver, 'instances.csv')
+            if not os.path.exists(ic):
+                continue
+            for row in csv.reader(open(ic)):
+                if len(row) < 3 or not row[0].strip().startswith('['):
+                    continue
+                try:
+                    pair = dict(ast.literal_eval(row[0]))
+                except Exception:
+                    continue
+                f_rel = f'{cat}/{ver}/' + pair['f'].lstrip('./')
+                g_rel = f'{cat}/{ver}/' + pair['g'].lstrip('./')
+                vnnlib_r = f'{cat}/{ver}/' + row[1].lstrip('./')
+                times = ref_by_vnnlib.get(vnnlib_r)
+                if not times:
+                    continue                 # neither ref solved this pair
+                def _ex(r):
+                    return (os.path.exists(os.path.join(BENCH, r))
+                            or os.path.exists(os.path.join(BENCH, r + '.gz')))
+                if not (_ex(f_rel) and _ex(g_rel)):
+                    continue
+                rows.append((min(times), cat, ver, f'PAIR|{f_rel}|{g_rel}',
+                             vnnlib_r, float(row[2]), '', '', '', ''))
     rows.sort(key=lambda r: r[0])
     with open(OUT, 'w', newline='') as f:
         w = csv.writer(f)

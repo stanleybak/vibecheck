@@ -55,6 +55,18 @@ def ssh(cmd, timeout=60, check=False):
     return r.stdout.strip()
 
 
+def resolve(rel):
+    """The on-disk file for a worklist rel is <rel> or its .gz sibling
+    (isomorphic/monotonic onnx are .onnx.gz). Returns the existing rel to
+    STAGE, or None. The driver passes the PLAIN path; vc2 resolves .gz."""
+    full = os.path.join(BENCH_LOCAL, rel)
+    if os.path.exists(full):
+        return rel
+    if os.path.exists(full + '.gz'):
+        return rel + '.gz'
+    return None
+
+
 def done_keys():
     """(onnx_rel, vnnlib_rel) already in the local results mirror."""
     keys = set()
@@ -82,11 +94,15 @@ def next_batch():
         k = (x['onnx_rel'], x['vnnlib_rel'])
         if k in done:
             continue
-        op = os.path.join(BENCH_LOCAL, x['onnx_rel'])
-        vp = os.path.join(BENCH_LOCAL, x['vnnlib_rel'])
-        if not os.path.exists(op) or not os.path.exists(vp):
+        onnx_rels = (x['onnx_rel'].split('|')[1:] if x['onnx_rel'].startswith('PAIR|')
+                     else [x['onnx_rel']])
+        staged = [resolve(r) for r in onnx_rels]
+        vn = resolve(x['vnnlib_rel'])
+        if any(sr is None for sr in staged) or vn is None:
             continue
-        fsz = os.path.getsize(op) + os.path.getsize(vp)
+        fsz = sum(os.path.getsize(os.path.join(BENCH_LOCAL, sr)) for sr in staged) \
+            + os.path.getsize(os.path.join(BENCH_LOCAL, vn))
+        x['_stage'] = staged + [vn]        # actual files to rsync (may be .gz)
         if batch and (size + fsz > SIZE_BUDGET or len(batch) >= COUNT_BUDGET):
             break
         batch.append(x)
@@ -109,9 +125,11 @@ def drain():
     subprocess.run(['rsync', '-az', '-e', f'ssh -i {KEY}',
                     f'ubuntu@{HOST}:{BOX_CE}/', CE_LOCAL + SUFFIX + '/'],
                    capture_output=True)
-    # delete drained CEs on box (kept locally) + staged files for done insts
-    ssh(f'rm -f {BOX_CE}/* 2>/dev/null; '
-        f'find {BOX_BENCH} -type f -delete 2>/dev/null; true')
+    # delete drained CEs on box (kept locally). Do NOT delete bench_stage
+    # here: the driver may still be MID-BATCH and need those files (a
+    # mid-run drain wiped them -> missing_file). Staged files are cleared
+    # in push(), which only runs when the driver is idle.
+    ssh(f'rm -f {BOX_CE}/* 2>/dev/null; true')
 
 
 def push():
@@ -123,9 +141,12 @@ def push():
     filelist = HERE + '/.stage_files'
     with open(filelist, 'w') as f:
         for x in batch:
-            f.write(x['onnx_rel'] + '\n')
-            f.write(x['vnnlib_rel'] + '\n')
-    ssh(f'mkdir -p {BOX_BENCH} {BOX_RUN} {BOX_CE}')
+            for r in x['_stage']:
+                f.write(r + '\n')
+    # driver is idle here (push only called when not running): safe to
+    # clear the previous batch's staged files now, before staging this one.
+    ssh(f'find {BOX_BENCH} -type f -delete 2>/dev/null; '
+        f'mkdir -p {BOX_BENCH} {BOX_RUN} {BOX_CE}')
     subprocess.run(['rsync', '-az', '--files-from=' + filelist,
                     '-e', f'ssh -i {KEY}', BENCH_LOCAL + '/',
                     f'ubuntu@{HOST}:{BOX_BENCH}/'], check=True)

@@ -27,10 +27,18 @@ while IFS=, read -r cat ver onnx vnnlib to; do
 	[ -z "$cat" ] && continue
 	n=$((n+1))
 	if done_key "$onnx" "$vnnlib"; then continue; fi
-	ON="$BENCH/$onnx"; VN="$BENCH/$vnnlib"
-	if [ ! -f "$ON" ] || [ ! -f "$VN" ]; then
-		echo "$cat,$onnx,$vnnlib,$ver,missing_file,0" >> "$RESULTS"; continue
-	fi
+	VN="$BENCH/$vnnlib"
+	case "$onnx" in
+	PAIR\|*)   # network-pair: onnx = PAIR|<f_rel>|<g_rel>
+		F=$(echo "$onnx" | cut -d'|' -f2); G=$(echo "$onnx" | cut -d'|' -f3)
+		ON="[('f', '$BENCH/$F'), ('g', '$BENCH/$G')]"
+		[ -f "$BENCH/$F" ] && [ -f "$BENCH/$G" ] && [ -f "$VN" ] || {
+			echo "$cat,$onnx,$vnnlib,$ver,missing_file,0" >> "$RESULTS"; continue; } ;;
+	*)
+		ON="$BENCH/$onnx"
+		[ -f "$ON" ] && [ -f "$VN" ] || {
+			echo "$cat,$onnx,$vnnlib,$ver,missing_file,0" >> "$RESULTS"; continue; } ;;
+	esac
 	res=$(mktemp)
 	sudo rm -f /tmp/idle_since 2>/dev/null || true
 	T0=$(date +%s.%N)
