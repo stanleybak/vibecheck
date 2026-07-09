@@ -16,18 +16,22 @@ def ref(t):
 def main():
     total=sum(1 for _ in open(os.path.join(HERE,'worklist.csv')))-1
     vc,ab=ref('vibecheck'),ref('alpha_beta_crown')
-    box={}; 
+    def rk(onnx,vnnlib):   # reference key: PAIR rows -> original onnx
+        return (onnx.split('|')[1] if onnx.startswith('PAIR|') else onnx, vnnlib)
+    box={}; refkey={}
     if os.path.exists(BOX):
         for row in csv.reader(open(BOX)):
-            if len(row)>=6: box[(row[1],row[2])]=(row[4],float(row[5]))
+            if len(row)>=6:
+                box[(row[1],row[2])]=(row[4],float(row[5]))
+                refkey[(row[1],row[2])]=rk(row[1],row[2])
     done=len(box)
     solved=[k for k,(v,t) in box.items() if v in ('sat','unsat')]
     err=[k for k,(v,t) in box.items() if v not in ('sat','unsat','timeout','unknown')]
     to=[k for k,(v,t) in box.items() if v in ('timeout','unknown')]
     # match vs each ref (only where ref is confident)
-    m_vc=sum(1 for k in solved if vc.get(k)==box[k][0])
-    m_ab=sum(1 for k in solved if ab.get(k)==box[k][0])
-    contra=[k for k in solved if (vc.get(k) in('sat','unsat') and vc.get(k)!=box[k][0] and ab.get(k)!=box[k][0]) or (ab.get(k) in('sat','unsat') and ab.get(k)!=box[k][0] and vc.get(k)!=box[k][0])]
+    m_vc=sum(1 for k in solved if vc.get(refkey[k])==box[k][0])
+    m_ab=sum(1 for k in solved if ab.get(refkey[k])==box[k][0])
+    contra=[k for k in solved if (vc.get(refkey[k]) in('sat','unsat') and vc.get(refkey[k])!=box[k][0] and ab.get(refkey[k])!=box[k][0]) or (ab.get(refkey[k]) in('sat','unsat') and ab.get(refkey[k])!=box[k][0] and vc.get(refkey[k])!=box[k][0])]
     # worklist: (key) -> (ref_time, timeout)
     wl={}
     for r in csv.DictReader(open(os.path.join(HERE,'worklist.csv'))):

@@ -37,7 +37,9 @@ def load_box():
         with open(BOX) as f:
             for row in csv.reader(f):
                 if len(row) >= 6:
-                    d[(row[1], row[2])] = (row[0], row[4], row[5])
+                    ok = (row[1].split('|')[1] if row[1].startswith('PAIR|')
+                          else row[1])
+                    d[(ok, row[2])] = (row[0], row[4], row[5])
     return d
 
 
