@@ -1,0 +1,107 @@
+"""Build the vc2 sweep work-list: every instance solved by vc1 OR abcrown,
+sorted by the fastest reference solve time (easy wins first), with the
+official per-instance timeout joined from instances.csv.
+
+Output CSV columns:
+  ref_time, category, version, onnx_rel, vnnlib_rel, timeout,
+  vc1_verdict, vc1_time, abc_verdict, abc_time
+Paths are relative to the benchmarks root (benchmarks/<cat>/<ver>/...),
+so both local and the box resolve them under their own benchmarks dir.
+"""
+import csv
+import os
+import sys
+
+RES = os.path.expanduser('~/repositories/vnncomp2026_results_official')
+BENCH = os.path.expanduser('~/repositories/vnncomp2026_benchmarks/benchmarks')
+OUT = os.path.join(os.path.dirname(__file__), 'worklist.csv')
+
+
+def rel_after_benchmarks(p):
+    # results path: vnncomp2026_benchmarks/benchmarks/<cat>/<ver>/onnx/x
+    i = p.find('/benchmarks/')
+    return p[i + len('/benchmarks/'):] if i >= 0 else p
+
+
+def load(tool):
+    d = {}
+    with open(f'{RES}/{tool}/results.csv') as f:
+        for row in csv.reader(f):
+            if len(row) < 6:
+                continue
+            cat, onnx, vnnlib, ver, verdict, t = row[:6]
+            onnx_r = rel_after_benchmarks(onnx)      # <cat>/<ver>/onnx/x
+            vnnlib_r = rel_after_benchmarks(vnnlib)
+            key = (cat, ver, onnx_r, vnnlib_r)
+            d[key] = (verdict, float(t) if t else 0.0)
+    return d
+
+
+def timeout_index():
+    """(cat, ver, onnx_rel, vnnlib_rel) -> official timeout (float)."""
+    idx = {}
+    for cat in os.listdir(BENCH):
+        catd = os.path.join(BENCH, cat)
+        if not os.path.isdir(catd):
+            continue
+        for ver in os.listdir(catd):
+            ic = os.path.join(catd, ver, 'instances.csv')
+            if not os.path.exists(ic):
+                continue
+            with open(ic) as f:
+                for row in csv.reader(f):
+                    if len(row) < 3:
+                        continue
+                    onnx, vnnlib, to = row[0], row[1], row[2]
+                    onnx_r = f'{cat}/{ver}/{onnx.lstrip("./")}'
+                    vnnlib_r = f'{cat}/{ver}/{vnnlib.lstrip("./")}'
+                    idx[(cat, ver, onnx_r, vnnlib_r)] = float(to)
+    return idx
+
+
+def main():
+    vc = load('vibecheck')
+    ab = load('alpha_beta_crown')
+    tos = timeout_index()
+    keys = set(vc) | set(ab)
+    rows = []
+    missing_to = 0
+    for k in keys:
+        vcv = vc.get(k)
+        abv = ab.get(k)
+        solved_times = []
+        if vcv and vcv[0] in ('sat', 'unsat'):
+            solved_times.append(vcv[1])
+        if abv and abv[0] in ('sat', 'unsat'):
+            solved_times.append(abv[1])
+        if not solved_times:
+            continue                       # neither reference solved it
+        ref_time = min(solved_times)
+        cat, ver, onnx_r, vnnlib_r = k
+        to = tos.get(k)
+        if to is None:
+            missing_to += 1
+            continue
+        rows.append((ref_time, cat, ver, onnx_r, vnnlib_r, to,
+                     vcv[0] if vcv else '', vcv[1] if vcv else '',
+                     abv[0] if abv else '', abv[1] if abv else ''))
+    rows.sort(key=lambda r: r[0])
+    with open(OUT, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['ref_time', 'category', 'version', 'onnx_rel',
+                    'vnnlib_rel', 'timeout', 'vc1_verdict', 'vc1_time',
+                    'abc_verdict', 'abc_time'])
+        w.writerows(rows)
+    print(f'work-list: {len(rows)} instances -> {OUT}')
+    print(f'  (dropped {missing_to} with no instances.csv timeout match)')
+    # sum of official timeouts (worst-case GPU-seconds if all time out)
+    total_to = sum(r[5] for r in rows)
+    print(f'  worst-case GPU-time if ALL hit timeout: {total_to/3600:.0f} GPU-h')
+    print(f'  (reference solved these fast; realistic << that)')
+    from collections import Counter
+    c = Counter(r[1] for r in rows)
+    print('  by category:', dict(sorted(c.items())))
+
+
+if __name__ == '__main__':
+    main()
