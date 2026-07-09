@@ -882,7 +882,10 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
     a_ops = [nm for nm in net.order if net.ops[nm].kind == 'nonlin'
              and hasattr(REL[net.ops[nm].fn], 'band_alpha')]
     if not a_ops or iters <= 0:
-        return best
+        # respect return_alphas even on the no-optimizable-ops fast path
+        # (sign-only nets: a_ops empty -> a bare tensor here made verify's
+        # fz[1] crash on traffic_signs quantized nets)
+        return (best, None) if return_alphas else best
     alphas = {}
     for nm in a_ops:
         if init_alphas is not None and nm in init_alphas:

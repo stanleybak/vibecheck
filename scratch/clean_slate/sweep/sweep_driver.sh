@@ -32,7 +32,10 @@ while IFS=, read -r cat ver onnx vnnlib to; do
 	PAIR\|*)   # network-pair: onnx = PAIR|<f_rel>|<g_rel>
 		F=$(echo "$onnx" | cut -d'|' -f2); G=$(echo "$onnx" | cut -d'|' -f3)
 		ON="[('f', '$BENCH/$F'), ('g', '$BENCH/$G')]"
-		[ -f "$BENCH/$F" ] && [ -f "$BENCH/$G" ] && [ -f "$VN" ] || {
+		# files may be staged as .onnx.gz (vc2 resolves the .gz sibling from
+		# the plain path); accept either form in the existence check.
+		ex() { [ -f "$1" ] || [ -f "$1.gz" ]; }
+		ex "$BENCH/$F" && ex "$BENCH/$G" && ex "$VN" || {
 			echo "$cat,$onnx,$vnnlib,$ver,missing_file,0" >> "$RESULTS"; continue; } ;;
 	*)
 		ON="$BENCH/$onnx"
