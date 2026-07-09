@@ -25,7 +25,7 @@ import torch
 
 from . import attack, backward, debug, memory
 from .bab import (Domain as _Dom, disjunct_selector, materialize_clamps,
-                  refuted_matrix)
+                  merge_intermediates, refuted_matrix)
 
 
 def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
@@ -530,17 +530,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 if root_ref is None:
                     inter = ib
                 else:
-                    inter = {}
-                    for k2, v in root_ref.items():
-                        rv = tuple(t.expand(B, -1) for t in v)
-                        iv = ib[k2]
-                        merged = []
-                        for j2 in range(0, len(rv), 2):
-                            merged.append(torch.maximum(rv[j2], iv[j2]))
-                            merged.append(torch.minimum(rv[j2 + 1],
-                                                        torch.maximum(iv[j2 + 1],
-                                                                      merged[-1])))
-                        inter[k2] = tuple(merged)
+                    inter = merge_intermediates(root_ref, ib, B,
+                                                keep_valid=True)
             lbq, Ain = backward.crown(net, blo, bhi, W, inter,
                                       return_input_adjoint=True)
         except torch.cuda.OutOfMemoryError:
@@ -991,15 +982,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                  clamps=clamps,
                                                  range_clamps=range_clamps)
                 ib = backward._inter_from_state(net, lambda e: ib_state[e])
-                inter = {}
-                for k2, v in root_inter.items():
-                    rv = tuple(t.expand(B, -1) for t in v)
-                    iv = ib[k2]
-                    merged = []
-                    for j2 in range(0, len(rv), 2):
-                        merged.append(torch.maximum(rv[j2], iv[j2]))
-                        merged.append(torch.minimum(rv[j2 + 1], iv[j2 + 1]))
-                    inter[k2] = tuple(merged)
+                inter = merge_intermediates(root_inter, ib, B)
             if bound != 'zono' and n_relu_total <= 2000:
                 # small net (acasxu class): per-batch CROWN refinement of the
                 # merged bounds under the clamps. NOT for wide layers: the
