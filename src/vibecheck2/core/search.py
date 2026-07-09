@@ -20,12 +20,12 @@ from __future__ import annotations
 import os
 import time
 
-from typing import NamedTuple
-
 import numpy as np
 import torch
 
 from . import attack, backward, debug, memory
+from .bab import (Domain as _Dom, disjunct_selector, materialize_clamps,
+                  refuted_matrix)
 
 
 def _beta_tighten(lbq, W, bias, zo, WG, rec, batch_doms, inter, dev,
@@ -237,10 +237,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     if roots is not None:
         D, sel = 0, None       # per-domain rows replace the disjunct map
     else:
-        D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
-        # per-disjunct row selector (D, q) for the batched refutation check
-        sel = torch.zeros(D, q, device=dev, dtype=torch.bool)
-        sel[disj_idx, torch.arange(q)] = True
+        D, sel = disjunct_selector(disj_idx, q, dev)
 
     # the frontier lives on HOST: a stuck instance grows it to millions of
     # (n_in,) rows (dist_shift index112 hit 250k x 792 and OOM-crashed the
@@ -342,12 +339,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         if brow is not None:
             db = dom_bound(lbq, brow)
             return ((db > 0) & torch.isfinite(db)).unsqueeze(1)
-        lbb = lbq + bias
-        pos = (lbb > 0) & torch.isfinite(lbb)        # refuting rows
-        refuted = torch.zeros(lbq.shape[0], D, device=dev, dtype=torch.bool)
-        for dd in range(D):
-            refuted[:, dd] = (pos & sel[dd]).any(dim=1)
-        return refuted
+        return refuted_matrix(lbq, bias, sel)
 
     def clip_domains(olo, ohi, A, lbb, rows):
         """ABC-style input clipping: every row r in `rows` must satisfy its
@@ -794,18 +786,6 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
 
 
-class _Dom(NamedTuple):
-    """One relu-BaB domain on the heap (the design's Domain concept in
-    heap-entry form). Tuple ordering: worst-first by lb, tick unique so
-    comparisons never reach the payload fields."""
-    lb: float                 # parent-inherited worst bound (heap key)
-    tick: int                 # unique push counter (tie-break)
-    splits: tuple             # ((edge, j, sign|range), ...)
-    floor: object             # parent per-query bounds (np array) | None
-    betas: dict               # {(edge, j): optimized beta} | {}
-    alphas: object            # {edge: (qd, n) fp16 numpy} | None
-
-
 def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
                relu_maps, open_idx, lbq, dev, root_alphas=None,
                dom_alphas=None, k=8, chunk=256):
@@ -923,9 +903,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     W = W.to(dev, dt)
     bias = bias.to(dev, dt)
     q = W.shape[0]
-    D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
-    sel = torch.zeros(D, q, device=dev, dtype=torch.bool)
-    sel[disj_idx, torch.arange(q)] = True
+    D, sel = disjunct_selector(disj_idx, q, dev)
     lo1 = lo.reshape(1, -1).to(dev, dt)
     hi1 = hi.reshape(1, -1).to(dev, dt)
     if beta_iters is None:
@@ -978,14 +956,6 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     t0 = time.time()
 
 
-    def refuted_of(lbq):
-        lbb = lbq + bias
-        pos = (lbb > 0) & torch.isfinite(lbb)
-        r = torch.zeros(lbq.shape[0], D, device=dev, dtype=torch.bool)
-        for dd in range(D):
-            r[:, dd] = (pos & sel[dd]).any(dim=1)
-        return r
-
     while heap:
         if time.time() > deadline:
             return 'timeout', {'frontier': len(heap), 'bounded': n_bounded,
@@ -1003,24 +973,9 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         try:
             blo = lo1.expand(B, -1)
             bhi = hi1.expand(B, -1)
-            clamps = {}
-            range_clamps = {}
-            for bi, dom in enumerate(batch_doms):
-                for nm, j, spec_ in dom.splits:
-                    if isinstance(spec_, tuple):          # smooth range split
-                        if nm not in range_clamps:
-                            n_e = net.ops[nm].n
-                            range_clamps[nm] = (
-                                torch.full((B, n_e), -torch.inf, device=dev),
-                                torch.full((B, n_e), torch.inf, device=dev))
-                        rlo, rhi = range_clamps[nm]
-                        rlo[bi, j] = max(float(rlo[bi, j]), spec_[0])
-                        rhi[bi, j] = min(float(rhi[bi, j]), spec_[1])
-                    else:                                  # relu sign split
-                        if nm not in clamps:
-                            clamps[nm] = torch.zeros(B, net.ops[nm].n, device=dev,
-                                                     dtype=torch.int8)
-                        clamps[nm][bi, j] = spec_
+            clamps, range_clamps = materialize_clamps(
+                [dom.splits for dom in batch_doms],
+                lambda nm: net.ops[nm].n, B, dev)
             # reforward-IBP under the clamps, intersected with the (tighter at
             # the root, clamp-blind) root intermediates: best of both regimes
             if bound == 'zono':
@@ -1214,7 +1169,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                 dtype=lbq.dtype)
                 for f in floors])
             lbq = torch.maximum(lbq, fl)
-        refuted = refuted_of(lbq)
+        refuted = refuted_matrix(lbq, bias, sel)
         open_mask = ~refuted.all(dim=1)
         if open_mask.any():
             # unified action ranking: relu sign splits score by BaBSR
