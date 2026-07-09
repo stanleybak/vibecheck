@@ -32,14 +32,18 @@ def load(tool):
             cat, onnx, vnnlib, ver, verdict, t = row[:6]
             onnx_r = rel_after_benchmarks(onnx)      # <cat>/<ver>/onnx/x
             vnnlib_r = rel_after_benchmarks(vnnlib)
-            key = (cat, ver, onnx_r, vnnlib_r)
-            d[key] = (verdict, float(t) if t else 0.0)
+            # key on the PATH (which carries the true version dir), NOT the
+            # results version FIELD -- they disagree for several categories
+            # (results ver 1.0 but path .../2.0/...), which silently dropped
+            # adaptive_cruise/sat_relu/smart_turn/cgan2026/relusplitter.
+            d[(onnx_r, vnnlib_r)] = (cat, verdict, float(t) if t else 0.0)
     return d
 
 
 def timeout_index():
-    """(cat, ver, onnx_rel, vnnlib_rel) -> official timeout (float)."""
+    """(onnx_rel, vnnlib_rel) -> official timeout; plus cat_default[cat]."""
     idx = {}
+    cat_to = {}
     for cat in os.listdir(BENCH):
         catd = os.path.join(BENCH, cat)
         if not os.path.isdir(catd):
@@ -53,38 +57,53 @@ def timeout_index():
                     if len(row) < 3:
                         continue
                     onnx, vnnlib, to = row[0], row[1], row[2]
+                    if onnx.strip().startswith('['):
+                        continue        # network-pair (handled separately)
                     onnx_r = f'{cat}/{ver}/{onnx.lstrip("./")}'
                     vnnlib_r = f'{cat}/{ver}/{vnnlib.lstrip("./")}'
-                    idx[(cat, ver, onnx_r, vnnlib_r)] = float(to)
-    return idx
+                    idx[(onnx_r, vnnlib_r)] = float(to)
+                    cat_to.setdefault(cat, []).append(float(to))
+    # category default = the most common timeout in that category
+    from collections import Counter
+    cat_default = {c: Counter(v).most_common(1)[0][0]
+                   for c, v in cat_to.items()}
+    return idx, cat_default
 
 
 def main():
     vc = load('vibecheck')
     ab = load('alpha_beta_crown')
-    tos = timeout_index()
+    tos, cat_default = timeout_index()
     keys = set(vc) | set(ab)
     rows = []
     missing_to = 0
     for k in keys:
-        vcv = vc.get(k)
+        vcv = vc.get(k)      # (cat, verdict, time) | None
         abv = ab.get(k)
+        cat = (vcv or abv)[0]
+        # derive version dir from the path key
+        ver = k[0].split('/')[1] if '/' in k[0] else '1.0'
+        onnx_r, vnnlib_r = k
         solved_times = []
-        if vcv and vcv[0] in ('sat', 'unsat'):
-            solved_times.append(vcv[1])
-        if abv and abv[0] in ('sat', 'unsat'):
-            solved_times.append(abv[1])
+        if vcv and vcv[1] in ('sat', 'unsat'):
+            solved_times.append(vcv[2])
+        if abv and abv[1] in ('sat', 'unsat'):
+            solved_times.append(abv[2])
         if not solved_times:
-            continue                       # neither reference solved it
+            continue
         ref_time = min(solved_times)
-        cat, ver, onnx_r, vnnlib_r = k
         to = tos.get(k)
         if to is None:
-            missing_to += 1
-            continue
+            # reference solved an instance not in the current instances.csv
+            # (older instance set); the file exists, so sweep it with the
+            # category's standard timeout rather than dropping it.
+            to = cat_default.get(cat)
+            if to is None:
+                missing_to += 1
+                continue
         rows.append((ref_time, cat, ver, onnx_r, vnnlib_r, to,
-                     vcv[0] if vcv else '', vcv[1] if vcv else '',
-                     abv[0] if abv else '', abv[1] if abv else ''))
+                     vcv[1] if vcv else '', vcv[2] if vcv else '',
+                     abv[1] if abv else '', abv[2] if abv else ''))
     rows.sort(key=lambda r: r[0])
     with open(OUT, 'w', newline='') as f:
         w = csv.writer(f)
