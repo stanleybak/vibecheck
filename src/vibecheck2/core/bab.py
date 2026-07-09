@@ -99,27 +99,3 @@ def materialize_clamps(batch_splits, n_of, B, dev):
                                              dtype=torch.int8)
                 clamps[nm][bi, j] = spec
     return clamps, range_clamps
-
-
-def merge_intermediates(base, reforward, B, keep_valid=False):
-    """Intersect root/base pre-activation bounds (tight, clamp-blind) with
-    a per-domain reforward (clamp-aware, looser at the root): best of both
-    regimes. base/reforward map edge -> flat (lo, hi[, lo2, hi2 ...])
-    tuples. keep_valid clamps each hi up to its merged lo so a
-    floating-point inversion never produces an empty interval (the
-    input-split driver's guard; the relu driver historically omitted it).
-    """
-    out = {}
-    for k, v in base.items():
-        rv = tuple(t.expand(B, -1) for t in v)
-        iv = reforward[k]
-        merged = []
-        for j in range(0, len(rv), 2):
-            lo = torch.maximum(rv[j], iv[j])
-            hi = torch.minimum(rv[j + 1], iv[j + 1])
-            if keep_valid:
-                hi = torch.maximum(hi, lo)
-            merged.append(lo)
-            merged.append(hi)
-        out[k] = tuple(merged)
-    return out

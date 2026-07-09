@@ -74,23 +74,3 @@ def test_domain_heap_order():
     # worst (most negative) pops first; payload never compared
     assert heapq.heappop(h).lb == -2.0
     assert heapq.heappop(h).lb == -0.5
-
-
-def test_merge_intermediates():
-    from vibecheck2.core.bab import merge_intermediates
-    base = {'e': (torch.tensor([[-2.0, -1.0]]), torch.tensor([[3.0, 2.0]]))}
-    ref = {'e': (torch.tensor([[-1.5, -0.5]]), torch.tensor([[2.5, 1.0]]))}
-    out = merge_intermediates(base, ref, 1)
-    assert out['e'][0].tolist() == [[-1.5, -0.5]]     # max of los
-    assert out['e'][1].tolist() == [[2.5, 1.0]]       # min of his
-
-
-def test_merge_intermediates_keep_valid():
-    from vibecheck2.core.bab import merge_intermediates
-    # base lo exceeds reforward hi -> inversion; keep_valid repairs it
-    base = {'e': (torch.tensor([[1.0]]), torch.tensor([[5.0]]))}
-    ref = {'e': (torch.tensor([[-1.0]]), torch.tensor([[0.5]]))}
-    raw = merge_intermediates(base, ref, 1, keep_valid=False)
-    assert float(raw['e'][0][0, 0]) == 1.0 and float(raw['e'][1][0, 0]) == 0.5
-    fix = merge_intermediates(base, ref, 1, keep_valid=True)
-    assert float(fix['e'][1][0, 0]) == 1.0             # hi clamped up to lo
