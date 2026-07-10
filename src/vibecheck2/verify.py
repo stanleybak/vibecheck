@@ -174,9 +174,18 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
         # false-unsat SOUNDNESS violation.
         onnx_path = None
         pgd_budget = 0.0
+    from .core.budget import OutOfTime
     try:
         return _verify_groups(net, spec, groups, onnx_path, timeout,
                               device, alpha_iters, pgd_budget, log, t0)
+    except OutOfTime:
+        # the cooperative deadline fired inside a phase that does not
+        # wrap its own budget.check() (stabilize_intermediates ->
+        # intermediates_crown on a large ResNet). Budget exhausted =
+        # honest 'unknown'/timeout, never a crash-to-error.
+        log('[vc2] budget exhausted (OutOfTime); verdict unknown')
+        return 'unknown', {'reason': 'out_of_time',
+                           'time': time.time() - t0}
     except NotImplementedError as e:
         # an op-coverage gap (vit bmm adjoints until M6, etc.) is a
         # feature boundary, not a crash: log it loudly and return the
