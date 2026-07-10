@@ -184,12 +184,17 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
         log(f'[vc2] not implemented: {e}; verdict unknown')
         return 'unknown', {'reason': f'not_implemented: {e}',
                            'time': time.time() - t0}
-    except torch.AcceleratorError as e:
+    except (torch.AcceleratorError, torch.cuda.OutOfMemoryError) as e:
         # raw CUDA allocation failure outside the caching allocator
-        # (compile workspace exhaustion poisons subsequent allocs in this
-        # process); the phases that ran stand, the verdict is honest
-        log(f'[vc2] accelerator failure: {str(e)[:80]}; verdict unknown')
-        return 'unknown', {'reason': 'accelerator_failure',
+        # (compile workspace exhaustion poisons subsequent allocs) OR a
+        # CUDA OOM the chunked memory service could not absorb (a large
+        # ResNet's dense adjoint on a 22GB card -- tinyimagenet). The
+        # phases that ran stand; the HONEST verdict is unknown (vc2 ran
+        # out of memory), never a crash-to-error.
+        torch.cuda.empty_cache()
+        log(f'[vc2] cuda oom/accelerator failure: {str(e)[:80]}; '
+            f'verdict unknown')
+        return 'unknown', {'reason': 'cuda_oom_or_accelerator',
                            'time': time.time() - t0}
 
 
