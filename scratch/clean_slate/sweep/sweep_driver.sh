@@ -49,10 +49,12 @@ while IFS=, read -r cat ver onnx vnnlib to; do
 	# serializes the timed run on the shared GPU.
 	VC2_SRC="${VC2_SRC:-/home/ubuntu/vc2/src}" bash "$PREP" vc2 "$cat" "$ON" "$VN" >/dev/null 2>&1 || true
 	if [ -n "$GPULOCK" ] && [ -x "$GPULOCK" ]; then
+		HARD=$(awk "BEGIN{printf \"%d\", $to + 90}")
 		VC2_SRC="${VC2_SRC:-/home/ubuntu/vc2/src}" "$GPULOCK" run "vc2-sweep: $cat ${onnx##*/}" -- \
-			bash "$RUN" vc2 "$cat" "$ON" "$VN" "$res" "$to" >/dev/null 2>&1 || true
+			timeout -k 15 "$HARD" bash "$RUN" vc2 "$cat" "$ON" "$VN" "$res" "$to" >/dev/null 2>&1 || true
 	else
-		VC2_SRC="${VC2_SRC:-$PWD/src}" bash "$RUN" vc2 "$cat" "$ON" "$VN" "$res" "$to" >/dev/null 2>&1 || true
+		HARD=$(awk "BEGIN{printf \"%d\", $to + 90}")
+		VC2_SRC="${VC2_SRC:-$PWD/src}" timeout -k 15 "$HARD" bash "$RUN" vc2 "$cat" "$ON" "$VN" "$res" "$to" >/dev/null 2>&1 || true
 	fi
 	EL=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $T0}")
 	V=$(head -n1 "$res" 2>/dev/null | tr -d '[:space:]')
