@@ -911,8 +911,33 @@ def main(argv=None):
         verdict, details = verify(a.net, a.spec, a.timeout, a.device,
                                   net_cache=a.net_cache,
                                   attack_off=a.no_attack)
+    except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError) as e:
+        # a CUDA OOM anywhere the chunked memory service could not absorb
+        # (a large ResNet's dense adjoint deep in the BaB, past verify()'s
+        # own catch) is an HONEST 'unknown' -- vc2 ran out of memory --
+        # never a crash-to-error. Belt to verify()'s suspenders.
+        import traceback
+        traceback.print_exc()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:                     # noqa: BLE001 - best effort
+            pass
+        if a.results_file:
+            with open(a.results_file, 'w') as f:
+                f.write('unknown\n')
+        print(f'[vc2] cuda oom (top-level): verdict unknown ({str(e)[:80]})')
+        return 1
     except BaseException as e:                # crash -> 'error' (v1 discipline)
         import traceback
+        traceback.print_exc()
+        # a RuntimeError carrying an OOM message (some CUDA paths raise the
+        # base RuntimeError, not the OOM subclass) is also unknown-not-error
+        if 'out of memory' in str(e).lower():
+            if a.results_file:
+                with open(a.results_file, 'w') as f:
+                    f.write('unknown\n')
+            print('[vc2] oom-message runtime error (top-level): unknown')
+            return 1
         traceback.print_exc()
         if a.results_file:
             with open(a.results_file, 'w') as f:
