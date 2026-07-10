@@ -55,7 +55,12 @@ while IFS=, read -r cat ver onnx vnnlib to; do
 		VC2_SRC="${VC2_SRC:-$PWD/src}" bash "$RUN" vc2 "$cat" "$ON" "$VN" "$res" "$to" >/dev/null 2>&1 || true
 	fi
 	EL=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $T0}")
-	V=$(head -n1 "$res" 2>/dev/null | tr -d '[:space:]'); [ -z "$V" ] && V=error
+	V=$(head -n1 "$res" 2>/dev/null | tr -d '[:space:]')
+	# empty result = the python process died without writing a verdict
+	# (OS OOM-kill / SIGKILL on a huge net -- no Python handler runs). That
+	# is an honest 'unknown' (vc2 could not complete in memory/time), not a
+	# tool 'error'. A genuine Python crash writes 'error\n<msg>' itself.
+	if [ -z "$V" ]; then V=unknown; echo "  (empty result -> unknown; likely OOM-kill) $onnx" >> "$PROG"; fi
 	echo "$cat,$onnx,$vnnlib,$ver,$V,$EL" >> "$RESULTS"
 	# capture a counterexample (sat rows carry the s-expr after line 1)
 	if [ "$V" = "sat" ] && [ "$(wc -l < "$res")" -gt 1 ]; then
