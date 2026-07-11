@@ -376,11 +376,12 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     if op.kind == 'nonlin')
     n_relu_layers = sum(1 for op in net.ops.values()
                         if op.kind == 'nonlin')
+    n_wide_pre = int((np.asarray(spec.x_hi).ravel()
+                      - np.asarray(spec.x_lo).ravel() > 1e-6).sum())
     _polish_tries = 4 if budget.remaining() > 60 else 1
     if relu_only and n_relu_layers <= 2:
         pgd_budget = min(pgd_budget, 2.0)
-    elif int((np.asarray(spec.x_hi).ravel()
-              - np.asarray(spec.x_lo).ravel() > 1e-6).sum()) <= 32:
+    elif n_wide_pre <= 32:
         # mixed net on the WIDE (input-split) route: the closer is the
         # decomposed BaB and every root-attack second starves it (lsnc_33:
         # frontier at 550 boxes of ~13.5M when the deadline hit). True-sat
@@ -414,7 +415,15 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # escalate only on a genuine near-miss (margin just above zero,
             # or a marginal below-zero candidate the chokepoint rejected) with
             # cheap-phase budget to spare; otherwise fall through to bounds.
-            if ainfo['best_margin'] >= 0.05 or budget.remaining() < 15:
+            # RELU ROBUSTNESS nets (wide inputs) get a much wider window:
+            # the CE basin is rare but trivial once seeded -- tinyimagenet
+            # idx_140 plateaus at +0.17 for 100 restarts and hits in 5
+            # iters at 256 (either init); the 0.05 gate blocked exactly the
+            # escalation that closes the 9 resnet sat misses. Mixed nets
+            # keep the tight gate (vit sits near-zero on hard UNSAT rows).
+            near = 0.5 if (relu_only and n_wide_pre > 32
+                           and budget.remaining() > 30) else 0.05
+            if ainfo['best_margin'] >= near or budget.remaining() < 15:
                 break
             if any((op.kind == 'nonlin' and op.fn != 'relu')
                    or op.kind in ('mul', 'bmm')
