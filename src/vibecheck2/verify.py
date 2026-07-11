@@ -366,6 +366,18 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     # restart samples a different output-space basin and one lands in the CE
     # basin.  So escalate restarts on a near-zero MISS; clear cases exit on
     # the first (cheap) pass and never pay for the extra restarts.
+    # MILP-class pre-check (graph-only): shallow relu-only nets are decided
+    # by the exact MILP phase, and on a T=20 budget a 5s root pgd starves it
+    # (safenlp medical 1988: pgd 5.1s + milp 7s TIME_LIMIT sols=0 + a
+    # hopeless 30-dim input-split = unknown; v1 closes in 4-15s). The MILP
+    # itself also hunts incumbents, so the trimmed pgd only cedes work to a
+    # stronger finder.
+    relu_only = all(op.fn == 'relu' for op in net.ops.values()
+                    if op.kind == 'nonlin')
+    n_relu_layers = sum(1 for op in net.ops.values()
+                        if op.kind == 'nonlin')
+    if relu_only and n_relu_layers <= 2:
+        pgd_budget = min(pgd_budget, 2.0)
     if pgd_budget > 0:
         restarts = 100
         for _ in range(3):                        # 100 -> 250 -> 625
@@ -474,10 +486,8 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     # this class (malbeware, safenlp) and must not be starved: the wide route's
     # input-split floor (max(20s,...)) or the dual can eat a short (T=20)
     # budget whole before it is ever reached.
-    relu_only = all(op.fn == 'relu' for op in net.ops.values()
-                    if op.kind == 'nonlin')
-    n_relu_layers = sum(1 for op in net.ops.values()
-                        if op.kind == 'nonlin')
+    # (relu_only / n_relu_layers precomputed before Phase A -- the same
+    # class check trims the root pgd budget there.)
     # gate on the UNSTABLE count -- that is the MILP's binary count (milp.py),
     # not the full relu width. malbeware 16-25 has a wide layer but few
     # unstable neurons; keying on full width wrongly gated it out.
@@ -516,8 +526,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
 
     if verdict != 'unsat' and open_d and milp_eligible \
             and budget.remaining() > 8:
+        # the MILP is decisive here: on a short budget give it everything
+        # minus a small fallback reserve (safenlp T=20: the 0.65 fraction
+        # left it 7s -> TIME_LIMIT with zero solutions; the input-split
+        # fallback on a 30-dim box cannot use the reserve anyway)
         mv, mres = _try_milp(open_d, time.time()
-                             + min(0.65 * budget.remaining(), 60.0))
+                             + min(max(0.65 * budget.remaining(),
+                                       budget.remaining() - 4.0), 60.0))
         if mv == 'sat':
             return 'sat', {'witness': mres, 'time': time.time() - t0}
         if mv == 'unsat':
@@ -574,9 +589,14 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                 # launching after the deadline had already passed
                 break
             slice_end = time.time() + max(20.0, frac * budget.remaining())
+            # decomposed mode is single-stage and the last real phase on
+            # these short-budget rows: hand it the tail reserve too (the
+            # post-slice heavy phases are all remaining-gated off anyway;
+            # lsnc siblings sat ~2s short of closing at the 2.0s reserve)
+            tail = 1.2 if roots_arg is not None else 2.0
             verdict, binfo = input_split_bab(
                 net, spec, W, b, di, lo[0], hi[0],
-                deadline=min(t0 + timeout - 2.0, slice_end), device=device,
+                deadline=min(t0 + timeout - tail, slice_end), device=device,
                 alpha_iters=ai, onnx_path=onnx_path,
                 roots=roots_arg, row_groups=rgroups, log=log, **bab_kw)
             log(f'[vc2] input_split_bab (wide slice, alpha={ai}): '

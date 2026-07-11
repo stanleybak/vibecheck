@@ -176,15 +176,17 @@ def stabilize_intermediates(net, W, lo1, hi1, inter, budget, device='cpu',
 
 
 def _requeue(f_lo, f_hi, f_worst, f_row, batch, blo, bhi, brow):
-    """Push an OOM'd batch back onto the host frontier and halve the
-    batch size (the sanctioned round-level OOM recovery)."""
+    """Push an OOM'd batch back onto the frontier and halve the batch
+    size (the sanctioned round-level OOM recovery)."""
     torch.cuda.empty_cache()
-    f_lo = torch.cat([f_lo, blo.cpu()])
-    f_hi = torch.cat([f_hi, bhi.cpu()])
+    fd = f_lo.device
+    f_lo = torch.cat([f_lo, blo.to(fd)])
+    f_hi = torch.cat([f_hi, bhi.to(fd)])
     f_worst = torch.cat([f_worst,
-                         torch.full((blo.shape[0],), -torch.inf)])
+                         torch.full((blo.shape[0],), -torch.inf,
+                                    device=fd)])
     if brow is not None:
-        f_row = torch.cat([f_row, brow.cpu()])
+        f_row = torch.cat([f_row, brow.to(fd)])
     return f_lo, f_hi, f_worst, f_row, max(64,
                                            min(batch, blo.shape[0]) // 2)
 
@@ -255,9 +257,14 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     else:
         D, sel = disjunct_selector(disj_idx, q, dev)
 
-    # the frontier lives on HOST: a stuck instance grows it to millions of
-    # (n_in,) rows (dist_shift index112 hit 250k x 792 and OOM-crashed the
-    # GPU mid-bookkeeping); only the popped batch goes to the device
+    # the frontier lives on the DEVICE while it is small -- the host
+    # bookkeeping (topk + keep-mask + cat over multi-million rows) costs
+    # whole seconds per run on fast-round nets (lsnc: ~30 rounds over a
+    # 3-8M frontier) -- and migrates to HOST once, permanently, when it
+    # outgrows 10% of free VRAM (dist_shift index112 hit 250k x 792 rows
+    # and OOM-crashed the GPU mid-bookkeeping; the one-way switch mirrors
+    # z_rad_mode). The pending pool always stays on host.
+    fdev = dev
     pend_lo = pend_hi = pend_row = None
     if roots is not None:
         R_lo = roots[0].to('cpu', dt)
@@ -275,15 +282,16 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             f_row, pend_row = R_row[:mini_group], R_row[mini_group:]
         else:
             f_lo, f_hi, f_row = R_lo, R_hi, R_row
-        f_worst = torch.full((f_lo.shape[0],), -torch.inf)
+        f_lo, f_hi, f_row = f_lo.to(fdev), f_hi.to(fdev), f_row.to(fdev)
+        f_worst = torch.full((f_lo.shape[0],), -torch.inf, device=fdev)
         log(f'[vc2/bab] multi-sub: {R_lo.shape[0]} roots over '
             f'{W.shape[0]} unique rows'
             + (f', mini-group {mini_group}' if pend_lo is not None else ''))
     else:
-        f_lo = lo.reshape(1, -1).to('cpu', dt)
-        f_hi = hi.reshape(1, -1).to('cpu', dt)
-        f_row = torch.zeros(1, dtype=torch.long)
-        f_worst = torch.full((1,), -torch.inf)
+        f_lo = lo.reshape(1, -1).to(fdev, dt)
+        f_hi = hi.reshape(1, -1).to(fdev, dt)
+        f_row = torch.zeros(1, dtype=torch.long, device=fdev)
+        f_worst = torch.full((1,), -torch.inf, device=fdev)
     n_bounded = n_split = rounds = 0
     tol_witness = None
     _round_wall, _round_B = 1.0, 1
@@ -431,11 +439,12 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         if (pend_lo is not None and pend_lo.shape[0]
                 and f_lo.shape[0] < mini_group):
             na = min(mini_group - f_lo.shape[0], pend_lo.shape[0])
-            f_lo = torch.cat([f_lo, pend_lo[:na]])
-            f_hi = torch.cat([f_hi, pend_hi[:na]])
-            f_row = torch.cat([f_row, pend_row[:na]])
+            f_lo = torch.cat([f_lo, pend_lo[:na].to(f_lo.device)])
+            f_hi = torch.cat([f_hi, pend_hi[:na].to(f_lo.device)])
+            f_row = torch.cat([f_row, pend_row[:na].to(f_lo.device)])
             f_worst = torch.cat([f_worst,
-                                 torch.full((na,), -torch.inf)])
+                                 torch.full((na,), -torch.inf,
+                                            device=f_worst.device)])
             pend_lo, pend_hi, pend_row = (pend_lo[na:], pend_hi[na:],
                                           pend_row[na:])
         rounds += 1
@@ -860,15 +869,17 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 right_lo.scatter_(1, kk, mid)
                 ch_lo = torch.cat([ch_lo, right_lo])
                 ch_hi = torch.cat([left_hi, ch_hi])
-            from .dual_lp import _host_ram_room
-            need = 2 * 4 * (f_lo.shape[0] + ch_lo.shape[0]) * ch_lo.shape[1]
-            if need > _host_ram_room() * 0.5:
-                # graceful stop beats the cgroup OOM kill (which loses the
-                # verdict); the caller treats timeout as unknown
-                return 'timeout', {'frontier': int(f_lo.shape[0]),
-                                   'bounded': n_bounded,
-                                   'splits': n_split,
-                                   'reason': 'host_ram_cap'}
+            if fdev.type != 'cuda':
+                from .dual_lp import _host_ram_room
+                need = (2 * 4 * (f_lo.shape[0] + ch_lo.shape[0])
+                        * ch_lo.shape[1])
+                if need > _host_ram_room() * 0.5:
+                    # graceful stop beats the cgroup OOM kill (which loses
+                    # the verdict); the caller treats timeout as unknown
+                    return 'timeout', {'frontier': int(f_lo.shape[0]),
+                                       'bounded': n_bounded,
+                                       'splits': n_split,
+                                       'reason': 'host_ram_cap'}
             if brow is not None:
                 w = lbq_open                    # already per-domain (No,)
                 # child pre-refutation (abcrown's concretize step): the
@@ -887,22 +898,31 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 ch_keep = ~((lb_ch > 0) & torch.isfinite(lb_ch)).any(dim=1)
                 ch_pri = lb_ch.masked_fill(~torch.isfinite(lb_ch),
                                            -torch.inf).max(dim=1).values
-                f_lo = torch.cat([f_lo, ch_lo[ch_keep].cpu()])
-                f_hi = torch.cat([f_hi, ch_hi[ch_keep].cpu()])
+                f_lo = torch.cat([f_lo, ch_lo[ch_keep].to(fdev)])
+                f_hi = torch.cat([f_hi, ch_hi[ch_keep].to(fdev)])
                 f_row = torch.cat([f_row,
-                                   orow.repeat(reps_c)[ch_keep].cpu()])
-                f_worst = torch.cat([f_worst, ch_pri[ch_keep].cpu()])
+                                   orow.repeat(reps_c)[ch_keep].to(fdev)])
+                f_worst = torch.cat([f_worst, ch_pri[ch_keep].to(fdev)])
             else:
                 w = lbq_open.min(dim=1).values
-                f_lo = torch.cat([f_lo, ch_lo.cpu()])
-                f_hi = torch.cat([f_hi, ch_hi.cpu()])
+                f_lo = torch.cat([f_lo, ch_lo.to(fdev)])
+                f_hi = torch.cat([f_hi, ch_hi.to(fdev)])
                 f_row = torch.cat([f_row,
                                    torch.zeros(ch_lo.shape[0],
-                                               dtype=torch.long)])
+                                               dtype=torch.long,
+                                               device=fdev)])
                 f_worst = torch.cat([f_worst,
                                      w.repeat(ch_lo.shape[0] // w.shape[0])
-                                     .cpu()])
+                                     .to(fdev)])
             n_split += int(w.shape[0])
+            if fdev.type == 'cuda':
+                fbytes = f_lo.numel() * 8 + f_lo.shape[0] * 12
+                if fbytes > 0.10 * memory.free_bytes(dev):
+                    fdev = torch.device('cpu')
+                    f_lo, f_hi = f_lo.cpu(), f_hi.cpu()
+                    f_row, f_worst = f_row.cpu(), f_worst.cpu()
+                    log(f'[vc2/bab] frontier -> host '
+                        f'({f_lo.shape[0]} rows, {fbytes / 1e9:.2f}GB)')
 
             if onnx_path is not None and (
                     rounds == 1

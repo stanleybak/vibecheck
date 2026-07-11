@@ -136,25 +136,54 @@ def refute_rows_milp(net, lo, hi, inter, W, bias, disj_idx, disjuncts,
             break
         d = int(d)
         rows = rows_of[d]
-        # FEASIBILITY of the CE region {all rows w_r.y + b_r <= 0} (v1's Gurobi
-        # route). INFEASIBLE proves no counterexample exists -> refuted, and it
-        # is DECISIVE at any positive true margin -- no razor-thin obj_margin
-        # trap (min-of-max got stuck at a loose LP bound of 0.0 on sat_relu
-        # v56_c239, where the exact margin is a tiny positive epsilon). A
-        # feasible point satisfies every row -> a CE candidate the caller
-        # validates through the ORT chokepoint.
-        cs = [m.addConstr(Wn[r] @ y_out + bn[r] <= 0.0) for r in rows]
-        m.setObjective(0.0)
-        m.Params.BestBdStop = gp.GRB.INFINITY
-        m.Params.BestObjStop = gp.GRB.INFINITY
+        cs = []
+        if len(rows) == 1:
+            # OPTIMIZATION form for a single row: min w.y + b with
+            # bound-driven stops -- BestBdStop fires the moment the DUAL
+            # bound clears zero (sound refutation at any point of the
+            # solve), BestObjStop the moment an incumbent violates. The
+            # pure feasibility form has no objective to prune with and
+            # grinds big-M trees to TIME_LIMIT on barely-infeasible
+            # regions (safenlp medical 1988: 118 binaries, 13s, no
+            # verdict).
+            r = rows[0]
+            m.setObjective(Wn[r] @ y_out + bn[r], gp.GRB.MINIMIZE)
+            m.Params.BestBdStop = obj_margin
+            m.Params.BestObjStop = -obj_margin
+        else:
+            # FEASIBILITY of the CE region {all rows w_r.y + b_r <= 0}
+            # (v1's Gurobi route). INFEASIBLE proves no counterexample
+            # exists -> refuted, and it is DECISIVE at any positive true
+            # margin -- no razor-thin obj_margin trap (min-of-max got
+            # stuck at a loose LP bound of 0.0 on sat_relu v56_c239,
+            # where the exact margin is a tiny positive epsilon). A
+            # feasible point satisfies every row -> a CE candidate the
+            # caller validates through the ORT chokepoint.
+            cs = [m.addConstr(Wn[r] @ y_out + bn[r] <= 0.0) for r in rows]
+            m.setObjective(0.0)
+            m.Params.BestBdStop = gp.GRB.INFINITY
+            m.Params.BestObjStop = gp.GRB.INFINITY
         m.Params.TimeLimit = max(3.0, left / max(1, len(todo) - len(refuted)))
         t0 = time.time()
         m.optimize()
-        log(f'[vc2/milp] disj {d} (k={len(rows)}): status={m.Status} '
-            f'sols={m.SolCount} t={time.time() - t0:.1f}s')
-        if m.Status == gp.GRB.INFEASIBLE:
-            refuted.add(d)                          # sound: CE region empty
-        elif m.SolCount > 0 and candidate is None:
-            candidate = np.array(x_in.X, dtype=np.float64)  # all rows <= 0
-        m.remove(cs)
+        if len(rows) == 1:
+            try:
+                ob = float(m.ObjBound)
+            except (AttributeError, gp.GurobiError):
+                ob = -float('inf')
+            log(f'[vc2/milp] disj {d} (k=1): status={m.Status} '
+                f'sols={m.SolCount} bd={ob:+.3e} t={time.time() - t0:.1f}s')
+            if ob >= obj_margin:
+                refuted.add(d)               # sound: dual bound on the min
+            elif m.SolCount > 0 and candidate is None \
+                    and float(m.ObjVal) <= 0.0:
+                candidate = np.array(x_in.X, dtype=np.float64)
+        else:
+            log(f'[vc2/milp] disj {d} (k={len(rows)}): status={m.Status} '
+                f'sols={m.SolCount} t={time.time() - t0:.1f}s')
+            if m.Status == gp.GRB.INFEASIBLE:
+                refuted.add(d)                      # sound: CE region empty
+            elif m.SolCount > 0 and candidate is None:
+                candidate = np.array(x_in.X, dtype=np.float64)  # rows <= 0
+            m.remove(cs)
     return refuted, candidate
