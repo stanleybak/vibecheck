@@ -651,7 +651,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # throughput and gains ~0 -- the deep-box slack is the mul
             # band, which alpha cannot move)
             stages = ((0, 0.9),)
-            bab_kw = {'split_dims': 1, 'batch': 1048576}
+            bab_kw = {'split_dims': 1, 'batch': 524288}
         for ai, frac in stages:
             if budget.remaining() < 5:
                 # a 20s-budget instance (nn4sys mscn) measured 6.4s of

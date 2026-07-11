@@ -152,6 +152,47 @@ def stabilize_intermediates(net, W, lo1, hi1, inter, budget, device='cpu',
                                               clamps={nm: cl},
                                               alpha_iters=alpha_iters,
                                               budget=budget)
+            if backward._zono_cost_bytes(net, B) \
+                    <= memory.free_bytes(dev) * memory.SAFETY:
+                # v1's phase 1+2 interleave tightens branches with the
+                # FORWARD ZONO under the sign clamp too -- on attention
+                # nets the zono is the tight frame and the crown-only
+                # branches stabilized nothing (vit pgd_2_3_16: unstable
+                # 184 -> 184 while v1's splits close the row). Both
+                # sides are valid per-branch bounds; intersect.
+                try:
+                    cb_lo = inter[nm][0].expand(B, -1).clone()
+                    cb_hi = inter[nm][1].expand(B, -1).clone()
+                    cb_lo[2 * ar, js] = cb_lo[2 * ar, js].clamp_min(0.0)
+                    cb_hi[2 * ar + 1, js] = \
+                        cb_hi[2 * ar + 1, js].clamp_max(0.0)
+                    _l3, _h3, zst3 = backward.fwd.zono(
+                        net, blo, bhi, return_state=True,
+                        clamp_bounds={nm: (cb_lo, cb_hi)})
+                    zi3 = backward._inter_from_state(
+                        net, lambda e: zst3[e].bounds())
+                    del zst3
+                    for k2, v in ib.items():
+                        zv = zi3.get(k2)
+                        if zv is None or len(zv) != len(v):
+                            continue
+                        merged3 = []
+                        for j2 in range(0, len(v), 2):
+                            nl3 = torch.maximum(v[j2], zv[j2])
+                            merged3.append(nl3)
+                            merged3.append(torch.maximum(
+                                torch.minimum(v[j2 + 1], zv[j2 + 1]), nl3))
+                        ib[k2] = tuple(merged3)
+                except (NotImplementedError,
+                        torch.cuda.OutOfMemoryError) as _se:
+                    # zono side unavailable (op without a band / estimate
+                    # missed): the crown branches above stand alone, as
+                    # before this interleave existed
+                    backward._warn_once(
+                        f'stabilize zono branches skipped '
+                        f'({type(_se).__name__})')
+                    if dev.type == 'cuda':
+                        torch.cuda.empty_cache()
             new_inter = {}
             for k2, v in inter.items():
                 merged = []
@@ -847,14 +888,13 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 # (group mode: oA's rows are the domain's OWN rows already,
                 # so the sum scores exactly the right polytope)
                 score = oA.abs().sum(dim=1) * (ohi - olo) / 2
+            # (a deep-split "starved ramp" was built and REMOVED here: any
+            # rule for when to split extra levels -- post-pop queue, live
+            # total work, start-phase latch -- made the TREE chaotically
+            # instance-dependent (lsnc _33/_5/_0 swung 13M <-> 35M boxes
+            # from firing-time alone). Uniform 2-way splitting costs ~2s of
+            # startup ramp and is predictable.)
             kdims = min(split_dims, olo.shape[1])
-            if row_groups is not None and f_lo.shape[0] < bs // 4:
-                # frontier-starved ramp (decomposed mode): 2-way splitting
-                # from a handful of roots pays ~25 rounds of fixed per-round
-                # cost before a batch fills (lsnc: ~4s of a 19s slice).
-                # Splitting 3 extra levels while starved fills the frontier
-                # in a few rounds; those shallow boxes would split anyway.
-                kdims = min(split_dims + 3, olo.shape[1])
             topk = score.topk(kdims, dim=1).indices          # (B, kdims)
             if debug.enabled() and rounds <= 64:
                 debug.add_seq('bab_split_dim', int(topk[0, 0]))
