@@ -192,7 +192,8 @@ def _requeue(f_lo, f_hi, f_worst, f_row, batch, blo, bhi, brow):
 def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     device='cpu', batch=4096, split_dims=2, alpha_iters=8,
                     onnx_path=None, attack_every=8, heuristic=None,
-                    roots=None, mini_group=None, log=lambda m: None):
+                    roots=None, row_groups=None, mini_group=None,
+                    full_refine=None, log=lambda m: None):
     """Returns (verdict, info): 'unsat' | 'sat' (+witness) | 'timeout'.
 
     W (q, n_out), bias (q,), disj_idx (q,): the spec query rows.
@@ -205,6 +206,15 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     own single-row sub-instance -- the domain is refuted when ITS row's lb
     goes positive -- and they all share one frontier, so the batched bound
     amortizes across the 960 subs instead of a 0.2s-per-group serial loop.
+
+    row_groups (G, r): generalizes root_row from one W row to a row GROUP
+    per root (root_row then holds group ids). A group is one disjunct's
+    conjunctive rows: the domain is refuted when ANY of them goes positive,
+    and the clip intersects ALL of their halfspaces (abcrown's or-clause
+    decomposition -- lsnc's 13-disjunct spec explodes as one joint frontier
+    but drains per-disjunct). Ragged groups are padded by repeating a row
+    (idempotent for refutation and clipping). Single-row multi-sub is the
+    r=1 case and keeps its dedicated gathers.
     """
     dev = torch.device(device)
     dt = torch.float32
@@ -224,7 +234,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                      and op.fn in ('relu', 'leaky_relu'))
         heuristic = 'widest' if n_band > n_relu else 'sb'
     _row_map = weight_of = None
-    if roots is not None:
+    if roots is not None and row_groups is None:
         # dedupe by WEIGHT only for the CROWN cost. Cardinality specs (lindex:
         # 120k rows) carry ~q DISTINCT thresholds sharing ONE weight, so a
         # (w, b)-dedup left q identical-weight columns and CROWN ran O(B x q).
@@ -233,7 +243,13 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         uniqW, weight_of = torch.unique(W, dim=0, return_inverse=True)
         W = uniqW.contiguous()
         weight_of = weight_of.to(dev)
-    q = W.shape[0]
+    if row_groups is not None:
+        # group mode bounds each domain's OWN rows via a batched per-domain
+        # W (B, r, n) gather instead of the global deduped matrix (lsnc:
+        # r=3 of 15 unique rows -- 5x less CROWN adjoint per box)
+        assert roots is not None, 'row_groups requires roots mode'
+        row_groups = row_groups.to(dev)
+    q = W.shape[0] if row_groups is None else int(row_groups.shape[1])
     if roots is not None:
         D, sel = 0, None       # per-domain rows replace the disjunct map
     else:
@@ -288,29 +304,57 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     # bigger ones: joint-alpha refine ONCE at the root, then per batch only
     # a cheap reforward intersected with the root bounds (subbox is a
     # subset, so the intersection is sound) -- the abcrown cost model.
-    full_refine = n_nonlin <= 1200
+    forced_refine = full_refine is not None
+    if not forced_refine:
+        full_refine = n_nonlin <= 1200
+    same_box = True
     if roots is not None:
-        full_refine = False              # per-sub boxes vary; root_ref on
-                                         # the UNION box, cheap reforward
-                                         # per batch (still sound)
-    if full_refine:
+        same_box = (bool((R_lo == R_lo[0]).all())
+                    and bool((R_hi == R_hi[0]).all()))
+        if not same_box and not forced_refine:
+            full_refine = False          # SCATTERED per-sub boxes (mscn):
+                                         # root_ref on the UNION box, cheap
+                                         # reforward per batch (still sound).
+                                         # Same-box roots (disjunct
+                                         # decomposition) keep the probe: the
+                                         # forced cheap bound dropped lsnc's
+                                         # per-box closure 59% -> 29%.
+    if full_refine and not forced_refine:
         # identity-CROWN vs forward-zono planes flips by net class (acasxu
         # amplifying weights favor backward refinement; dist_shift sigmoid
         # bands close at depth 1 under zono but need 100k+ splits under
         # identity-CROWN), so measure both on the root's first two
         # children and keep the winner.
-        wax = int((f_hi - f_lo).argmax())
+        # probe on the (shared) root box -- f_lo may hold several identical
+        # rows in decomposed-roots mode, and argmax over all of them would
+        # return a flattened index
+        wax = int((f_hi[0] - f_lo[0]).argmax())
         mid = (f_lo[0, wax] + f_hi[0, wax]) / 2
-        plo = f_lo.repeat(2, 1).to(dev)
-        phi = f_hi.repeat(2, 1).to(dev)
+        plo = f_lo[:1].repeat(2, 1).to(dev)
+        phi = f_hi[:1].repeat(2, 1).to(dev)
         phi[0, wax] = mid
         plo[1, wax] = mid
         try:
+            # deduped-W mode (roots): bias is per ORIGINAL row and no longer
+            # aligns with W's columns; the probe only compares the two
+            # bounds' tightness, so compare bias-free there
+            pb = bias if bias.shape[0] == W.shape[0] else 0.0
             _l, _h, zst = backward.fwd.zono(net, plo, phi, return_state=True)
             zi = backward._inter_from_state(net, lambda e: zst[e].bounds())
-            z_lb = float((backward.crown(net, plo, phi, W, zi) + bias).min())
+            # the zono route's real bound is max(crown-over-zono-seeds,
+            # direct spec concretization through the state) -- see the
+            # in-loop zout max
+            zo_p = zst[net.output_name]
+            W3p = W.unsqueeze(0).expand(2, -1, -1)
+            zsp = torch.bmm(W3p, zo_p.c.unsqueeze(2)).squeeze(2) \
+                - torch.bmm(W3p, zo_p.G).abs().sum(dim=2)
+            if zo_p.rad is not None:
+                zsp = zsp - torch.bmm(W3p.abs(),
+                                      zo_p.rad.unsqueeze(2)).squeeze(2)
+            z_lb = float((torch.maximum(
+                backward.crown(net, plo, phi, W, zi), zsp) + pb).min())
             ci = backward.intermediates_crown(net, plo, phi, base_inter=zi)
-            c_lb = float((backward.crown(net, plo, phi, W, ci) + bias).min())
+            c_lb = float((backward.crown(net, plo, phi, W, ci) + pb).min())
             full_refine = c_lb >= z_lb
             log(f'[vc2/bab] refine probe: crown={c_lb:.3f} zono={z_lb:.3f} '
                 f'-> full_refine={full_refine}')
@@ -318,25 +362,42 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             backward._warn_once(f'refine probe zono unavailable '
                                 f'({type(_pe).__name__}); keeping crown')
     root_ref = None
-    if not full_refine and roots is None:
-        # (multi-sub skips this: the union of 960 scattered subboxes is
-        # nearly the whole space, so refining it is GBs of pure cost;
-        # the per-subbox reforward below is the tight part there)
+    if not full_refine and same_box:
+        # multi-sub with SCATTERED roots skips this (the union of 960
+        # subboxes is nearly the whole space, so refining it is GBs of
+        # pure cost; the per-subbox reforward below is the tight part
+        # there) -- but when every root shares ONE box (disjunct
+        # decomposition) the root refinement is as valid as at roots=None.
         root_ref = backward.intermediates_crown(
-            net, f_lo.to(dev), f_hi.to(dev),
+            net, f_lo[:1].to(dev), f_hi[:1].to(dev),
             alpha_iters=(12 if n_nonlin <= 20000 else 0))
+
+    def _grp_vals(lbq, brow):
+        """(B, r): each domain's own rows' bounds. In group mode lbq's r
+        columns ARE the domain's rows (per-domain W); add their biases."""
+        return lbq + bias[row_groups[brow]]
 
     def dom_bound(lbq, brow):
         """(B,) each domain's OWN row bound = its weight column + its bias
-        (multi-sub, weight-deduped W)."""
+        (multi-sub, weight-deduped W). Group mode: the group's best FINITE
+        row (any positive row refutes, so max is the closure margin)."""
+        if row_groups is not None:
+            vals = _grp_vals(lbq, brow)
+            return vals.masked_fill(~torch.isfinite(vals),
+                                    -torch.inf).max(dim=1).values
         wrow = weight_of[brow]
         return lbq.gather(1, wrow.unsqueeze(1)).squeeze(1) + bias[brow]
 
     def domain_refuted(lbq, brow=None):
         """(B, q) query lbs -> (B, D) refutation matrix; in multi-sub
-        mode a (B, 1) matrix from each domain's OWN row. Only FINITE
-        positive bounds refute (+inf is an artifact, never a proof)."""
+        mode a (B, 1) matrix from each domain's OWN row (group mode: ANY
+        of its rows). Only FINITE positive bounds refute (+inf is an
+        artifact, never a proof)."""
         if brow is not None:
+            if row_groups is not None:
+                vals = _grp_vals(lbq, brow)
+                return ((vals > 0) & torch.isfinite(vals)).any(
+                    dim=1, keepdim=True)
             db = dom_bound(lbq, brow)
             return ((db > 0) & torch.isfinite(db)).unsqueeze(1)
         return refuted_matrix(lbq, bias, sel)
@@ -388,6 +449,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 and _round_wall / max(_round_B, 1) < 2e-5):
             batch *= 2
         _round_t0 = time.time()
+        zout = None            # this batch's forward-zono OUTPUT state
         # pick the worst-first batch, sized by the memory budget: the
         # reforward holds (lo, hi) for EVERY edge (sum, not max -- mscn's
         # 116 edges held 3GB at the max-based estimate), the crown adjoint
@@ -418,6 +480,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                     return_state=True)
                     zi = backward._inter_from_state(
                         net, lambda e: zst[e].bounds())
+                    zout = zst[net.output_name]
+                    del zst
                     inter = backward.intermediates_crown(net, blo, bhi,
                                                          base_inter=zi)
                 except (NotImplementedError, torch.cuda.OutOfMemoryError):
@@ -440,6 +504,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                         box_remainder='all' if z_rad_mode else False)
                     ib = backward._inter_from_state(
                         net, lambda e: zst[e].bounds())
+                    zout = zst[net.output_name]
                     del zst
                 except torch.cuda.OutOfMemoryError:
                     if not z_rad_mode:
@@ -454,6 +519,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                 box_remainder='all')
                             ib = backward._inter_from_state(
                                 net, lambda e: zst[e].bounds())
+                            zout = zst[net.output_name]
                             del zst
                         except (torch.cuda.OutOfMemoryError,
                                 NotImplementedError):
@@ -541,7 +607,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                         torch.maximum(iv[j2 + 1],
                                                                       merged[-1])))
                         inter[k2] = tuple(merged)
-            lbq, Ain = backward.crown(net, blo, bhi, W, inter,
+            Wq = W if row_groups is None else W[row_groups[brow]]
+            lbq, Ain = backward.crown(net, blo, bhi, Wq, inter,
                                       return_input_adjoint=True)
         except torch.cuda.OutOfMemoryError:
             # v1's round-level pattern: push the popped batch back, halve
@@ -567,6 +634,23 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         # matching linearization and an inflated bias would over-clip
         # (cutting real counterexamples: unsound)
         lbq_lin = lbq.clone()
+        if zout is not None:
+            # forward-zono spec concretization: w.c - |w.G|.1 - |w|.rad is
+            # a sound lower bound that KEEPS the state's cross-factor
+            # correlations end-to-end; extracting per-edge boxes for the
+            # backward crown severs them at every mul (lsnc quadrotor2d:
+            # the correlated product state was invisible to the crown).
+            # lbq_lin above stays the PLAIN crown concretization -- the
+            # clip's (A, c) reconstruction must match Ain exactly.
+            Wq3 = Wq if Wq.dim() == 3 \
+                else Wq.unsqueeze(0).expand(blo.shape[0], -1, -1)
+            zm = torch.bmm(Wq3, zout.c.unsqueeze(2)).squeeze(2) \
+                - torch.bmm(Wq3, zout.G).abs().sum(dim=2)
+            if zout.rad is not None:
+                zm = zm - torch.bmm(Wq3.abs(),
+                                    zout.rad.unsqueeze(2)).squeeze(2)
+            lbq = torch.maximum(lbq, zm)
+            zout = None
         n_bounded += blo.shape[0]
         refuted = domain_refuted(lbq, brow)
         open_mask = ~refuted.all(dim=1)
@@ -593,7 +677,11 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             if open_mask.any() and alpha_iters > 0 and oi.numel():
                 inter_o = {k2: tuple(t[oi] for t in v)
                            for k2, v in inter.items()}
-                if brow is not None:
+                if row_groups is not None:
+                    # per-domain rows: no shared columns to threshold; let
+                    # alpha optimize every row fully (sound, no early-stop)
+                    thr = None
+                elif brow is not None:
                     # W is weight-deduped (q_W cols); the alpha loss threshold
                     # must be per-COLUMN, not per original row. Target each
                     # column's HARDEST domain (max of -bias over rows mapping
@@ -604,7 +692,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                         include_self=True)
                 else:
                     thr = -bias
-                lb_a, al = backward.alpha_crown(net, blo[oi], bhi[oi], W,
+                Wq_o = Wq[oi] if row_groups is not None else W
+                lb_a, al = backward.alpha_crown(net, blo[oi], bhi[oi], Wq_o,
                                                 inter_o, iters=alpha_iters,
                                                 thresholds=thr,
                                                 return_alpha=True)
@@ -613,8 +702,9 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 # (A, b) upgrade for the clip below (the plain-CROWN pair is
                 # much weaker; pairing alpha bounds with the plain-CROWN A
                 # would over-clip and was the unsound variant)
-                lb_al, Ain_a = backward.crown(net, blo[oi], bhi[oi], W, inter_o,
-                                              al, return_input_adjoint=True)
+                lb_al, Ain_a = backward.crown(net, blo[oi], bhi[oi], Wq_o,
+                                              inter_o, al,
+                                              return_input_adjoint=True)
                 # adopt the alpha linearization ONLY where it beats the plain
                 # one, rowwise (each row's (A_r, b_r) is an independent valid
                 # pair). The final alpha iterate can be WORSE than the plain
@@ -655,25 +745,52 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             # it timeout -- it is the load-bearing certifier, not the alpha)
             oref = refuted[open_mask]
             if brow is not None:
-                # multi-sub: each domain clips against ITS single row's
-                # halfspace A_r.x + d_r <= 0 (a pure conjunction). Gather the
-                # domain's weight-row adjoint and per-domain bound from the
-                # weight-deduped columns (same closed form as clip_domains).
+                # multi-sub: each domain clips against ITS OWN rows'
+                # halfspaces A_r.x + c_r <= 0 (a pure conjunction; group
+                # mode iterates the disjunct's rows, each tightening the
+                # box the next clips further). The affine constant c_r is
+                # recovered over the ORIGINAL box the crown ran on (the
+                # per-row concretization lbq_lin is a min over THAT box);
+                # re-deriving it over a shrunk box would be unsound.
                 orow = brow[open_mask]
-                wrow_o = weight_of[orow]
-                Ar = oA.gather(1, wrow_o.view(-1, 1, 1)
-                               .expand(-1, 1, oA.shape[2])).squeeze(1)
-                d_r = (lbq_lin[open_mask].gather(
-                    1, wrow_o.unsqueeze(1)).squeeze(1) + bias[orow])
-                mn = Ar.clamp(max=0) * ohi + Ar.clamp(min=0) * olo
-                base = mn.sum(dim=1, keepdim=True)
-                d = d_r.unsqueeze(1) - base
-                slack = -d - (base - mn)
-                new_hi = torch.minimum(ohi, slack / Ar.clamp_min(1e-30))
-                new_lo = torch.maximum(olo, slack / Ar.clamp_max(-1e-30))
-                xh_u = torch.where(Ar > 0, new_hi, ohi)
-                xl_u = torch.where(Ar < 0, new_lo, olo)
+                og = (row_groups[orow] if row_groups is not None
+                      else orow.unsqueeze(1))            # (B, r) W rows
+                if row_groups is not None:
+                    # per-domain W: lbq_lin's r columns ARE the own rows
+                    A_own = oA                           # (B, r, n)
+                    d_own = lbq_lin[open_mask] + bias[og]
+                else:
+                    wrow_o = weight_of[og]               # (B, 1)
+                    A_own = oA.gather(1, wrow_o.unsqueeze(-1)
+                                      .expand(-1, -1, oA.shape[2]))
+                    d_own = (lbq_lin[open_mask].gather(1, wrow_o)
+                             + bias[og])
+                # affine constants recovered over the box the crown ran on
+                # (d_own is a min over THAT box; re-deriving one over a
+                # shrunk box would be unsound)
+                mn0 = (A_own.clamp(min=0) * olo.unsqueeze(1)
+                       + A_own.clamp(max=0) * ohi.unsqueeze(1)).sum(-1)
+                c_own = d_own - mn0                      # (B, r)
+                xl_u, xh_u = olo, ohi
+                for j_g in range(og.shape[1]):
+                    Ar = A_own[:, j_g]
+                    c = c_own[:, j_g].unsqueeze(1)
+                    mn = Ar.clamp(max=0) * xh_u + Ar.clamp(min=0) * xl_u
+                    base = mn.sum(dim=1, keepdim=True)
+                    slack = -c - (base - mn)
+                    new_hi = torch.minimum(xh_u, slack / Ar.clamp_min(1e-30))
+                    new_lo = torch.maximum(xl_u, slack / Ar.clamp_max(-1e-30))
+                    xh_u = torch.where(Ar > 0, new_hi, xh_u)
+                    xl_u = torch.where(Ar < 0, new_lo, xl_u)
                 feas_any = (xh_u - xl_u).min(dim=1).values >= 0
+                # post-clip re-check (abcrown clip_n_verify): the same rows
+                # concretized over the SHRUNK box; a positive row closes
+                # the domain without a split
+                mn1 = (A_own.clamp(min=0) * xl_u.unsqueeze(1)
+                       + A_own.clamp(max=0) * xh_u.unsqueeze(1)).sum(-1)
+                lb_clip = c_own + mn1
+                feas_any &= ~((lb_clip > 0)
+                              & torch.isfinite(lb_clip)).any(dim=1)
             else:
                 lbb = (lbq_lin + bias)[open_mask]
                 xl_u = torch.full_like(olo, torch.inf)
@@ -707,8 +824,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 orow = orow[feas_any]
                 # per-domain query bound = the domain's OWN row (weight-deduped
                 # gather + per-domain bias); lbq columns are unique weights.
-                lbq_open = (lbq[open_mask][feas_any].gather(
-                    1, weight_of[orow].unsqueeze(1)).squeeze(1) + bias[orow])
+                lbq_open = dom_bound(lbq[open_mask][feas_any], orow)
             else:
                 lbq_open = (lbq + bias)[open_mask][feas_any]
             if not olo.shape[0]:
@@ -719,8 +835,17 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             if heuristic == 'widest':
                 score = ohi - olo
             else:
+                # (group mode: oA's rows are the domain's OWN rows already,
+                # so the sum scores exactly the right polytope)
                 score = oA.abs().sum(dim=1) * (ohi - olo) / 2
             kdims = min(split_dims, olo.shape[1])
+            if row_groups is not None and f_lo.shape[0] < bs // 4:
+                # frontier-starved ramp (decomposed mode): 2-way splitting
+                # from a handful of roots pays ~25 rounds of fixed per-round
+                # cost before a batch fills (lsnc: ~4s of a 19s slice).
+                # Splitting 3 extra levels while starved fills the frontier
+                # in a few rounds; those shallow boxes would split anyway.
+                kdims = min(split_dims + 3, olo.shape[1])
             topk = score.topk(kdims, dim=1).indices          # (B, kdims)
             if debug.enabled() and rounds <= 64:
                 debug.add_seq('bab_split_dim', int(topk[0, 0]))
@@ -744,26 +869,51 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                    'bounded': n_bounded,
                                    'splits': n_split,
                                    'reason': 'host_ram_cap'}
-            f_lo = torch.cat([f_lo, ch_lo.cpu()])
-            f_hi = torch.cat([f_hi, ch_hi.cpu()])
             if brow is not None:
                 w = lbq_open                    # already per-domain (No,)
+                # child pre-refutation (abcrown's concretize step): the
+                # parent's own linear forms (A, c) are valid on any subset,
+                # so evaluate them over each child box and never push a
+                # child they already prove empty -- a refuted child costs
+                # ~nothing here vs a full zono+crown pass next round. The
+                # surviving child's linear margin doubles as a TIGHTER
+                # frontier priority than the parent's repeated bound.
+                reps_c = ch_lo.shape[0] // olo.shape[0]
+                A_f = A_own[feas_any].repeat(reps_c, 1, 1)
+                c_f = c_own[feas_any].repeat(reps_c, 1)
+                mnc = (A_f.clamp(min=0) * ch_lo.unsqueeze(1)
+                       + A_f.clamp(max=0) * ch_hi.unsqueeze(1)).sum(-1)
+                lb_ch = c_f + mnc                        # (C, r)
+                ch_keep = ~((lb_ch > 0) & torch.isfinite(lb_ch)).any(dim=1)
+                ch_pri = lb_ch.masked_fill(~torch.isfinite(lb_ch),
+                                           -torch.inf).max(dim=1).values
+                f_lo = torch.cat([f_lo, ch_lo[ch_keep].cpu()])
+                f_hi = torch.cat([f_hi, ch_hi[ch_keep].cpu()])
                 f_row = torch.cat([f_row,
-                                   orow.repeat(ch_lo.shape[0]
-                                               // orow.shape[0]).cpu()])
+                                   orow.repeat(reps_c)[ch_keep].cpu()])
+                f_worst = torch.cat([f_worst, ch_pri[ch_keep].cpu()])
             else:
                 w = lbq_open.min(dim=1).values
+                f_lo = torch.cat([f_lo, ch_lo.cpu()])
+                f_hi = torch.cat([f_hi, ch_hi.cpu()])
                 f_row = torch.cat([f_row,
                                    torch.zeros(ch_lo.shape[0],
                                                dtype=torch.long)])
-            f_worst = torch.cat([f_worst,
-                                 w.repeat(ch_lo.shape[0] // w.shape[0])
-                                 .cpu()])
+                f_worst = torch.cat([f_worst,
+                                     w.repeat(ch_lo.shape[0] // w.shape[0])
+                                     .cpu()])
             n_split += int(w.shape[0])
 
             if onnx_path is not None and (
-                    rounds % attack_every == 1
-                    or time.time() - last_atk > 8.0):
+                    rounds == 1
+                    or time.time() - last_atk > 8.0
+                    or (rounds % attack_every == 1
+                        and time.time() - last_atk > 2.0)):
+                # cadence is time-gated: the bare round-modulo fired a 0.5s
+                # pgd every few hundred ms during the fast early rounds
+                # (lsnc: ~3s of a 19s BaB slice burned before the frontier
+                # ramped). Round 1 stays unconditional -- the first
+                # post-clip subboxes are the attack's best shot on sat rows.
                 last_atk = time.time()
                 # attack the worst open subboxes as one batched-box PGD
                 widx = torch.argsort(w)[:64]

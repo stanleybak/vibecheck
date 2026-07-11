@@ -567,30 +567,77 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                     rad2[:, p] = zp.rad
             state[name] = ZonoState(c2, G2, syms, rad2)
         elif op.kind == 'mul':
-            # bilinear product: sound box collapse. The correlation-exact
-            # first-order product (v1 _torch_zono_mul_bilinear) was built
-            # and MEASURED on ml4acopf 0298: bit-identical alpha_zono
-            # margin, 2x slower (extra generator columns) -- the mul band
-            # is not binding at the optimum there. Reintroduce only with a
-            # case it wins.
+            # correlation-exact first-order product (the elementwise case
+            # of _bmm_zono's algebra): z = a.b keeps the linear cross terms
+            # on the SHARED symbols and the e^2 diagonal as fresh shared
+            # symbols, so a u.(P u) quadratic form stays coupled through
+            # the downstream reduce-sum. The old sound box collapse severed
+            # the factor correlation entirely: lsnc quadrotor2d root -50 vs
+            # v1's correlated -15.8 (sign-symmetric garbage on a PSD form).
+            # ml4acopf 0298 measured bit-equal either way, so the
+            # per-element hybrid below keeps box-friendly regimes at the
+            # (exact) corner product.
             za, zb = state[op.inputs[0]], state[op.inputs[1]]
+            ga, gb = za.G.shape[2], zb.G.shape[2]
+            kpre = _shared_prefix(za.sym, zb.sym)
+            sym = za.sym[:kpre] + za.sym[kpre:] + zb.sym[kpre:]
+            Ga = torch.cat([za.G, torch.zeros(B, za.c.shape[1], gb - kpre,
+                                              device=dev, dtype=dt)], dim=2)
+            Gb = torch.cat([zb.G[:, :, :kpre],
+                            torch.zeros(B, zb.c.shape[1], ga - kpre,
+                                        device=dev, dtype=dt),
+                            zb.G[:, :, kpre:]], dim=2)
+            D = Ga * Gb                                     # (B, n, g)
+            c2 = za.c * zb.c + 0.5 * D.sum(dim=2)           # e^2 in [0,1]
+            G2 = Ga * zb.c.unsqueeze(2) + Gb * za.c.unsqueeze(2)
+            ra = za.G.abs().sum(dim=2)
+            rb = zb.G.abs().sum(dim=2)
+            dabs = D.abs().sum(dim=2)
+            box_off = (ra * rb - dabs).clamp_min(0.0)       # i != j terms
+            if za.rad is not None:
+                # remainder cross terms, first-order in unlabeled noise:
+                # (|c|+r)_a * rad_b + rad_a * (|c|+r)_b covers rad*gen,
+                # rad*center and rad*rad products (|a.u| <= |a|)
+                box_off = box_off \
+                    + (za.c.abs() + ra + za.rad) * zb.rad \
+                    + za.rad * (zb.c.abs() + rb)
+            # per-element hybrid vs the exact interval corner product (both
+            # enclose the true image; 4x threshold as in _bmm_zono --
+            # collapse only guards genuine blow-ups, mild extra width pays
+            # for itself through the preserved correlations)
             (la, ha), (lb_, hb_) = za.bounds(), zb.bounds()
             cands = torch.stack([la * lb_, la * hb_, ha * lb_, ha * hb_])
-            mlo = cands.min(dim=0).values
-            mhi = cands.max(dim=0).values
+            ilo = cands.min(dim=0).values
+            ihi = cands.max(dim=0).values
             if 'out_lo' in op.params:      # emission-declared output range
-                mlo = mlo.clamp_min(op.params['out_lo'])
+                ilo = ilo.clamp_min(op.params['out_lo'])
             if 'out_hi' in op.params:
-                mhi = torch.maximum(mhi.clamp_max(op.params['out_hi']), mlo)
-            c2 = (mhi + mlo) / 2
-            delta = (mhi - mlo) / 2
+                ihi = torch.maximum(ihi.clamp_max(op.params['out_hi']), ilo)
+            aw = 2 * (G2.abs().sum(dim=2) + 0.5 * dabs + box_off)
+            worse = ((aw > 4.0 * (ihi - ilo) + 1e-12).any(dim=0)
+                     .unsqueeze(0).expand(B, c2.shape[1]))
+            c2 = torch.where(worse, (ihi + ilo) / 2, c2)
+            G2 = torch.where(worse.unsqueeze(2), torch.zeros_like(G2), G2)
+            D = torch.where(worse.unsqueeze(2), torch.zeros_like(D), D)
+            box_off = torch.where(worse, (ihi - ilo) / 2, box_off)
             if box_remainder:
-                state[name] = ZonoState(
-                    c2, torch.zeros(B, c2.shape[1], 0, device=dev, dtype=dt),
-                    [], delta)
+                # remainder mode: no new columns; the e^2 residual joins
+                # the off-diagonal box (this mode trades exactly this
+                # correlation for memory)
+                state[name] = ZonoState(c2, G2, sym,
+                                        box_off + 0.5 * D.abs().sum(dim=2))
             else:
-                G2 = torch.diag_embed(delta)
-                sym = [(name, i) for i in range(c2.shape[1])]
+                # e^2 diagonal as fresh SHARED symbols u_g = 2 e_g^2 - 1:
+                # one column per source symbol with any nonzero product
+                # mass, correlated across elements (a per-element box here
+                # would re-lose the quadratic form at the reduce-sum)
+                gidx = torch.nonzero((D != 0).any(dim=0).any(dim=0),
+                                     as_tuple=False).flatten()
+                if gidx.numel():
+                    G2 = torch.cat([G2, 0.5 * D[:, :, gidx]], dim=2)
+                    sym = sym + [(name, 'sq', int(g_))
+                                 for g_ in gidx.tolist()]
+                G2, sym = _append_fresh(G2, sym, box_off, name, dev, dt)
                 state[name] = ZonoState(c2, G2, sym)
         elif op.kind == 'bmm':
             za, zb = state[op.inputs[0]], state[op.inputs[1]]

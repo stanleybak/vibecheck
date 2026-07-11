@@ -369,9 +369,16 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     if pgd_budget > 0:
         restarts = 100
         for _ in range(3):                        # 100 -> 250 -> 625
+            # the multi-region SLP polish (4 tries x ~0.5s) is the hidden-CE
+            # lever on generous budgets; on short-budget instances those 2s
+            # come straight out of the BaB endgame (lsnc: T=25, BaB needs
+            # ~19s), and a razor-thin plateau there is a barely-TRUE unsat
             w, ainfo = attack.pgd(net, spec, device=device, restarts=restarts,
                                   iters=250, init='osi',
-                                  time_budget=pgd_budget, log=log)
+                                  time_budget=pgd_budget,
+                                  polish_tries=(
+                                      4 if budget.remaining() > 60 else 1),
+                                  log=log)
             if w is not None:
                 ok, vinfo = attack.validate(onnx_path, spec, w, log=log)
                 if ok:
@@ -524,12 +531,43 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # need lift + dual (index112: v1 spends 96.8s there) fall through
         # to the normal heavy pipeline below on a miss
         from .core.search import input_split_bab
+        # DISJUNCT DECOMPOSITION (abcrown's or-clause handling): each
+        # disjunct becomes its own root domain over the same box. Its few
+        # conjunctive rows clip hard where the UNION clip over all
+        # disjunct polytopes barely shrinks, and easy disjuncts drain
+        # early (lsnc quadrotor2d: 12/13 disjuncts close in ~1-4s each
+        # decomposed while the joint frontier explodes past 1.2M boxes;
+        # abcrown closes the same row in 15s with exactly this split).
+        roots_arg = rgroups = None
+        n_dj = len(spec.disjuncts)
+        if n_dj > 1:
+            per_rows = [(di == d2).nonzero().flatten()
+                        for d2 in range(n_dj)]
+            if all(p.numel() for p in per_rows):
+                r_max = max(p.numel() for p in per_rows)
+                rgroups = torch.stack([
+                    torch.cat([p, p[:1].expand(r_max - p.numel())])
+                    for p in per_rows])
+                roots_arg = (lo[0].unsqueeze(0).expand(n_dj, -1),
+                             hi[0].unsqueeze(0).expand(n_dj, -1),
+                             torch.arange(n_dj))
         # two-stage alpha escalation: the boundary-alpha depth is a
         # knife-edge lever (iso instance_3 closes at 8 iters and dies at
         # 20; instance_31 the exact opposite -- deeper alpha both closes
         # marginal leaves AND steers splits off-tree via the adopted
         # linearizations). Stage 1 costs nothing when it wins.
-        for ai, frac in ((8, 0.7), (20, 0.9)):
+        stages = ((8, 0.7), (20, 0.9))
+        bab_kw = {}
+        if roots_arg is not None:
+            # decomposed mode, measured on lsnc quadrotor2d_0 (A10G):
+            # 2-way splits + full-frontier batches + alpha OFF -> unsat
+            # 22.8s / 27.6M boxes drained, where 4-way/64k/alpha-8
+            # explodes past 3.7M frontier (alpha both halves round
+            # throughput and gains ~0 -- the deep-box slack is the mul
+            # band, which alpha cannot move)
+            stages = ((0, 0.9),)
+            bab_kw = {'split_dims': 1, 'batch': 1048576}
+        for ai, frac in stages:
             if budget.remaining() < 5:
                 # a 20s-budget instance (nn4sys mscn) measured 6.4s of
                 # OVERRUN from stage 2 + the dual + the final BaB all
@@ -539,7 +577,8 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             verdict, binfo = input_split_bab(
                 net, spec, W, b, di, lo[0], hi[0],
                 deadline=min(t0 + timeout - 2.0, slice_end), device=device,
-                alpha_iters=ai, onnx_path=onnx_path, log=log)
+                alpha_iters=ai, onnx_path=onnx_path,
+                roots=roots_arg, row_groups=rgroups, log=log, **bab_kw)
             log(f'[vc2] input_split_bab (wide slice, alpha={ai}): '
                 f'{verdict} '
                 f'{ {k: v for k, v in binfo.items() if k != "witness"} }')

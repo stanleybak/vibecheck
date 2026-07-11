@@ -104,11 +104,16 @@ def _osi_diversify(net, x, lo, hi, generator, steps=30):
 
 def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         device='cpu', time_budget=10.0, init='uniform', seeds=None,
-        lr_frac=0.25, lr_decay=0.99, plateau=40, log=lambda m: None):
+        lr_frac=0.25, lr_decay=0.99, plateau=40, polish_tries=4,
+        log=lambda m: None):
     """Search for a spec counterexample. Returns (witness_np | None, info).
 
     The returned witness is ONLY a candidate: callers must gate it through
     validate() (the ORT chokepoint) before any 'sat' verdict.
+
+    polish_tries: how many top plateau points get the razor-thin SLP polish
+    (different activation regions; soundnessbench needs all 4). Short-budget
+    unsat-leaning callers pass 1 -- each try costs ~0.5s of BaB time.
     """
     dev = torch.device(device)
     dt = torch.float32
@@ -214,7 +219,7 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         # plateau points sit in different activation regions (measured:
         # soundnessbench 009's best point polishes 4.6e-4 -> 5.6e-5 and
         # stalls there -- the face is not reachable in every region).
-        for bi in order[:4].tolist():
+        for bi in order[:polish_tries].tolist():
             if float(best_m[bi]) >= 1e-2:
                 break
             cand = _slp_polish(net, spec,
