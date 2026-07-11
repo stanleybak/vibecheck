@@ -630,13 +630,21 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 # e^2 diagonal as fresh SHARED symbols u_g = 2 e_g^2 - 1:
                 # one column per source symbol with any nonzero product
                 # mass, correlated across elements (a per-element box here
-                # would re-lose the quadratic form at the reduce-sum)
+                # would re-lose the quadratic form at the reduce-sum).
+                # CAPPED: each mul otherwise adds ~g columns and sequential
+                # muls compound (ml4acopf 300_ieee: 3 muls over a wide
+                # state blew fzono-alpha from 110s to 600s+); past the cap
+                # the diagonal residual folds into the fresh box while the
+                # first-order correlated gens -- the main win, zero new
+                # columns -- always stay.
                 gidx = torch.nonzero((D != 0).any(dim=0).any(dim=0),
                                      as_tuple=False).flatten()
-                if gidx.numel():
+                if 0 < gidx.numel() <= 256:
                     G2 = torch.cat([G2, 0.5 * D[:, :, gidx]], dim=2)
                     sym = sym + [(name, 'sq', int(g_))
                                  for g_ in gidx.tolist()]
+                else:
+                    box_off = box_off + 0.5 * D.abs().sum(dim=2)
                 G2, sym = _append_fresh(G2, sym, box_off, name, dev, dt)
                 state[name] = ZonoState(c2, G2, sym)
         elif op.kind == 'bmm':

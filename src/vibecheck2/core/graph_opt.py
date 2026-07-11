@@ -16,8 +16,61 @@ function it computes -- so it can run unconditionally at load and stays sound.
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 from .linmap import Dense
+
+
+def _dense_of(lm, n_in):
+    """(W, b) float64 of a small LinMap via identity probes (any layout)."""
+    eye = torch.eye(n_in, dtype=torch.float64)
+    W = np.asarray(lm.lin(eye).T.numpy(), dtype=np.float64)
+    b = np.asarray(lm.bias_vec(torch.zeros(1, n_in, dtype=torch.float64))
+                   .numpy(), dtype=np.float64).reshape(-1)
+    return W, b
+
+
+def fuse_affine(net, max_n=4096, max_elems=4_000_000):
+    """Compose single-consumer linmap->linmap chains into ONE Dense map.
+
+    Per-pass op-dispatch cost dominates tiny wide-route nets: lsnc's 51-op
+    quadrotor graph pays ~51 Python ops x 4-5 passes per BaB round, and
+    the decomposed BaB runs 640k domains/s where abcrown (fused affine
+    layers) does 1.2M/s on the IDENTICAL 13.4M-domain tree. Composition
+    happens in float64 and only when both maps materialize small dense
+    matrices -- conv-scale nets are untouched (densifying a conv is a
+    memory disaster). Exact up to fp reassociation (the same class of
+    deviation as the front end's existing folds; every sat still
+    validates against the real onnx through the ORT chokepoint)."""
+    changed = True
+    while changed:
+        changed = False
+        consumers = {}
+        for nm2 in net.order:
+            for e in net.ops[nm2].inputs:
+                consumers[e] = consumers.get(e, 0) + 1
+        for nm2 in list(net.order):
+            op = net.ops.get(nm2)
+            if op is None or op.kind != 'linmap':
+                continue
+            up = net.ops.get(op.inputs[0])
+            if (up is None or up.kind != 'linmap'
+                    or consumers.get(up.name, 0) != 1
+                    or up.name == net.output_name):
+                continue
+            n0 = net.ops[up.inputs[0]].n
+            if (max(n0, up.n, op.n) > max_n
+                    or n0 * up.n > max_elems or up.n * op.n > max_elems):
+                continue
+            W1, b1 = _dense_of(up.lm, n0)
+            W2, b2 = _dense_of(op.lm, up.n)
+            op.lm = Dense((W2 @ W1).astype(np.float32),
+                          (W2 @ b1 + b2).astype(np.float32))
+            op.inputs = (up.inputs[0],)
+            del net.ops[up.name]
+            net.order.remove(up.name)
+            changed = True
+    return net
 
 
 def _wb(dense):

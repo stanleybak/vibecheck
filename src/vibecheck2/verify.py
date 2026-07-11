@@ -376,8 +376,19 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     if op.kind == 'nonlin')
     n_relu_layers = sum(1 for op in net.ops.values()
                         if op.kind == 'nonlin')
+    _polish_tries = 4 if budget.remaining() > 60 else 1
     if relu_only and n_relu_layers <= 2:
         pgd_budget = min(pgd_budget, 2.0)
+    elif int((np.asarray(spec.x_hi).ravel()
+              - np.asarray(spec.x_lo).ravel() > 1e-6).sum()) <= 32:
+        # mixed net on the WIDE (input-split) route: the closer is the
+        # decomposed BaB and every root-attack second starves it (lsnc_33:
+        # frontier at 550 boxes of ~13.5M when the deadline hit). True-sat
+        # rows there cross zero inside pgd directly; the razor-thin SLP
+        # polish serves hidden-CE nets with generous budgets, which keep it.
+        pgd_budget = min(pgd_budget, 2.5)
+        if budget.remaining() < 60:
+            _polish_tries = 0
     if pgd_budget > 0:
         restarts = 100
         for _ in range(3):                        # 100 -> 250 -> 625
@@ -388,8 +399,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             w, ainfo = attack.pgd(net, spec, device=device, restarts=restarts,
                                   iters=250, init='osi',
                                   time_budget=pgd_budget,
-                                  polish_tries=(
-                                      4 if budget.remaining() > 60 else 1),
+                                  polish_tries=_polish_tries,
                                   log=log)
             if w is not None:
                 ok, vinfo = attack.validate(onnx_path, spec, w, log=log)
@@ -490,7 +500,14 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     # phases (joint-inter alpha, lift, dual) are wasted work there.
     n_wide = int((hi[0] - lo[0] > 1e-6).sum())
     wide_route = n_wide <= 32
-    if verdict != 'unsat':
+    # decomposed-BaB fast path: a deeply negative root crown on a
+    # multi-disjunct wide instance never closes at the root phases (alpha
+    # lifts <2x; lsnc sits at -73), and the BaB rebuilds its own
+    # alpha-refined root_ref anyway -- the ~0.4s of crown-inter +
+    # alpha-crown is pure starvation of the closer
+    _skip_root_refine = (wide_route and len(spec.disjuncts) > 1
+                         and float((lb0 + b).min()) < -20.0)
+    if verdict != 'unsat' and not _skip_root_refine:
         # per-edge backward-CROWN refinement whenever disjuncts stay
         # open -- QUALITY-triggered, not memory-triggered. (It was gated
         # on 'zono does not fit', which meant a 23GB card took a WEAKER
@@ -511,15 +528,19 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             inter, _ = _zono_seed(inter, clamped=True)
         lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
         _phase('crown-inter', lb0)
-    if verdict != 'unsat' and alpha_iters > 0:
+    # defaults stand in for the skipped root-refine phases (later blocks
+    # read lb/worst/n_nonlin whether or not those phases ran)
+    lb = lb0
+    worst = float((lb0 + b).min())
+    n_nonlin = sum(net.ops[nm].n for nm in net.order
+                   if net.ops[nm].kind == 'nonlin')
+    if verdict != 'unsat' and alpha_iters > 0 and not _skip_root_refine:
         lb = backward.alpha_crown(net, lo, hi, W, inter,
                                   iters=alpha_iters, thresholds=-b,
                                   budget=budget)[0]
         lb = torch.maximum(lb, lb0)
         _phase('alpha-crown', lb)
         worst = float((lb + b).min())
-        n_nonlin = sum(net.ops[nm].n for nm in net.order
-                       if net.ops[nm].kind == 'nonlin')
     from .core import debug as _dbg
     if _dbg.enabled():
         _dbg.add('W', W)
@@ -641,8 +662,9 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # decomposed mode is single-stage and the last real phase on
             # these short-budget rows: hand it the tail reserve too (the
             # post-slice heavy phases are all remaining-gated off anyway;
-            # lsnc siblings sat ~2s short of closing at the 2.0s reserve)
-            tail = 1.2 if roots_arg is not None else 2.0
+            # lsnc siblings sat ~2s short of closing at the 2.0s reserve,
+            # and _33's frontier was at 550 boxes at the 1.2s one)
+            tail = 0.6 if roots_arg is not None else 2.0
             verdict, binfo = input_split_bab(
                 net, spec, W, b, di, lo[0], hi[0],
                 deadline=min(t0 + timeout - tail, slice_end), device=device,

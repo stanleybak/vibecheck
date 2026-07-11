@@ -902,12 +902,14 @@ def load(onnx_path, dtype=np.float32) -> Net:
     # constant pad), Min/Max, and MaxPool directly on the IR, and the passes
     # below fold split-relus + decompose maxpool. No v1 onnx_optimizer.
     net = from_compute_graph(cg, true_shapes=_onnx_true_shapes(onnx_path))
-    from .graph_opt import fold_split_relu
+    from .graph_opt import fold_split_relu, fuse_affine
     net = fold_split_relu(net)          # undo relu-split hardening (exact)
     # MaxPool is emitted as a native maxpool op (from_compute_graph) and
     # decomposed here into the exact pairwise relu tree -- one vc2-native path
     # for padded AND unpadded pools (no ONNX-level maxpool_to_relu needed).
     net = decompose_maxpool(net)
+    net = fuse_affine(net)              # compose small linmap chains (exact
+                                        # up to fp reassociation; size-gated)
     net = tag_simplex_bmm(net)
     net.onnx_path = onnx_path
     return net
