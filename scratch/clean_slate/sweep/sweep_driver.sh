@@ -28,18 +28,18 @@ while IFS=, read -r cat ver onnx vnnlib to; do
 	n=$((n+1))
 	if done_key "$onnx" "$vnnlib"; then continue; fi
 	VN="$BENCH/$vnnlib"
+	# files may be staged as .gz (vc2's loaders resolve the .gz sibling from
+	# the plain path via ensure_decompressed); accept either form.
+	ex() { [ -f "$1" ] || [ -f "$1.gz" ]; }
 	case "$onnx" in
 	PAIR\|*)   # network-pair: onnx = PAIR|<f_rel>|<g_rel>
 		F=$(echo "$onnx" | cut -d'|' -f2); G=$(echo "$onnx" | cut -d'|' -f3)
 		ON="[('f', '$BENCH/$F'), ('g', '$BENCH/$G')]"
-		# files may be staged as .onnx.gz (vc2 resolves the .gz sibling from
-		# the plain path); accept either form in the existence check.
-		ex() { [ -f "$1" ] || [ -f "$1.gz" ]; }
 		ex "$BENCH/$F" && ex "$BENCH/$G" && ex "$VN" || {
 			echo "$cat,$onnx,$vnnlib,$ver,missing_file,0" >> "$RESULTS"; continue; } ;;
 	*)
 		ON="$BENCH/$onnx"
-		[ -f "$ON" ] && [ -f "$VN" ] || {
+		ex "$ON" && ex "$VN" || {
 			echo "$cat,$onnx,$vnnlib,$ver,missing_file,0" >> "$RESULTS"; continue; } ;;
 	esac
 	res=$(mktemp)
