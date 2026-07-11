@@ -495,16 +495,17 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         # batch_size 65536 for exactly this; 350k leaves/s at 64k vs 7k/s
         # at 4096). Expensive-leaf nets (iso: ~40us/leaf, where bigger
         # batches dilute the boundary-alpha cap) never trigger.
-        if (rounds > 4 and batch < 65536 and f_lo.shape[0] > batch
-                and _round_wall / max(_round_B, 1) < 3e-5):
-            # threshold 3e-5: acasxu 4_7 prop_1's full-refine leaves cost
-            # ~23us and sat just past the old 2e-5 cut; iso's ~40us leaves
-            # (the reason the guard exists) stay excluded. Growth fires
-            # whenever the frontier outruns the batch AT ALL -- the old
-            # 4x-frontier trigger stalled at 8192 in subset-popping mode,
-            # while FULL-frontier pops both amortize the round and shrink
-            # the tree (acasxu 4_7: batch 4096 bounded 2.6M boxes without
-            # closing; batch 65536 full-frontier closes at 215k in 8.5s).
+        if (rounds > 4 and batch < 65536 and f_lo.shape[0] > 4 * batch
+                and _round_wall / max(_round_B, 1) < 2e-5):
+            # (adaptive batch REGIME selection was tried here -- leaf-cost
+            # 3e-5 / frontier>batch / drain-gated variants -- and every
+            # rule helped one acasxu row while exploding another (4_7-p1
+            # needs 65536 full-frontier pops: 215k boxes vs 2.6M timeout;
+            # 3_3-p2 needs 4096 worst-first discipline: 13s vs 10M-box
+            # explosion). The caller's two-stage escalation now carries
+            # the regime instead: stage 1 = 4096 disciplined, stage 2 =
+            # 65536 throughput. This trigger stays exactly as validated
+            # by the 123/123 sweep.)
             batch *= 2
         _round_t0 = time.time()
         zout = None            # this batch's forward-zono OUTPUT state

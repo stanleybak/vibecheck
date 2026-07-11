@@ -650,7 +650,14 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # 20; instance_31 the exact opposite -- deeper alpha both closes
         # marginal leaves AND steers splits off-tree via the adopted
         # linearizations). Stage 1 costs nothing when it wins.
-        stages = ((8, 0.7), (20, 0.9))
+        # stage 1 = the DISCIPLINED regime (batch 4096 worst-first, the
+        # form the 123/123 validation sweep pinned); stage 2 = the
+        # THROUGHPUT regime (batch 65536 full-frontier pops). The two
+        # acasxu D=1 rows need OPPOSITE regimes (4_7-p1: 215k boxes at
+        # 65536 vs 2.6M timeout at 4096; 3_3-p2: 13s at 4096 vs a 10M-box
+        # explosion when grown) and every adaptive single-knob rule flipped
+        # one while fixing the other -- so run both, disciplined first.
+        stages = ((8, 0.55, 4096), (20, 0.9, 65536))
         bab_kw = {}
         if roots_arg is not None:
             # decomposed mode, measured on lsnc quadrotor2d_0 (A10G):
@@ -659,9 +666,9 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # explodes past 3.7M frontier (alpha both halves round
             # throughput and gains ~0 -- the deep-box slack is the mul
             # band, which alpha cannot move)
-            stages = ((0, 0.9),)
-            bab_kw = {'split_dims': 1, 'batch': 524288}
-        for ai, frac in stages:
+            stages = ((0, 0.9, 524288),)
+            bab_kw = {'split_dims': 1}
+        for ai, frac, sbatch in stages:
             if budget.remaining() < 5:
                 # a 20s-budget instance (nn4sys mscn) measured 6.4s of
                 # OVERRUN from stage 2 + the dual + the final BaB all
@@ -677,7 +684,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             verdict, binfo = input_split_bab(
                 net, spec, W, b, di, lo[0], hi[0],
                 deadline=min(t0 + timeout - tail, slice_end), device=device,
-                alpha_iters=ai, onnx_path=onnx_path,
+                alpha_iters=ai, batch=sbatch, onnx_path=onnx_path,
                 roots=roots_arg, row_groups=rgroups, log=log, **bab_kw)
             log(f'[vc2] input_split_bab (wide slice, alpha={ai}): '
                 f'{verdict} '
