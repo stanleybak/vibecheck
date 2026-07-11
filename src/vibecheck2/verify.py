@@ -773,7 +773,20 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             lb_f, fz_alphas = (None, None) if fz is None \
                 else (fz[0][0].double(), fz[1])
             if lb_f is not None:
-                gain32 = bool((lb_f > lb0.double() + 1e-12).any())
+                # gain measured on the OPEN disjuncts' rows only: a zono
+                # win on already-refuted rows says nothing about the row
+                # that decides the instance (cifar100 idx_8330: 1/99 open,
+                # some closed row gained, and the cold f64 stage burned
+                # ~40s on a crown-led open row -- zono-lift, the phase
+                # that closes it, never ran)
+                _open_set = {int(d2) for d2 in open_d}
+                _orows = torch.tensor(
+                    [i2 for i2 in range(di.shape[0])
+                     if int(di[i2]) in _open_set],
+                    dtype=torch.long, device=lb_f.device)
+                gain32 = bool((lb_f > lb0.double()
+                               + 1e-12)[_orows].any()) \
+                    if _orows.numel() else False
                 # escalate to f64 iff the zono frame LEADS (gain32; on
                 # crown-led nets precision cannot help a bound fzono
                 # didn't produce -- vit 1151 measured 38s of waste) AND
@@ -827,11 +840,14 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             # an op without a forward band yet is a feature boundary
             # for this escalation only; the phases below still run
             log(f'[vc2] fzono-alpha skipped ({e})')
-    if verdict != 'unsat' and len(open_d) == 1 and n_nonlin <= 20000:
+    if verdict != 'unsat' and len(open_d) == 1 and n_nonlin <= 80000:
         # zono-lift (v1 phase 2.5): exact box+halfspace LP tightening of
         # every pre-activation under the open disjunct's own output rows.
         # Region-conditional, hence scoped to the single-open-disjunct case
-        # where refuting that region IS the instance.
+        # where refuting that region IS the instance. Gate 80k: cifar100
+        # resnet_medium sits at 55460 nonlin and v1 closes idx_8330 with
+        # EXACTLY this phase (98/99 at alpha, lift kills the last one)
+        # while the old 20k gate skipped it and fzono burned the budget.
         from .core.dual_lp import lift_intermediates
         rows_d = torch.nonzero(di == open_d[0],
                                as_tuple=False).flatten().tolist()
