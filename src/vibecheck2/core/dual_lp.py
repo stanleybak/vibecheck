@@ -818,10 +818,21 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
     ver = _verifier(dev)
     state_cache = {}
     gamma_inter = {}
+    n_div_consec = 0
     for d in open_d:
         rows = torch.nonzero(disj_idx == d, as_tuple=False).flatten().tolist()
         left = deadline - time.time()
         if left <= 1.0:
+            break
+        if n_div_consec >= 2:
+            # divergence is a property of the shared STATE, not the row:
+            # sibling disjuncts rebuild the same too-loose state and
+            # re-diverge (vit pgd_2_3_16_1197: 4 disjuncts x ~8s of
+            # frontier doubling = 34s of a 100s budget for zero refuted;
+            # same signature as TinyYOLO's 217s burn). Two consecutive
+            # diverged disjuncts cede the WHOLE phase to the BaB.
+            log('[vc2/dual] 2 consecutive diverged disjuncts; '
+                'ceding phase to BaB')
             break
         # cap the dual's share: a diverging frontier must not starve the
         # BaB fall-through (challenging_certified: 490s at 19M open and
@@ -924,6 +935,7 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                 # this way while ab closes the row in 38s of BaB
                 log(f'[vc2/dual] disj {d} row {r}: DIVERGED '
                     f'(open={info.get("open")}/{_nodes}); ceding to BaB')
+                n_div_consec += 1
                 break
             if (verdict != 'unsat'
                     and info.get('reason') != 'splits_exhausted'
@@ -969,6 +981,7 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                 f'reason={info.get("reason", "-")} open={info.get("open", 0)}')
             if verdict == 'unsat':
                 refuted.add(d)
+                n_div_consec = 0
                 break
             if (verdict != 'unsat'
                     and info.get('reason') == 'splits_exhausted'
@@ -982,6 +995,7 @@ def _certify_queries_impl(net, spec, W, bias, disj_idx, lo, hi, inter,
                 log(f'[vc2/dual]   range-split: {verdict} {info}')
                 if verdict == 'unsat':
                     refuted.add(d)
+                    n_div_consec = 0
                     break
                 log('[vc2/dual] state too loose even range-split; bailing')
                 return refuted

@@ -428,6 +428,48 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         inter = backward.intermediates(net, lo, hi)
     except OutOfTime:
         return 'timeout', {'time': time.time() - t0}
+
+    def _inter_intersect(base, zi):
+        """Elementwise intersection of two inter dicts (same builder, same
+        keys/shapes; 4-tuples pair up as (lo, hi, lo, hi))."""
+        out = {}
+        for k2, v in base.items():
+            zv = zi.get(k2)
+            if zv is None or len(zv) != len(v):
+                out[k2] = v
+                continue
+            merged = []
+            for j2 in range(0, len(v), 2):
+                nl = torch.maximum(v[j2], zv[j2])
+                merged.append(nl)
+                merged.append(torch.maximum(
+                    torch.minimum(v[j2 + 1], zv[j2 + 1]), nl))
+            out[k2] = tuple(merged)
+        return out
+
+    def _zono_seed(cur, clamped):
+        """Forward-zono pass intersected into `cur` (v1 phase-1+2's
+        zono-tighten half). The root chain was INTERVAL-seeded before:
+        on attention nets the zono is the tight frame and the whole
+        chain inherited the loose seed (vit pgd_2_3_16_1197: crown-inter
+        -2.80 interval-seeded vs v1's zono-interleave -1.11)."""
+        from .core import memory as _mem
+        if backward._zono_cost_bytes(net, 1) > \
+                _mem.free_bytes(dev) * _mem.SAFETY:
+            return cur, False
+        try:
+            _zl, _zh, zst0 = forward.zono(
+                net, lo, hi, return_state=True,
+                clamp_bounds={k2: (v[0], v[1]) for k2, v in cur.items()
+                              if len(v) == 2} if clamped else None)
+            zi0 = backward._inter_from_state(
+                net, lambda e: zst0[e].bounds())
+            del zst0
+            return _inter_intersect(cur, zi0), True
+        except (NotImplementedError, torch.cuda.OutOfMemoryError):
+            return cur, False
+
+    inter, zono_seeded = _zono_seed(inter, clamped=False)
     lb0 = backward.crown(net, lo, hi, W, inter)[0]
     verdict, open_d = None, []
 
@@ -462,6 +504,11 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                                                  budget=budget)
         except OutOfTime:
             return 'timeout', {'time': time.time() - t0}
+        if zono_seeded and budget.remaining() > 10:
+            # interleave (v1 phase 1+2): re-run the zono OVER the crown-
+            # refined bounds (clamped at every nonlin input) and intersect
+            # -- each frame tightens the other's weak edges
+            inter, _ = _zono_seed(inter, clamped=True)
         lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
         _phase('crown-inter', lb0)
     if verdict != 'unsat' and alpha_iters > 0:
@@ -491,10 +538,12 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     # gate on the UNSTABLE count -- that is the MILP's binary count (milp.py),
     # not the full relu width. malbeware 16-25 has a wide layer but few
     # unstable neurons; keying on full width wrongly gated it out.
+    # (computed for EVERY net -- the stabilize gate below keys on it too,
+    # and mixed nets have relu layers of their own: vit's MLP blocks)
     n_unstable = sum(int(((inter[nm][0] < 0) & (inter[nm][1] > 0)).sum())
                      for nm in net.order
                      if net.ops[nm].kind == 'nonlin'
-                     and net.ops[nm].fn == 'relu') if relu_only else 0
+                     and net.ops[nm].fn == 'relu')
     milp_eligible = (relu_only and n_unstable <= 25_000
                      and n_relu_layers <= 2)
 
@@ -782,6 +831,25 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                 _phase('lift-polish', lb0)
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
+    if verdict != 'unsat' and open_d \
+            and 0 < n_unstable <= 2000 and budget.remaining() > 20:
+        # split-and-tighten stabilization (v1 bab_refine): tighten the
+        # INTERMEDIATES under targeted relu sign splits until root alpha
+        # closes; the frontier BaB below measurably explodes exactly where
+        # this converges (relusplitter model_2_2: v1 33s, vc2 BaB frontier
+        # 39k). Runs BEFORE the dual and on MIXED nets too -- v1 closes
+        # vit pgd_2_3_16_1197 in 4.9s with exactly this phase order
+        # (interleaved zono-tighten 0.16s -> 6/9 verified -> joint alpha
+        # closes the rest), while the dual burned 34s diverging on the
+        # same rows over the UNstabilized state.
+        from .core.search import stabilize_intermediates
+        inter = stabilize_intermediates(net, W, lo, hi, inter, budget,
+                                        device=device, log=log)
+        lb_s = backward.alpha_crown(net, lo, hi, W, inter,
+                                    iters=max(alpha_iters, 45),
+                                    thresholds=-b, budget=budget)[0]
+        lb0 = torch.maximum(lb0, lb_s)
+        _phase('stabilize', lb0)
     if verdict != 'unsat' and budget.remaining() > 5:
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
@@ -831,20 +899,6 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         if mv == 'unsat':
             return 'unsat', {'time': time.time() - t0}
         open_d = mres
-    if verdict != 'unsat' and open_d and relu_only \
-            and n_unstable <= 2000 and budget.remaining() > 20:
-        # split-and-tighten stabilization (v1 bab_refine): tighten the
-        # INTERMEDIATES under targeted sign splits until root alpha closes;
-        # the frontier BaB below measurably explodes exactly where this
-        # converges (relusplitter model_2_2: v1 33s, vc2 BaB frontier 39k)
-        from .core.search import stabilize_intermediates
-        inter = stabilize_intermediates(net, W, lo, hi, inter, budget,
-                                        device=device, log=log)
-        lb_s = backward.alpha_crown(net, lo, hi, W, inter,
-                                    iters=max(alpha_iters, 45),
-                                    thresholds=-b, budget=budget)[0]
-        lb0 = torch.maximum(lb0, lb_s)
-        _phase('stabilize', lb0)
     if verdict != 'unsat' and budget.remaining() > 3:
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
