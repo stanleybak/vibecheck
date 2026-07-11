@@ -148,6 +148,7 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
     D = len(spec.disjuncts)
     target = torch.arange(x.shape[0], device=dev) % max(D, 1)
     since_improve = 0
+    deepen_iters = 0
     it = 0
     sign_ops = [nm for nm in net.order
                 if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'sign']
@@ -162,8 +163,18 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         improved = overall < best_m
         best_x[improved] = x.detach()[improved]
         best_m = torch.minimum(best_m, overall)
-        if (best_m < 0).any():         # VNNLIB constraints are NON-strict:
-            break                      # equality satisfies (sat_relu Y_1<=0)
+        if (best_m < 0).any():
+            # VNNLIB constraints are NON-strict (equality satisfies;
+            # sat_relu Y_1<=0) -- but a FIRST-crossing candidate at ~-1e-4
+            # sits inside the CUDA-vs-ORT f32 noise band on deep nets and
+            # the chokepoint rejects it (cifar100 resnet_large idx_1063:
+            # -5e-4/-2e-4/-1e-3 rejected three times while vc1 sats in
+            # 5s). Spend up to 25 extra iters DEEPENING the violation past
+            # the band before returning; a razor-thin true CE still
+            # returns after the cap.
+            deepen_iters += 1
+            if float(best_m.min()) < -1e-2 or deepen_iters > 25:
+                break
         loss = m.gather(1, target.unsqueeze(1)).clamp(min=-0.05).sum()
         if sign_ops:
             # sign-boundary ATTRACTOR (ab custom_pgd_loss
