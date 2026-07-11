@@ -42,6 +42,27 @@ def fuse_affine(net, max_n=4096, max_elems=4_000_000):
     memory disaster). Exact up to fp reassociation (the same class of
     deviation as the front end's existing folds; every sat still
     validates against the real onnx through the ORT chokepoint)."""
+    def _small(nm_in, *ops_):
+        n0 = net.ops[nm_in].n
+        if n0 > max_n:
+            return False
+        for o in ops_:
+            if o.n > max_n or n0 * o.n > max_elems:
+                return False
+        return True
+
+    def _sole_linmaps_of_same_source(op, consumers):
+        """All inputs single-consumer linmaps of ONE shared source (and
+        none of them the output edge) -> that source, else None."""
+        srcs = set()
+        for e in op.inputs:
+            u = net.ops.get(e)
+            if (u is None or u.kind != 'linmap'
+                    or consumers.get(e, 0) != 1 or e == net.output_name):
+                return None
+            srcs.add(u.inputs[0])
+        return srcs.pop() if len(srcs) == 1 else None
+
     changed = True
     while changed:
         changed = False
@@ -51,25 +72,57 @@ def fuse_affine(net, max_n=4096, max_elems=4_000_000):
                 consumers[e] = consumers.get(e, 0) + 1
         for nm2 in list(net.order):
             op = net.ops.get(nm2)
-            if op is None or op.kind != 'linmap':
+            if op is None:
                 continue
-            up = net.ops.get(op.inputs[0])
-            if (up is None or up.kind != 'linmap'
-                    or consumers.get(up.name, 0) != 1
-                    or up.name == net.output_name):
-                continue
-            n0 = net.ops[up.inputs[0]].n
-            if (max(n0, up.n, op.n) > max_n
-                    or n0 * up.n > max_elems or up.n * op.n > max_elems):
-                continue
-            W1, b1 = _dense_of(up.lm, n0)
-            W2, b2 = _dense_of(op.lm, up.n)
-            op.lm = Dense((W2 @ W1).astype(np.float32),
-                          (W2 @ b1 + b2).astype(np.float32))
-            op.inputs = (up.inputs[0],)
-            del net.ops[up.name]
-            net.order.remove(up.name)
-            changed = True
+            if op.kind == 'linmap':
+                up = net.ops.get(op.inputs[0])
+                if (up is None or up.kind != 'linmap'
+                        or consumers.get(up.name, 0) != 1
+                        or up.name == net.output_name
+                        or not _small(up.inputs[0], up, op)):
+                    continue
+                n0 = net.ops[up.inputs[0]].n
+                W1, b1 = _dense_of(up.lm, n0)
+                W2, b2 = _dense_of(op.lm, up.n)
+                op.lm = Dense((W2 @ W1).astype(np.float32),
+                              (W2 @ b1 + b2).astype(np.float32))
+                op.inputs = (up.inputs[0],)
+                del net.ops[up.name]
+                net.order.remove(up.name)
+                changed = True
+            elif op.kind in ('add', 'concat'):
+                # add/concat of single-consumer linmaps sharing ONE source
+                # becomes a single linmap (sum of weights / stacked rows);
+                # this is what breaks lsnc's chains apart (the fused net
+                # then collapses further under the linmap-linmap rule)
+                src = _sole_linmaps_of_same_source(op, consumers)
+                if src is None:
+                    continue
+                ups = [net.ops[e] for e in op.inputs]
+                if not _small(src, op, *ups):
+                    continue
+                n0 = net.ops[src].n
+                mats = [_dense_of(u.lm, n0) for u in ups]
+                if op.kind == 'add':
+                    Wf = sum(m[0] for m in mats)
+                    bf = sum(m[1] for m in mats)
+                else:
+                    base = np.asarray(op.params['base'],
+                                      dtype=np.float64).reshape(-1)
+                    Wf = np.zeros((op.n, n0))
+                    bf = base.copy()
+                    for u, (Wu, bu), pos in zip(
+                            ups, mats, op.params['positions']):
+                        p = np.asarray(pos).reshape(-1)
+                        Wf[p] = Wu
+                        bf[p] = bu
+                for u in ups:
+                    del net.ops[u.name]
+                    net.order.remove(u.name)
+                net.ops[nm2] = type(op)(
+                    op.name, 'linmap', (src,), op.shape, op.n,
+                    lm=Dense(Wf.astype(np.float32), bf.astype(np.float32)))
+                changed = True
     return net
 
 

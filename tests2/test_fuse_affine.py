@@ -47,11 +47,13 @@ def test_fuse_affine_composes_chains_exactly():
     assert bool((lb[0] <= ys.min(dim=0).values + 1e-5).all())
 
 
-def test_fuse_affine_keeps_forks_and_big_maps():
+def test_fuse_affine_fork_collapses_exactly():
     rng = np.random.default_rng(5)
     def d(m, n):
         return Dense(rng.normal(size=(m, n)).astype(np.float32), None)
-    # 'a' feeds BOTH 'b' and 'c' (fork): must not fuse
+    # 'a' forks into 'b' and 'c', which re-join in 's': the add rule fuses
+    # b+c into one map of 'a', then the chain rule folds 'a' -- one linmap,
+    # same function
     ops = {
         'x': Op('x', 'input', (), (4,), 4),
         'a': Op('a', 'linmap', ('x',), (4,), 4, lm=d(4, 4)),
@@ -60,8 +62,11 @@ def test_fuse_affine_keeps_forks_and_big_maps():
         's': Op('s', 'add', ('b', 'c'), (4,), 4),
     }
     net = Net(ops, ['a', 'b', 'c', 's'], 'x', 's')
+    xs = torch.rand(64, 4) * 2 - 1
+    y0 = forward.point(net, xs)
     net = fuse_affine(net)
-    assert 'a' in net.ops and len(net.order) == 4
+    assert len(net.order) == 1, net.order
+    assert float((y0 - forward.point(net, xs)).abs().max()) < 1e-4
     # oversized maps: untouched
     ops2 = {
         'x': Op('x', 'input', (), (4,), 4),
@@ -71,3 +76,26 @@ def test_fuse_affine_keeps_forks_and_big_maps():
     net2 = Net(ops2, ['a', 'b'], 'x', 'b')
     net2 = fuse_affine(net2, max_n=2)
     assert 'a' in net2.ops
+
+
+def test_fuse_affine_add_concat_same_source():
+    """add/concat of single-consumer linmaps of one shared source fuse to
+    a single linmap, then chain-fuse further; function preserved."""
+    rng = np.random.default_rng(9)
+    def d(m, n):
+        return Dense(rng.normal(size=(m, n)).astype(np.float32),
+                     rng.normal(size=m).astype(np.float32))
+    ops = {
+        'x': Op('x', 'input', (), (4,), 4),
+        'a': Op('a', 'linmap', ('x',), (5,), 5, lm=d(5, 4)),
+        'b': Op('b', 'linmap', ('x',), (5,), 5, lm=d(5, 4)),
+        's': Op('s', 'add', ('a', 'b'), (5,), 5),
+        'c': Op('c', 'linmap', ('s',), (3,), 3, lm=d(3, 5)),
+    }
+    net = Net(ops, ['a', 'b', 's', 'c'], 'x', 'c')
+    xs = torch.rand(64, 4) * 2 - 1
+    y0 = forward.point(net, xs)
+    net = fuse_affine(net)
+    assert len(net.order) == 1, net.order       # everything collapses
+    y1 = forward.point(net, xs)
+    assert float((y0 - y1).abs().max()) < 1e-4

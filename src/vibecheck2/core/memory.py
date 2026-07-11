@@ -19,7 +19,16 @@ def free_bytes(device) -> int:
     dev = torch.device(device)
     if dev.type == 'cuda':
         free, _total = torch.cuda.mem_get_info(dev)
-        return int(free)
+        # the caching allocator's reserved-but-unallocated blocks are
+        # reusable by the next torch alloc, but mem_get_info counts them
+        # as USED: after a few 1M-domain BaB rounds `reserved` grows to
+        # most of the card, driver-free collapses, and chunk_size starves
+        # every later batch (lsnc quadrotor2d_55: rounds fell to ~40k
+        # domains/s from a 1M/s start while the allocator sat on reusable
+        # cache; abcrown drains the same 14.2M-domain tree in 14.6s)
+        cached = (torch.cuda.memory_reserved(dev)
+                  - torch.cuda.memory_allocated(dev))
+        return int(free) + max(0, int(cached))
     # CPU: keep chunks modest rather than probing the OS; 4 GB nominal.
     return 4 << 30
 
