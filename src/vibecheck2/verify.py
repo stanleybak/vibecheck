@@ -1120,6 +1120,42 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             tol_w = binfo['tol_witness']
         if verdict == 'timeout':
             verdict = 'unknown'
+    if (verdict != 'unsat' and pgd_budget > 0 and onnx_path is not None
+            and budget.remaining() > 4
+            and any(op.kind == 'nonlin' and op.fn == 'sign'
+                    for op in net.ops.values())):
+        # sign-net ATTACK ENDGAME: bounds cannot close a hard-step net
+        # (sign planes are slope-0 constants; the BaB above exits
+        # 'exhausted splits' in seconds -- model_30 burned 9s of a 480s
+        # budget), so the remaining budget belongs to the attack, v1
+        # sign_attack style: cycle the STE clip frac loose/tight across
+        # passes with fresh seeds; every hit still crosses the ORT
+        # chokepoint, so a surrogate mismatch can never emit a false sat.
+        fracs = (0.05, 0.2, 0.1, 0.02)
+        ste_ops = [nm for nm in net.order
+                   if net.ops[nm].kind == 'nonlin'
+                   and net.ops[nm].fn == 'sign'
+                   and not net.ops[nm].params.get('ste_pass')]
+        p_i = 0
+        while budget.remaining() > 4:
+            for nm in ste_ops:
+                net.ops[nm].params['ste_frac'] = fracs[p_i % len(fracs)]
+            w, ainfo = attack.pgd(
+                net, spec, device=device, restarts=512, iters=300,
+                init='osi', seed=1000 + p_i, polish_tries=0,
+                time_budget=min(30.0, budget.remaining() - 2), log=log)
+            if w is not None:
+                ok, vinfo = attack.validate(onnx_path, spec, w, log=log)
+                if ok:
+                    w_emit = vinfo.get('witness_inbox', w)
+                    return 'sat', {'witness': np.asarray(w_emit),
+                                   'time': time.time() - t0}
+                if vinfo.get('within_tol_witness') is not None:
+                    tol_w = vinfo['within_tol_witness']
+                log('[vc2/sign] candidate rejected by ORT chokepoint; '
+                    'next frac pass')
+            p_i += 1
+        log(f'[vc2/sign] endgame exhausted after {p_i} frac passes')
     det = {'open_disjuncts': open_d, 'time': time.time() - t0}
     if verdict != 'unsat' and tol_w is not None:
         # a within-tolerance CE exists but the verdict stays HONEST

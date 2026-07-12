@@ -911,5 +911,27 @@ def load(onnx_path, dtype=np.float32) -> Net:
     net = fuse_affine(net)              # compose small linmap chains (exact
                                         # up to fp reassociation; size-gated)
     net = tag_simplex_bmm(net)
+    _tag_merged_signs(net)
     net.onnx_path = onnx_path
     return net
+
+
+def _tag_merged_signs(net):
+    """Mark the SECOND sign of a sign -> elementwise-affine -> sign merge
+    (traffic_signs QConv: `ste_sign` emits Sign -> Add(+c) -> Sign) with
+    params['ste_pass']. Its input is always ~(+-1 + c), outside the STE
+    clip window, so a clipped STE zeroes every gradient through it; on
+    {-1,+1} inputs the op is functionally a constant relabeling and gets
+    a pass-through backward instead (v1 sign_attack's rule). Gradient-
+    only: planes/band bounds are untouched."""
+    from . import linmap as lm
+    for name in net.order:
+        op = net.ops[name]
+        if op.kind != 'nonlin' or op.fn != 'sign':
+            continue
+        src = op.inputs[0]
+        while (net.ops[src].kind == 'linmap'
+               and isinstance(net.ops[src].lm, lm.ScaleShift)):
+            src = net.ops[src].inputs[0]
+        if net.ops[src].kind == 'nonlin' and net.ops[src].fn == 'sign':
+            op.params['ste_pass'] = True

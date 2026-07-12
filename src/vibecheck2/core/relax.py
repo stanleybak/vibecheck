@@ -516,23 +516,46 @@ class Pow(_V1Band):
 
 class _SignSTE(torch.autograd.Function):
     """Exact sign forward with a clipped straight-through gradient, so
-    PGD stays alive on binarized nets (traffic_signs: v1's sign_attack is
-    the same STE idea; a plain torch.sign zeroes every gradient)."""
+    PGD stays alive on binarized nets (v1 sign_attack). The clip window
+    is PER-LAYER ADAPTIVE: eps = frac * median|x|, gradient scaled by
+    1/eps -- binarized-conv pre-acts span orders of magnitude between
+    layers and a fixed window zeros whole layers (traffic model_30:
+    QConv pre-acts ~1e3 vs the old |x|<=1 -> dead net)."""
 
     @staticmethod
-    def forward(ctx, x):
+    def forward(ctx, x, frac):
+        eps = float(frac) * float(x.detach().abs().median()) + 1e-12
         ctx.save_for_backward(x)
+        ctx.eps = eps
         return torch.sign(x)
 
     @staticmethod
     def backward(ctx, g):
         (x,) = ctx.saved_tensors
-        return g * (x.abs() <= 1.0).to(g.dtype)
+        return (g / ctx.eps).masked_fill(x.abs() >= ctx.eps, 0.0), None
+
+
+class _SignPass(torch.autograd.Function):
+    """Exact sign forward, IDENTITY backward: for the second sign of a
+    sign -> elementwise-affine -> sign merge (graph._tag_merged_signs),
+    whose input (~+-1 + c) sits outside the STE clip window -- clipping
+    there kills the whole gradient chain (v1 sign_attack passes the
+    merged sign through). Gradient-only; bounds are untouched."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return torch.sign(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g
 
 
 class SignFn:
     def point(self, x, params=None):
-        return _SignSTE.apply(x)
+        if params and params.get('ste_pass'):
+            return _SignPass.apply(x)
+        return _SignSTE.apply(x, (params or {}).get('ste_frac', 0.1))
 
     def planes(self, lo, hi, params=None):
         """sign(x) in {-1, 0, 1}: constant bounds by pre-activation sign
