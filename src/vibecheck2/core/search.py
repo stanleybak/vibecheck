@@ -1007,23 +1007,47 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
 def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
                relu_maps, open_idx, lbq, dev, root_alphas=None,
-               dom_alphas=None, k=8, chunk=256):
+               dom_alphas=None, smooth_maps=None, k=8, chunk=256):
     """kFSB branching (ab-crown's default, its vit 2157 trace: 786 domains
     visited, frontier 51->29->9->2->0, ~half of each round spent in
-    `decision`): the BaBSR proxy NOMINATES the top-k relu candidates per
-    open domain, a real planes-only crown pass bounds both children of
-    every candidate, and the pick maximizes min(child lb) (reduceop min).
+    `decision`): the BaBSR proxy NOMINATES the top-k candidates per open
+    domain -- relu SIGN candidates and, when `smooth_maps` is given,
+    smooth-band RANGE candidates (ab-crown's nonlinear_split filter) --
+    a real planes-only crown pass bounds both children of every
+    candidate, and the pick maximizes min(child lb) (reduceop min).
     The proxy alone measured a flat 6k-domain tree at -0.015 on the same
-    row the probe-based pick closes.
+    row the probe-based pick closes; conversely the sign-only probe left
+    ml4acopf's bound FROZEN at -8.7 (the slack lives in trig bands only
+    a range split can shrink).
 
-    Returns {domain_row: (edge, neuron)} for the open domains (may omit
-    rows whose candidates all scored empty)."""
+    Returns {domain_row: (edge, neuron, kind, mid)} for the open domains
+    (may omit rows whose candidates all scored empty)."""
     from . import backward as bwd
     edges = sorted(relu_maps)
-    widths = [relu_maps[nm].shape[1] for nm in edges]
-    flat = torch.cat([relu_maps[nm] for nm in edges], dim=1)   # (B, ncat)
-    k_eff = min(k, flat.shape[1])
-    top_v, top_i = flat[open_idx].topk(k_eff, dim=1)           # (Bo, k)
+    n_relu_edges = len(edges)
+    all_maps = [relu_maps[nm] for nm in edges]
+    if smooth_maps:
+        s_edges = sorted(smooth_maps)
+        edges = edges + s_edges
+        all_maps += [smooth_maps[nm] for nm in s_edges]
+    widths = [m.shape[1] for m in all_maps]
+    flat = torch.cat(all_maps, dim=1)                          # (B, ncat)
+    n_relu_cols = sum(widths[:n_relu_edges])
+    if smooth_maps and n_relu_cols < flat.shape[1]:
+        # PER-KIND nomination quota (ab-crown nominates per branch type):
+        # relu intercept scores numerically swamp smooth band deltas, so
+        # a global top-k never probes a single range candidate and the
+        # bound freezes where the slack is a trig band
+        k_r = min(k // 2, n_relu_cols)
+        k_s = min(k - k_r, flat.shape[1] - n_relu_cols)
+        v_r, i_r = flat[open_idx][:, :n_relu_cols].topk(k_r, dim=1)
+        v_s, i_s = flat[open_idx][:, n_relu_cols:].topk(k_s, dim=1)
+        top_v = torch.cat([v_r, v_s], dim=1)
+        top_i = torch.cat([i_r, i_s + n_relu_cols], dim=1)
+        k_eff = k_r + k_s
+    else:
+        k_eff = min(k, flat.shape[1])
+        top_v, top_i = flat[open_idx].topk(k_eff, dim=1)       # (Bo, k)
     edge_of = torch.repeat_interleave(
         torch.arange(len(edges), device=dev),
         torch.tensor(widths, device=dev))
@@ -1042,20 +1066,40 @@ def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
         if not bool(valid[sl].any()):
             continue
         cc = {nm: cl[r].clone() for nm, cl in clamps.items()}
-        for ei, nm in enumerate(edges):
+        for ei, nm in enumerate(edges[:n_relu_edges]):
             if nm not in cc:
                 cc[nm] = torch.zeros(r.numel(), net.ops[nm].n,
                                      device=dev, dtype=torch.int8)
         e_sel = edge_of[cand[sl]]
         j_sel = j_of[cand[sl]]
         ar = torch.arange(r.numel(), device=dev)
-        for ei, nm in enumerate(edges):
+        for ei, nm in enumerate(edges[:n_relu_edges]):
             m = e_sel == ei
             if bool(m.any()):
                 cc[nm][ar[m], j_sel[m]] = signs[sl][m]
         ic = {k2: tuple(t[r] for t in v) for k2, v in inter.items()}
         rc = {k2: tuple(t[r] for t in v)
               for k2, v in (range_clamps or {}).items()}
+        # RANGE candidates: halve the smooth pre-activation at its mid
+        # (child 0 keeps the low half, child 1 the high half)
+        for ei in range(n_relu_edges, len(edges)):
+            m = e_sel == ei
+            if not bool(m.any()):
+                continue
+            nm = edges[ei]
+            l_r, h_r = inter[nm][0][r].clone(), inter[nm][1][r].clone()
+            if nm in rc:
+                l_r = torch.maximum(l_r, rc[nm][0])
+                h_r = torch.minimum(h_r, rc[nm][1])
+            mid = (l_r + h_r) / 2
+            hi_side = signs[sl] < 0                     # child 1 = high
+            lo_mask = m & ~hi_side
+            hi_mask = m & hi_side
+            h_r[ar[lo_mask], j_sel[lo_mask]] = \
+                mid[ar[lo_mask], j_sel[lo_mask]]
+            l_r[ar[hi_mask], j_sel[hi_mask]] = \
+                mid[ar[hi_mask], j_sel[hi_mask]]
+            rc[nm] = (l_r, h_r)
         lo_r = lo1.expand(r.numel(), -1)
         hi_r = hi1.expand(r.numel(), -1)
         # probe with the batch's DOMAIN alphas when available (each
@@ -1097,7 +1141,9 @@ def _kfsb_pick(net, W, bias, lo1, hi1, inter, clamps, range_clamps,
         if not bool(torch.isfinite(sc[i, best[i]])):
             continue
         ci = int(top_i[i, best[i]])
-        picks[bo] = (edges[int(edge_of[ci])], int(j_of[ci]))
+        ei = int(edge_of[ci])
+        picks[bo] = (edges[ei], int(j_of[ci]),
+                     'sign' if ei < n_relu_edges else 'range')
     return picks
 
 
@@ -1451,6 +1497,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     best_kind[bi] = kind
 
             relu_maps = {}
+            smooth_maps = {}
             for nm in (() if skip_babsr else relu_edges):
                 l, h = inter[nm]
                 cl = clamps.get(nm)
@@ -1469,12 +1516,18 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             from .relax import REL
             for nm in (() if skip_babsr else smooth_edges):
                 l, h = inter[nm]
+                if nm in range_clamps:
+                    l = torch.maximum(l, range_clamps[nm][0])
+                    h = torch.minimum(h, torch.maximum(range_clamps[nm][1],
+                                                       l))
                 _lam, _mu, delta = REL[net.ops[nm].fn].band(
                     l, h, net.ops[nm].params)
                 a = adj.get(nm)
-                consider(nm, (a.abs().amax(dim=1) if a is not None
-                              else torch.ones_like(l)) * delta,
-                         'range', mid=(l + h) / 2)
+                sc_nm = (a.abs().amax(dim=1) if a is not None
+                         else torch.ones_like(l)) * delta
+                if bound != 'zono':
+                    smooth_maps[nm] = sc_nm
+                consider(nm, sc_nm, 'range', mid=(l + h) / 2)
             if bound != 'zono' and relu_maps:
                 try:
                     op_idx = torch.nonzero(open_mask,
@@ -1489,11 +1542,21 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                        clamps, range_clamps, relu_maps,
                                        op_idx, lbq, dev,
                                        root_alphas=root_alphas,
-                                       dom_alphas=(alpha_out or None))
-                    for bo, (nm, j) in picks.items():
+                                       dom_alphas=(alpha_out or None),
+                                       smooth_maps=(smooth_maps or None))
+                    for bo, (nm, j, knd) in picks.items():
                         best_edge[bo] = nm
                         best_j[bo] = j
-                        best_kind[bo] = 'sign'
+                        best_kind[bo] = knd
+                        if knd == 'range':
+                            l_p = inter[nm][0][bo, j]
+                            h_p = inter[nm][1][bo, j]
+                            if nm in range_clamps:
+                                l_p = torch.maximum(
+                                    l_p, range_clamps[nm][0][bo, j])
+                                h_p = torch.minimum(
+                                    h_p, range_clamps[nm][1][bo, j])
+                            best_mid[bo] = (l_p + h_p) / 2
                 except torch.cuda.OutOfMemoryError:
                     # probe pass is advisory; the proxy picks stand
                     torch.cuda.empty_cache()
