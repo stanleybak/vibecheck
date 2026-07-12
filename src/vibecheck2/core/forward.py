@@ -623,9 +623,20 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
             if box_remainder:
                 # remainder mode: no new columns; the e^2 residual joins
                 # the off-diagonal box (this mode trades exactly this
-                # correlation for memory)
-                state[name] = ZonoState(c2, G2, sym,
-                                        box_off + 0.5 * D.abs().sum(dim=2))
+                # correlation for memory). The FIRST-ORDER gens are kept
+                # only while small: remainder mode exists to cap memory,
+                # and carrying (B, n, g) products through chained muls
+                # locked the box for 12 minutes on mscn_2048d_dual
+                # (360 domains x 2048 wide x 300+ gens x 12 muls) --
+                # collapse to rad past the cap (|G|.1 is sound).
+                rad2 = box_off + 0.5 * D.abs().sum(dim=2)
+                if G2.numel() > 40_000_000:
+                    state[name] = ZonoState(
+                        c2, torch.zeros(B, c2.shape[1], 0, device=dev,
+                                        dtype=dt), [],
+                        rad2 + G2.abs().sum(dim=2))
+                else:
+                    state[name] = ZonoState(c2, G2, sym, rad2)
             else:
                 # e^2 diagonal as fresh SHARED symbols u_g = 2 e_g^2 - 1:
                 # one column per source symbol with any nonzero product
