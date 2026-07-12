@@ -574,6 +574,19 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
         inter[name] = (l0, h0)
         idx = torch.nonzero(((l0 < 0) & (h0 > 0)).any(dim=0),
                             as_tuple=False).flatten()
+        if op.fn != 'relu' and (clamps or range_clamps):
+            # SMOOTH ops in a per-domain (BaB) context: the sign-crossing
+            # filter is the RELU criterion; a smooth band's slack scales
+            # with WIDTH, and skipping wide-but-positive inputs meant no
+            # split kind could ever move the spec bound through them
+            # (ml4acopf 118-linear: mul-factor splits fired, downstream
+            # sigmoid/sin inputs never re-tightened, bound frozen -8.78).
+            # Refine the widest elements too, capped.
+            wdt = (h0 - l0).amax(dim=0)
+            k_w = min(256, wdt.numel())
+            widx = wdt.topk(k_w).indices
+            widx = widx[wdt[widx] > 1e-6]
+            idx = torch.unique(torch.cat([idx, widx]))
         if not idx.numel():
             continue
         if net.ops[e].n > 65536 and clamps is None and range_clamps is None:
