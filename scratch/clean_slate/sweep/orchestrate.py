@@ -19,7 +19,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.expanduser('~/Desktop/temp/vc_copy1/vibecheck-nn')
 BENCH_LOCAL = os.path.expanduser('~/repositories/vnncomp2026_benchmarks/benchmarks')
-WORKLIST = os.path.join(HERE, 'worklist.csv')
+WORKLIST = os.environ.get('WORKLIST', os.path.join(HERE, 'worklist.csv'))
 RAW_LOCAL = os.path.join(HERE, 'box_results.csv')     # mirror of box results
 CE_LOCAL = os.path.join(HERE, 'ce')                   # drained CEs
 KEY = os.environ.get('KEY', os.path.expanduser('~/.ssh/g5-8x.pem'))
