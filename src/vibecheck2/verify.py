@@ -139,19 +139,32 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
         from .handlers.discrete_enum import try_discrete_enum
         log(f'[vc2] graph load failed ({type(e).__name__}: {str(e)[:80]}); '
             f'trying discrete-enum handler')
+        if not attack_off:
+            # INT8 QDQ nets (smart_turn): attack-only quant-surrogate
+            # handler (skipped in soundness sweeps -- it can only sat).
+            # Tried FIRST: its trigger is a cheap node-type scan, while
+            # discrete-enum's probe runs a ~25s ORT exploration before
+            # deciding it does not apply.
+            from .handlers.quant_surrogate import try_quant_surrogate
+            try:
+                return try_quant_surrogate(onnx_path, vnnlib_path, timeout,
+                                           device=device, log=log)
+            except NotImplementedError:
+                pass
         try:
             return try_discrete_enum(onnx_path, vnnlib_path, timeout, log)
         except NotImplementedError:
-            # discrete-enum can't model it either. An unsupported OP in the
-            # original load (e.g. smart_turn's quantized/dequantized conv
-            # kernels) is a FEATURE BOUNDARY -> honest 'unknown', not a crash;
-            # any other load error is a real bug and still becomes 'error'.
-            if isinstance(e, NotImplementedError):
-                log(f'[vc2] net not supported: {e}; verdict unknown')
-                return 'unknown', {
-                    'reason': f'not_implemented: {str(e)[:200]}',
-                    'time': time.time() - t0}
-            raise e
+            pass
+        # no handler can model it. An unsupported OP in the original load
+        # (e.g. a non-quantized dynamic conv kernel) is a FEATURE
+        # BOUNDARY -> honest 'unknown', not a crash; any other load error
+        # is a real bug and still becomes 'error'.
+        if isinstance(e, NotImplementedError):
+            log(f'[vc2] net not supported: {e}; verdict unknown')
+            return 'unknown', {
+                'reason': f'not_implemented: {str(e)[:200]}',
+                'time': time.time() - t0}
+        raise e
     try:
         spec = load_vnnlib(vnnlib_path)
     except NotImplementedError as e:
@@ -1253,7 +1266,12 @@ def main(argv=None):
         return 2
     if a.results_file:
         ce = None
-        if verdict == 'sat' and details.get('witness') is not None:
+        if verdict == 'sat' and details.get('ce_sexpr') is not None:
+            # handler-built CE (multi-input surrogate): already validated
+            # through the unified ORT gate and formatted with the spec's
+            # declared I/O; write verbatim
+            ce = details['ce_sexpr']
+        elif verdict == 'sat' and details.get('witness') is not None:
             # v1's CE formatting: version/io names resolved from the spec,
             # Y recomputed by the same ORT forward the scorer replays
             from .frontend.vnnlib_loader import load_vnnlib
