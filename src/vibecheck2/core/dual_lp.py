@@ -244,7 +244,8 @@ def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu',
 
 
 def lift_intermediates(net, lo, hi, inter, cut_rows, rounds=3,
-                       device='cpu', budget=None, log=lambda m: None):
+                       slopes=None, device='cpu', budget=None,
+                       log=lambda m: None):
     """v1 phase-2.5 zono-lift port: tighten every nonlinearity's
     pre-activation bounds by the EXACT box+one-halfspace LP
     (v1 box_halfspace.lagrangian_min, closed form) under the spec cut
@@ -264,7 +265,7 @@ def lift_intermediates(net, lo, hi, inter, cut_rows, rounds=3,
             # overrunning the instance budget
             log(f'[vc2/lift] budget stop after round {rnd}')
             break
-        geo = _GenGeometry(net, lo, hi, inter, device=device)
+        geo = _GenGeometry(net, lo, hi, inter, slopes=slopes, device=device)
         # the cut in generator coordinates (use the FIRST row; iterating
         # rows each round would also be valid)
         w, bcut = cut_rows[0]
@@ -278,14 +279,27 @@ def lift_intermediates(net, lo, hi, inter, cut_rows, rounds=3,
         for nm in geo.nonlin:
             e = net.ops[nm].inputs[0]
             n = net.ops[e].n
-            rows = geo.rows_chunked(e, list(range(n)), nm).cpu().numpy()
-            c_pre = geo.pre_center[nm].cpu().numpy()
             l0, h0 = inter[nm]
             l0 = l0.clone()
             h0 = h0.clone()
-            for j in range(n):
-                lo_j = lagrangian_min(rows[j], c_pre[j], a_cut, beta)
-                hi_j = -lagrangian_min(-rows[j], -c_pre[j], a_cut, beta)
+            # UNSTABLE neurons only (v1 phase-2.5 does the same): a stable
+            # relu's relaxation is exact regardless of band width, and the
+            # all-neuron loop cost 55s/round on resnet_medium's 55k
+            # pre-activations -- the budget stop then killed rounds 2-3,
+            # which are where v1's lift actually closes (it iterates
+            # lift -> rebuild geometry -> lift until the query closes)
+            if net.ops[nm].fn == 'relu':
+                js = torch.nonzero((l0[0] < 0) & (h0[0] > 0),
+                                   as_tuple=False).flatten().tolist()
+            else:
+                js = list(range(n))
+            if not js:
+                continue
+            rows = geo.rows_chunked(e, js, nm).cpu().numpy()
+            c_pre = geo.pre_center[nm].cpu().numpy()
+            for k_j, j in enumerate(js):
+                lo_j = lagrangian_min(rows[k_j], c_pre[j], a_cut, beta)
+                hi_j = -lagrangian_min(-rows[k_j], -c_pre[j], a_cut, beta)
                 if lo_j > float(l0[0, j]):
                     improved += lo_j - float(l0[0, j])
                     l0[0, j] = lo_j

@@ -874,12 +874,35 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         rows_d = torch.nonzero(di == open_d[0],
                                as_tuple=False).flatten().tolist()
         try:
-            inter = lift_intermediates(
-                net, lo, hi, inter,
-                cut_rows=[(W[r].cpu().numpy(), float(b[r]))
-                          for r in rows_d],
-                device=device, budget=budget, log=log)
-            lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
+            # v1's phase-2.5 ITERATES lift <-> intermediate refinement:
+            # the lift tightens the pre-relu bands, the crown refinement
+            # propagates that to every edge, and the REBUILT geometry
+            # lifts further (idx_8330: a single lift+alpha stalled at
+            # -0.2527 while v1's iterated cascade closes the row)
+            _prev_w5 = -float('inf')
+            for _lp in range(6):
+                if budget.remaining() < 15 or verdict == 'unsat':
+                    break
+                # (feeding the spec-alpha slopes into the lift geometry
+                # was MEASURED WORSE here: -0.46 vs -0.22 with the default
+                # adaptive band slopes -- spec alphas optimize the output
+                # bound, not the per-neuron LP tightness)
+                inter = lift_intermediates(
+                    net, lo, hi, inter, rounds=2,
+                    cut_rows=[(W[r].cpu().numpy(), float(b[r]))
+                              for r in rows_d],
+                    device=device, budget=budget, log=log)
+                inter = backward.intermediates_crown(net, lo, hi,
+                                                     base_inter=inter,
+                                                     budget=budget)
+                lb0 = torch.maximum(
+                    lb0, backward.crown(net, lo, hi, W, inter)[0])
+                verdict, open_d = _verdict_from_lbs(lb0 + b, di,
+                                                    len(spec.disjuncts))
+                _cur_w5 = float((lb0 + b).min())
+                if _cur_w5 <= _prev_w5 + 1e-3:
+                    break                 # the cascade went stale
+                _prev_w5 = _cur_w5
             lb_l = backward.alpha_crown(net, lo, hi, W, inter,
                                         iters=alpha_iters, thresholds=-b,
                                         budget=budget)[0]
@@ -901,7 +924,13 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         except NotImplementedError as e:
             log(f'[vc2] zono-lift skipped ({e})')
     if verdict != 'unsat' and open_d \
-            and 0 < n_unstable <= 2000 and budget.remaining() > 20:
+            and 0 < n_unstable <= 2000 and n_nonlin <= 20000 \
+            and budget.remaining() > 20:
+        # n_nonlin cap: the split batches bound ALL intermediates per
+        # layer -- on cifar100 resnet_medium (55k nonlin) one sweep ate
+        # the whole 90s tail unlogged and the dual/BaB never ran
+        # (faulthandler-confirmed); relusplitter (~1.2k) and vit (~14k)
+        # stay in.
         # split-and-tighten stabilization (v1 bab_refine): tighten the
         # INTERMEDIATES under targeted relu sign splits until root alpha
         # closes; the frontier BaB below measurably explodes exactly where
