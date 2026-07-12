@@ -105,7 +105,7 @@ def _osi_diversify(net, x, lo, hi, generator, steps=30):
 def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         device='cpu', time_budget=10.0, init='uniform', seeds=None,
         lr_frac=0.25, lr_decay=0.99, plateau=40, polish_tries=4,
-        log=lambda m: None):
+        dtype=torch.float32, log=lambda m: None):
     """Search for a spec counterexample. Returns (witness_np | None, info).
 
     The returned witness is ONLY a candidate: callers must gate it through
@@ -116,7 +116,9 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
     unsat-leaning callers pass 1 -- each try costs ~0.5s of BaB time.
     """
     dev = torch.device(device)
-    dt = torch.float32
+    dt = dtype            # f64 for the hidden-CE fine descent (violations
+                          # below the f32 forward noise floor; abcrown's
+                          # soundnessbench recipe runs double_fp)
     if lo is None:
         lo = torch.tensor(spec.x_lo, dtype=dt)
     if hi is None:
@@ -200,7 +202,12 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
             break
     order = torch.argsort(best_m)
     info = {'best_margin': float(best_m.min()), 'iters': it + 1,
-            'time': time.time() - t0}
+            'time': time.time() - t0,
+            # top plateau points for warm-started escalations (the f64
+            # fine descent restarts FROM these; cold f64 starts cannot
+            # afford the iterations at 1/32 fp64 throughput)
+            'plateau_x': best_x[order[:8]].detach().cpu().numpy()
+            .astype(np.float64)}
     log(f'[vc2/pgd] best_margin={info["best_margin"]:+.3e} '
         f'iters={info["iters"]} t={info["time"]:.2f}s')
     if best_m[order[0]] > 0:

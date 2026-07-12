@@ -392,6 +392,7 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
             _polish_tries = 0
     if pgd_budget > 0:
         restarts = 100
+        _plateau_seeds = []
         for _ in range(3):                        # 100 -> 250 -> 625
             # the multi-region SLP polish (4 tries x ~0.5s) is the hidden-CE
             # lever on generous budgets; on short-budget instances those 2s
@@ -412,6 +413,8 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                     tol_w = vinfo['within_tol_witness']
                 log('[vc2] pgd candidate rejected by ORT chokepoint; '
                     'continuing')
+            if ainfo.get('plateau_x') is not None:
+                _plateau_seeds.append(ainfo['plateau_x'])
             # escalate only on a genuine near-miss (margin just above zero,
             # or a marginal below-zero candidate the chokepoint rejected) with
             # cheap-phase budget to spare; otherwise fall through to bounds.
@@ -436,6 +439,58 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
                 # exact budget the BaB endgame needs.
                 break
             restarts = int(restarts * 2.5)
+        if relu_only and 0.0 < ainfo['best_margin'] < 1e-2 \
+                and budget.remaining() > 30:
+            # hidden-CE FINE DESCENT (abcrown's soundnessbench recipe:
+            # double_fp + 1000 small steps at slow decay): the injected
+            # violations sit BELOW the f32 forward noise floor, where the
+            # f32 ladder plateaus at ~+1e-4 even at 2048 restarts. f64
+            # forward + long low-lr descent resolves them; every hit
+            # still passes the ORT chokepoint.
+            _sd = (np.concatenate(_plateau_seeds, axis=0)
+                   if _plateau_seeds else None)
+            _prev_m64 = float('inf')
+            _ai64 = {}
+            w = None
+            for _st in range(4):
+                # warm-restart CHAIN: each stage reseeds from the last
+                # plateau and descends further (007: +1.2e-4 -> +2.1e-5
+                # in one stage; the geometric convergence crosses zero
+                # if a strict CE exists). Stop on crossing or stall.
+                w, _ai64 = attack.pgd(
+                    net, spec, device=device,
+                    restarts=(len(_sd) + 16 if _sd is not None else 64),
+                    iters=400, init='uniform', seeds=_sd,
+                    lr_frac=(0.005 / (4 ** _st)), lr_decay=0.997,
+                    plateau=400,
+                    time_budget=min(25.0, 0.25 * budget.remaining()),
+                    dtype=torch.float64,
+                    polish_tries=_polish_tries, log=log)
+                if w is not None or budget.remaining() < 30:
+                    break
+                m64 = _ai64['best_margin']
+                if not (0.0 < m64 < 0.5 * _prev_m64):
+                    break                       # stalled or diverged
+                _prev_m64 = m64
+                _sd = _ai64.get('plateau_x')
+            if w is None and _ai64.get('plateau_x') is not None \
+                    and 0.0 < _ai64.get('best_margin', 1.0) <= 1.5e-4:
+                # a plateau INSIDE the official COUNTEREXAMPLE_ATOL band
+                # (1e-4): pgd never surfaces it (margin > 0), but the
+                # chokepoint detects within-tol violations and stashes
+                # them for the loud unknown-with-tol-CE flag (verdicts
+                # stay strict-violation only -- CLAUDE.md hard rule)
+                w = _ai64['plateau_x'][0]
+            if w is not None:
+                ok, vinfo = attack.validate(onnx_path, spec, w, log=log)
+                if ok:
+                    w_emit = vinfo.get('witness_inbox', w)
+                    return 'sat', {'witness': np.asarray(w_emit),
+                                   'time': time.time() - t0}
+                if vinfo.get('within_tol_witness') is not None:
+                    tol_w = vinfo['within_tol_witness']
+                log('[vc2] f64 fine-descent candidate rejected by ORT '
+                    'chokepoint; continuing')
 
     dev = torch.device(device)
     lo = torch.tensor(spec.x_lo, dtype=torch.float32, device=dev).unsqueeze(0)
