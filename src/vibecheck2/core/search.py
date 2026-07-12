@@ -784,6 +784,21 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             log(f'[vc2/round] round={rounds} popped={blo.shape[0]} '
                 f'closed_crown={int(refuted.all(dim=1).sum())} '
                 f'queue={f_lo.shape[0]} gpu={_alloc:.2f}GB')
+        if (os.environ.get('VC2_DEBUG_GAP') and brow is not None
+                and rounds % 16 == 1):
+            # open-box bound-gap + width telemetry: distinguishes a
+            # knife-edge f32 floor (gaps ~ -1e-4) from plain relaxation
+            # looseness (gaps ~ -0.05) when a multi-sub grind won't drain
+            _om = ~domain_refuted(lbq, brow).all(dim=1)
+            if bool(_om.any()):
+                _db = dom_bound(lbq, brow)[_om]
+                _wd = (bhi[_om] - blo[_om]).max(dim=1).values
+                _q = torch.quantile(
+                    _db.float(), torch.tensor([0., .5, 1.], device=dev))
+                log(f'[vc2/gap] round={rounds} open={int(_om.sum())} '
+                    f'db=[{_q[0]:.2e},{_q[1]:.2e},{_q[2]:.2e}] '
+                    f'w_max={float(_wd.max()):.2e} '
+                    f'w_med={float(_wd.median()):.2e}')
         try:
             if open_mask.any() and alpha_iters > 0:
                 # alpha on BOUNDARY domains only (v1 boundary_eps=10 with a
