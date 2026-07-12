@@ -63,6 +63,10 @@ def _decompressed(path):
 
 def has_quantized_ops(onnx_path):
     """True if the ONNX uses DequantizeLinear/QuantizeLinear."""
+    if not (os.path.isfile(onnx_path) or os.path.isfile(onnx_path + '.gz')):
+        # let the caller's ORIGINAL load error propagate instead of a
+        # second FileNotFoundError from the probe
+        raise NotImplementedError(f'quant_surrogate: no file {onnx_path}')
     m = _load_onnx_model(onnx_path)
     return any(n.op_type in ('DequantizeLinear', 'QuantizeLinear')
                for n in m.graph.node)

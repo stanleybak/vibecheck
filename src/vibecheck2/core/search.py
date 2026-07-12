@@ -745,6 +745,9 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             ki = torch.nonzero((db0 > -1e-3) & (db0 <= 0),
                                as_tuple=False).flatten()
             if 0 < ki.numel() <= 64:
+                if os.environ.get('VC2_DEBUG_CLIP'):
+                    log(f'[vc2/bab] round={rounds} f64 rebound entry '
+                        f'k={ki.numel()}')
                 try:
                     _l4, _h4, z64 = backward.fwd.zono(
                         net, blo[ki].double(), bhi[ki].double(),
@@ -1069,6 +1072,10 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 cand, _ = attack.pgd(net, spec, lo=olo[widx], hi=ohi[widx],
                                      restarts=256, iters=60, device=device,
                                      time_budget=0.5, seed=rounds)
+                if os.environ.get('VC2_DEBUG_CLIP') and rounds <= 60:
+                    log(f'[vc2/bab] round={rounds} in-bab attack '
+                        f'{time.time() - last_atk:.1f}s '
+                        f'cand={"y" if cand is not None else "n"}')
                 if cand is not None:
                     ok, vinfo = attack.validate(onnx_path, spec, cand,
                                                 log=log)
