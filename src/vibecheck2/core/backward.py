@@ -155,7 +155,7 @@ def intermediates(net, lo, hi):
 from .forward import clamped_bounds  # single definition (forward.py)
 
 
-def _softmax_adjoint(op, Ao, l, h, d):
+def _softmax_adjoint(op, Ao, l, h, d, al=None):
     """Backward-CROWN adjoint THROUGH the fused softmax op, composed from
     the same relaxations the rest of the core uses (Exp planes,
     Reciprocal planes, McCormick product) over the chain
@@ -169,54 +169,75 @@ def _softmax_adjoint(op, Ao, l, h, d):
     with alphas; the whole joint-alpha chain was blind to the logits).
 
     Ao: (B, q, n_sm) adjoint arriving at y. l, h: logit bounds (B, n_sm).
+    al: optional (B, q, 4, n_sm) OPTIMIZER-CONTROLLED tangent positions --
+    channels 0:2 drive the exp planes, 2:4 the reciprocal planes (first
+    n_rows entries). With fixed planes only, alpha-CROWN was blind to the
+    whole attention stack (vit pgd_1197: alpha(200) == alpha(20) == -3.26
+    while ab-crown's optimizer takes -1.35 -> all-positive at the root).
     Returns (A_x (B, q, n_sm), d updated with the intercept terms).
     """
     p = op.params
     pre, k, post = p['pre'], p['k'], p['post']
     B = l.shape[0]
-    n_rows = pre * post
+    q = Ao.shape[1]
+    dev, dt = l.device, l.dtype
 
-    def rows(t):                    # (B, n_sm) -> (B, pre, k, post)
-        return t.reshape(B, pre, k, post)
+    # DIFFERENCE FORM (matches the forward's fused decomposition and
+    # ab-crown's softmax model): y_i = 1 / S_i with
+    #   S_i = sum_j exp(x_j - x_i)   (the j=i term is exp(0) = 1),
+    # so the chain is recip -> rowsum -> exp(pairwise differences) with
+    # NO product stage. The previous e*r form paid a McCormick product
+    # of two CORRELATED factors per element -- the dominant slack of the
+    # attention backward (vit pgd_1197: crown -3.62 vs ab's -1.35).
+    l5 = l.reshape(B, pre, k, post)
+    h5 = h.reshape(B, pre, k, post)
+    # z[..., i, j, :] = x_j - x_i over [l_j - h_i, h_j - l_i]
+    zl = (l5.unsqueeze(3) - h5.unsqueeze(2)).permute(0, 1, 3, 2, 4)
+    zh = (h5.unsqueeze(3) - l5.unsqueeze(2)).permute(0, 1, 3, 2, 4)
+    # exact zero diagonal (x_i - x_i)
+    eye = torch.eye(k, device=dev, dtype=torch.bool) \
+        .reshape(1, 1, k, k, 1)
+    zl = torch.where(eye, torch.zeros_like(zl), zl)
+    zh = torch.where(eye, torch.zeros_like(zh), zh)
+    # S_i bounds
+    sl = torch.exp(zl).sum(dim=3).reshape(B, -1).clamp_min(1.0)
+    sh = torch.exp(zh).sum(dim=3).reshape(B, -1)
+    sh = torch.maximum(sh, sl)                           # (B, n_sm)
 
-    def rows_q(t):                  # (B, q, n_sm) -> (B, q, pre, k, post)
-        return t.reshape(t.shape[0], t.shape[1], pre, k, post)
+    def _u(t):
+        return t if t.dim() == 3 else t.unsqueeze(1)
 
-    c = rows(h).max(dim=2, keepdim=True).values          # (B,pre,1,post)
-    c_bc = c.expand(B, pre, k, post).reshape(B, -1)
-    zl, zh = l - c_bc, h - c_bc
-    zh = zh.clamp_max(0.0)                               # exact: c >= h
-    el, eh = torch.exp(zl), torch.exp(zh)                # e in (0, 1]
-    sl = rows(el).sum(dim=2).reshape(B, n_rows).clamp_min(1e-30)
-    sh = rows(eh).sum(dim=2).reshape(B, n_rows).clamp_max(float(k))
-    sh = torch.maximum(sh, sl)
-    rl, rh = 1.0 / sh, 1.0 / sl
-    bidx = torch.arange(n_rows, device=l.device).reshape(
-        pre, 1, post).expand(pre, k, post).reshape(-1)
-    rl_bc, rh_bc = rl[:, bidx], rh[:, bidx]
-    # stage 1: y = e * r (McCormick over the factor boxes)
-    alx, aly, clo, aux, auy, cup = (
-        t.unsqueeze(1) for t in _mccormick_planes(el, eh, rl_bc, rh_bc))
+    # stage 1: y = 1/S (decreasing, S >= 1)
+    if al is not None:
+        arl, brl, aru, bru = REL['reciprocal'].alpha_planes(
+            sl.unsqueeze(1), sh.unsqueeze(1),
+            al[:, :, 2:4, :].clamp(0.0, 1.0))
+    else:
+        arl, brl, aru, bru = REL['reciprocal'].planes(sl, sh)
     Ap, An = _pos_part(Ao), _neg_part(Ao)
-    A_e = Ap * alx + An * aux
-    A_rb = Ap * aly + An * auy                           # onto r broadcast
-    d = d + (Ap * clo + An * cup).sum(dim=2)
-    A_r = rows_q(A_rb).sum(dim=3).reshape(Ao.shape[0], Ao.shape[1], n_rows)
-    # stage 2: r = 1/s (sign-definite planes; s > 0 by construction)
-    arl, brl, aru, bru = REL['reciprocal'].planes(sl, sh)
-    Ap2, An2 = _pos_part(A_r), _neg_part(A_r)
-    A_s = Ap2 * arl.unsqueeze(1) + An2 * aru.unsqueeze(1)
-    d = d + (Ap2 * brl.unsqueeze(1) + An2 * bru.unsqueeze(1)).sum(dim=2)
-    # stage 3: s = rowsum(e) (linear)
-    A_e = A_e + A_s[:, :, bidx]
-    # stage 4: e = exp(z), z = x - c: fold the constant shift into the
-    # intercepts (e >= a*z + b = a*x + (b - a*c))
-    ael, bel, aeu, beu = REL['exp'].planes(zl, zh)
-    bel = bel - ael * c_bc
-    beu = beu - aeu * c_bc
-    Ap3, An3 = _pos_part(A_e), _neg_part(A_e)
-    A_x = Ap3 * ael.unsqueeze(1) + An3 * aeu.unsqueeze(1)
-    d = d + (Ap3 * bel.unsqueeze(1) + An3 * beu.unsqueeze(1)).sum(dim=2)
+    A_S = Ap * _u(arl) + An * _u(aru)                    # (B, q, n_sm)
+    d = d + (Ap * _u(brl) + An * _u(bru)).sum(dim=2)
+    # stage 2: S_i = sum_j exp(z_ij): exp planes per PAIR; the same
+    # coefficient A_S[i] lands on every pair of row i
+    zl2 = zl.reshape(B, 1, -1)                           # (B,1,pre*k*k*post)
+    zh2 = zh.reshape(B, 1, -1)
+    if al is not None:
+        # per-element tangents broadcast over the row's k_j pairs
+        a_e = al[:, :, 0:2, :].clamp(0.0, 1.0) \
+            .reshape(B, q, 2, pre, k, post).unsqueeze(5) \
+            .expand(B, q, 2, pre, k, k, post).reshape(B, q, 2, -1)
+        ael, bel, aeu, beu = REL['exp'].alpha_planes(zl2, zh2, a_e)
+    else:
+        ael, bel, aeu, beu = REL['exp'].planes(zl2[:, 0], zh2[:, 0])
+    A_Sp = A_S.reshape(B, q, pre, k, post).unsqueeze(4) \
+        .expand(B, q, pre, k, k, post).reshape(B, q, -1)
+    Ap2, An2 = _pos_part(A_Sp), _neg_part(A_Sp)
+    A_z = Ap2 * _u(ael) + An2 * _u(aeu)                  # coeff on z_ij
+    d = d + (Ap2 * _u(bel) + An2 * _u(beu)).sum(dim=2)
+    # stage 3: z_ij = x_j - x_i (exact affine): +coeff onto x_j,
+    # -coeff onto x_i
+    A_z5 = A_z.reshape(B, q, pre, k, k, post)
+    A_x = (A_z5.sum(dim=3) - A_z5.sum(dim=4)).reshape(B, q, -1)
     return A_x, d
 
 
@@ -332,7 +353,9 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
                 h = torch.minimum(h, torch.maximum(rhi, l))
             rel = REL[op.fn]
             if op.fn == 'softmax':
-                Ain_sm, d = _softmax_adjoint(op, Ao, l, h, d)
+                Ain_sm, d = _softmax_adjoint(
+                    op, Ao, l, h, d,
+                    al=(alpha.get(name) if alpha else None))
                 if collect_adjoints is not None:
                     collect_adjoints[name] = Ao.detach()
                 put(op.inputs[0], Ain_sm)
@@ -810,6 +833,14 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
             al0 = REL['relu'].planes(l, h)[0]           # adaptive default
             alpha[name] = al0.detach().clone().unsqueeze(1) \
                 .expand(B, q, l.shape[1]).contiguous().requires_grad_(True)
+        elif op.fn == 'softmax':
+            # composite softmax tangents: channels 0:2 exp, 2:4 recip
+            # (see _softmax_adjoint) -- with fixed planes alpha-CROWN
+            # was blind to the whole attention stack
+            l, h = inter[name]
+            alpha[name] = torch.full(
+                (B, q, 4, l.shape[1]), 0.5, device=l.device,
+                dtype=l.dtype).requires_grad_(True)
         elif hasattr(REL[op.fn], 'alpha_planes'):
             l, h = inter[name]
             crossing = ((l < 0) & (h > 0)).to(l.dtype)
