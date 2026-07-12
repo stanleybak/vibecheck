@@ -1198,6 +1198,7 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     if net.ops[nm].kind == 'nonlin'
                     and net.ops[nm].fn in ('sigmoid', 'tanh', 'sin', 'cos',
                                            'exp', 'reciprocal', 'pow')]
+    mul_edges = [nm for nm in net.order if net.ops[nm].kind == 'mul']
 
     # (worst_lb, tiebreak, splits, lb_floor): lb_floor is the parent's
     # per-query bound vector. A child domain is a SUBSET of its parent,
@@ -1528,6 +1529,26 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 if bound != 'zono':
                     smooth_maps[nm] = sc_nm
                 consider(nm, sc_nm, 'range', mid=(l + h) / 2)
+            for nm in (() if skip_babsr else mul_edges):
+                # MUL-FACTOR range splits: the McCormick error bound is
+                # (hx-lx)(hy-ly)/4 per element -- halving the WIDER
+                # factor quarters it, where relu sign splits leave it
+                # untouched (ml4acopf 118-linear: bound frozen at -8.7
+                # through 300 rounds of pure sign splits). The action is
+                # recorded under the FACTOR EDGE name; materialize_clamps
+                # and the crown mul consumers intersect it there.
+                lx, hx, ly, hy = inter[nm]
+                e_a, e_b = net.ops[nm].inputs[0], net.ops[nm].inputs[1]
+                for e_f, (l_f, h_f), (l_o, h_o) in (
+                        (e_a, (lx, hx), (ly, hy)),
+                        (e_b, (ly, hy), (lx, hx))):
+                    if e_f in range_clamps:
+                        l_f = torch.maximum(l_f, range_clamps[e_f][0])
+                        h_f = torch.minimum(
+                            h_f, torch.maximum(range_clamps[e_f][1], l_f))
+                    err = (h_f - l_f).clamp_min(0.0) \
+                        * (h_o - l_o).clamp_min(0.0) / 4
+                    consider(e_f, err, 'range', mid=(l_f + h_f) / 2)
             if bound != 'zono' and relu_maps:
                 try:
                     op_idx = torch.nonzero(open_mask,

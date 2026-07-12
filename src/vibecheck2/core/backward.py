@@ -395,6 +395,21 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
             # per element pick the plane pair that is tighter at the box
             # center; adjoint sign selects lower (A+) vs upper (A-).
             lx, hx, ly, hy = inter[name]
+            if range_clamps:
+                # MUL-FACTOR range splits (BaB): entries keyed by the
+                # FACTOR EDGE name constrain that factor's box -- the
+                # McCormick error is (hx-lx)(hy-ly)/4, so halving a
+                # factor quarters it where relu/smooth splits cannot
+                # move it at all (ml4acopf's frozen -8.7)
+                e_a, e_b = op.inputs[0], op.inputs[1]
+                if e_a in range_clamps:
+                    lx = torch.maximum(lx, range_clamps[e_a][0])
+                    hx = torch.minimum(hx, torch.maximum(
+                        range_clamps[e_a][1], lx))
+                if e_b in range_clamps:
+                    ly = torch.maximum(ly, range_clamps[e_b][0])
+                    hy = torch.minimum(hy, torch.maximum(
+                        range_clamps[e_b][1], ly))
             alx, aly, clo, aux, auy, cup = (
                 t.unsqueeze(1)
                 for t in _mccormick_planes(lx, hx, ly, hy))
@@ -505,8 +520,18 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
             outs = []
             for e2, (l2, h2) in ((op.inputs[0], (lx, hx)),
                                  (op.inputs[1], (ly, hy))):
+                if range_clamps and e2 in range_clamps:
+                    # BaB mul-factor range split (keyed by factor EDGE)
+                    l2 = torch.maximum(l2, range_clamps[e2][0])
+                    h2 = torch.minimum(h2, torch.maximum(
+                        range_clamps[e2][1], l2))
                 if e2 in refined:
-                    outs.append(refined[e2])
+                    r_l, r_h = refined[e2]
+                    if range_clamps and e2 in range_clamps:
+                        r_l = torch.maximum(r_l, range_clamps[e2][0])
+                        r_h = torch.minimum(r_h, torch.maximum(
+                            range_clamps[e2][1], r_l))
+                    outs.append((r_l, r_h))
                     continue
                 idx2 = torch.arange(net.ops[e2].n, device=dev)
                 lb2, ub2 = l2.clone(), h2.clone()
