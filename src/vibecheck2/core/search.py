@@ -335,6 +335,11 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         f_worst = torch.full((1,), -torch.inf, device=fdev)
     n_bounded = n_split = rounds = 0
     tol_witness = None
+    # epoch 0, NOT t0: normally round 1's unconditional attack assigns
+    # this, but a round-1 early-continue (OOM halving) skipped the block
+    # and round 2's cadence gate crashed on the unbound name; epoch 0
+    # makes the first evaluated gate fire, preserving the round-1 intent
+    last_atk = 0.0
     _round_wall, _round_B = 1.0, 1
     # box-remainder mode: flips permanently after the first dense-zono
     # OOM, and starts ON when the dense estimate cannot fit at even a
