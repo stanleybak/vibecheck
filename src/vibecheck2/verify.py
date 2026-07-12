@@ -533,8 +533,23 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         if zono_seeded and budget.remaining() > 10:
             # interleave (v1 phase 1+2): re-run the zono OVER the crown-
             # refined bounds (clamped at every nonlin input) and intersect
-            # -- each frame tightens the other's weak edges
-            inter, _ = _zono_seed(inter, clamped=True)
+            # -- each frame tightens the other's weak edges. ITERATED to a
+            # small fixed point (vit pgd_2_3_16: relu-2 input width 15.97
+            # -> 14.09 -> 13.98 over passes vs v1's 9.2; one pass leaves
+            # measurable tightening on the table, later passes go stale)
+            for _il in range(3):
+                w_pre = sum(float((v[1] - v[0]).sum())
+                            for v in inter.values() if len(v) == 2)
+                inter, _ok = _zono_seed(inter, clamped=True)
+                if not _ok:
+                    break
+                if _il < 2:
+                    inter = backward.intermediates_crown(
+                        net, lo, hi, base_inter=inter, budget=budget)
+                w_post = sum(float((v[1] - v[0]).sum())
+                             for v in inter.values() if len(v) == 2)
+                if w_post > 0.99 * w_pre:
+                    break
         lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
         _phase('crown-inter', lb0)
     # defaults stand in for the skipped root-refine phases (later blocks
