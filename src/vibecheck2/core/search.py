@@ -728,6 +728,55 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             zout = None
         n_bounded += blo.shape[0]
         refuted = domain_refuted(lbq, brow)
+        if (lbq.dtype == torch.float32 and brow is not None
+                and not bool(refuted.all())):
+            # f64 KNIFE-EDGE REBOUND (nn4sys dual): rows whose true optimum
+            # sits ~0 drain the frontier to a residue of tiny boxes that
+            # f32 can never push past zero (720_2048_dual: 9 open boxes
+            # ground from round 369 to the deadline), while v1/abc prove
+            # them. At leaf size the relaxation error is gone and the gap
+            # IS f32 rounding: rebound just the near-zero domains with a
+            # float64 rad-zono spec concretization and refute in f64
+            # directly -- never downcast the f64 bound into lbq (nearest
+            # rounding can round a negative bound UP: unsound). The 1e-6
+            # acceptance floor covers the f32-representation slop of the
+            # caller's W/bias.
+            db0 = dom_bound(lbq, brow)
+            ki = torch.nonzero((db0 > -1e-3) & (db0 <= 0),
+                               as_tuple=False).flatten()
+            if 0 < ki.numel() <= 64:
+                try:
+                    _l4, _h4, z64 = backward.fwd.zono(
+                        net, blo[ki].double(), bhi[ki].double(),
+                        return_state=True, box_remainder='all')
+                    zo64 = z64[net.output_name]
+                    del z64
+                    Wk = (Wq[ki] if Wq.dim() == 3
+                          else Wq.unsqueeze(0).expand(ki.numel(), -1, -1)
+                          ).double()
+                    zm64 = torch.bmm(Wk, zo64.c.unsqueeze(2)).squeeze(2) \
+                        - torch.bmm(Wk, zo64.G).abs().sum(dim=2)
+                    if zo64.rad is not None:
+                        zm64 = zm64 - torch.bmm(
+                            Wk.abs(), zo64.rad.unsqueeze(2)).squeeze(2)
+                    if row_groups is not None:
+                        v64 = zm64 + bias[row_groups[brow[ki]]].double()
+                    else:
+                        v64 = (zm64.gather(
+                            1, weight_of[brow[ki]].unsqueeze(1))
+                            + bias[brow[ki]].unsqueeze(1).double())
+                    ref64 = ((v64 > 1e-6)
+                             & torch.isfinite(v64)).any(dim=1)
+                    if bool(ref64.any()):
+                        refuted[ki[ref64]] = True
+                        if os.environ.get('VC2_DEBUG_CLIP'):
+                            log(f'[vc2/bab] round={rounds} f64 rebound '
+                                f'closed {int(ref64.sum())}/{ki.numel()}')
+                except torch.cuda.OutOfMemoryError:
+                    # skip this round's rebound; the domains just split
+                    # as before (documented sound fallback)
+                    if dev.type == 'cuda':
+                        torch.cuda.empty_cache()
         open_mask = ~refuted.all(dim=1)
         if os.environ.get('VC2_DEBUG_CLIP') and rounds <= 60:
             _alloc = (torch.cuda.memory_allocated(dev) / 1e9
