@@ -514,6 +514,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             batch *= 2
         _round_t0 = time.time()
         zout = None            # this batch's forward-zono OUTPUT state
+        zm_res = None          # chunked-rescue spec concretization (B, q)
         # pick the worst-first batch, sized by the memory budget: the
         # reforward holds (lo, hi) for EVERY edge (sum, not max -- mscn's
         # 116 edges held 3GB at the max-based estimate), the crown adjoint
@@ -616,6 +617,10 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     # single shot and fell to intermediates_crown, whose
                     # per-factor identity queries never finished a round).
                     outs = {}
+                    zm_parts = []
+                    Wq_pre = (W if row_groups is None
+                              else W[row_groups[brow]]) \
+                        if brow is not None else None
 
                     def _zchunk(idx_c):
                         _zl, _zh, zc = backward.fwd.zono(
@@ -626,6 +631,27 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                         for k2, v in ibc.items():
                             outs.setdefault(k2, []).append(
                                 tuple(t.detach() for t in v))
+                        if Wq_pre is not None:
+                            # per-chunk forward-zono SPEC concretization:
+                            # the single-shot path applies it via zout, but
+                            # chunked rounds lost it entirely and multi-sub
+                            # roots pinned at -2e-3 crown bounds churned to
+                            # the deadline (720_2048_dual round-65 gap
+                            # telemetry: EVERY open box at one value). The
+                            # generator form keeps cross-factor correlations
+                            # the per-edge crown severs at every mul.
+                            zoc = zc[net.output_name]
+                            Wc = (Wq_pre[idx_c] if Wq_pre.dim() == 3
+                                  else Wq_pre.unsqueeze(0).expand(
+                                      idx_c.numel(), -1, -1))
+                            zmc = torch.bmm(Wc, zoc.c.unsqueeze(2)) \
+                                .squeeze(2) \
+                                - torch.bmm(Wc, zoc.G).abs().sum(dim=2)
+                            if zoc.rad is not None:
+                                zmc = zmc - torch.bmm(
+                                    Wc.abs(),
+                                    zoc.rad.unsqueeze(2)).squeeze(2)
+                            zm_parts.append(zmc.detach())
 
                     try:
                         memory.chunked_indices(
@@ -637,6 +663,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                             torch.cat([o[j] for o in v], dim=0)
                             for j in range(len(v[0])))
                             for k2, v in outs.items()}
+                        if zm_parts:
+                            zm_res = torch.cat(zm_parts, dim=0)
                         if os.environ.get('VC2_DEBUG_CLIP'):
                             log(f'[vc2/bab] round={rounds} chunked '
                                 f'{"rad-" if z_rad_mode else ""}zono '
@@ -726,6 +754,10 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                     zout.rad.unsqueeze(2)).squeeze(2)
             lbq = torch.maximum(lbq, zm)
             zout = None
+        elif zm_res is not None and zm_res.shape == lbq.shape:
+            # chunked-rescue rounds: same concretization, assembled
+            # per chunk (see _zchunk)
+            lbq = torch.maximum(lbq, zm_res)
         n_bounded += blo.shape[0]
         refuted = domain_refuted(lbq, brow)
         if (lbq.dtype == torch.float32 and brow is not None
@@ -742,9 +774,9 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             # acceptance floor covers the f32-representation slop of the
             # caller's W/bias.
             db0 = dom_bound(lbq, brow)
-            ki = torch.nonzero((db0 > -1e-3) & (db0 <= 0),
+            ki = torch.nonzero((db0 > -1e-2) & (db0 <= 0),
                                as_tuple=False).flatten()
-            if 0 < ki.numel() <= 64:
+            if 0 < ki.numel() <= 128:
                 if os.environ.get('VC2_DEBUG_CLIP'):
                     log(f'[vc2/bab] round={rounds} f64 rebound entry '
                         f'k={ki.numel()}')
