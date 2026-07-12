@@ -105,7 +105,7 @@ def _osi_diversify(net, x, lo, hi, generator, steps=30):
 def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         device='cpu', time_budget=10.0, init='uniform', seeds=None,
         lr_frac=0.25, lr_decay=0.99, plateau=40, polish_tries=4,
-        dtype=torch.float32, log=lambda m: None):
+        dtype=torch.float32, step='adam', log=lambda m: None):
     """Search for a spec counterexample. Returns (witness_np | None, info).
 
     The returned witness is ONLY a candidate: callers must gate it through
@@ -137,10 +137,19 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
     if init == 'osi':
         x = _osi_diversify(net, x, lo, hi, gen)
     x = x.clone().requires_grad_(True)
-    opt = torch.optim.Adam([x], lr=float(lr_frac * (hi - lo).max()))
-    # NB: lr is global; per-restart boxes of very different width could
-    # warrant per-restart lr (not needed by current categories)
-    sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=lr_decay)
+    opt = sched = sign_lr = None
+    if step == 'sign':
+        # ab-crown's PGD: x -= lr * sign(grad) with a PER-DIM fixed step
+        # (lr_frac x box width) and slow decay -- large signed steps hop
+        # basins where Adam's decayed crawl converges to the nearest
+        # plateau (soundnessbench hidden CEs: Adam floors at +1e-5,
+        # sign-steps cross). Also ~free per iter (no optimizer state).
+        sign_lr = lr_frac * (hi - lo)
+    else:
+        opt = torch.optim.Adam([x], lr=float(lr_frac * (hi - lo).max()))
+        # NB: lr is global; per-restart boxes of very different width could
+        # warrant per-restart lr (not needed by current categories)
+        sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=lr_decay)
     t0 = time.time()
     best_m = torch.full((x.shape[0],), torch.inf, device=dev)
     best_x = x.detach().clone()
@@ -165,7 +174,12 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         improved = overall < best_m
         best_x[improved] = x.detach()[improved]
         best_m = torch.minimum(best_m, overall)
-        if (best_m < 0).any():
+        # host-sync GATE: `.any()`/`bool()` force a GPU->CPU sync each
+        # iter, and at 2048 restarts that stalled the loop to 64ms/iter
+        # on a 13-op MLP (the checks, not the math, were the attack's
+        # cost). Check every 8th iter; the deepen window still runs.
+        _check = (it & 7) == 0 or deepen_iters > 0 or it == iters - 1
+        if _check and (best_m < 0).any():
             # VNNLIB constraints are NON-strict (equality satisfies;
             # sat_relu Y_1<=0) -- but a FIRST-crossing candidate at ~-1e-4
             # sits inside the CUDA-vs-ORT f32 noise band on deep nets and
@@ -191,13 +205,22 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
                 z = taps[nm]
                 att = att + torch.clamp(1e-4 - z.abs(), min=0).mean()
             loss = loss - att / (10 * 1e-4)
-        opt.zero_grad(set_to_none=True)
+        if x.grad is not None:
+            x.grad = None
         loss.backward()
-        opt.step()
-        sched.step()
+        if step == 'sign':
+            with torch.no_grad():
+                x -= sign_lr * x.grad.sign()
+                sign_lr = sign_lr * lr_decay
+        else:
+            opt.step()
+            sched.step()
         with torch.no_grad():
             x.clamp_(lo, hi)
-        since_improve = 0 if bool(improved.any()) else since_improve + 1
+        if _check:
+            # (same sync-gate as above: plateau granularity of 8 iters
+            # is irrelevant next to plateau windows of 40+)
+            since_improve = 0 if bool(improved.any()) else since_improve + 8
         if since_improve > plateau or time.time() - t0 > time_budget:
             break
     order = torch.argsort(best_m)
