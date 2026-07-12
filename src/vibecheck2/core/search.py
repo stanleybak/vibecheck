@@ -595,7 +595,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                         f'input-split per-batch zono unavailable '
                         f'({type(_ze).__name__}: {str(_ze)[:60]}); '
                         f'interval reforward only')
-                if ib is None and zono_oom and roots is None:
+                if ib is None and zono_oom and (roots is None
+                                                or z_rad_mode):
                     # the BATCH does not fit but per-leaf zono may (vit:
                     # ~5 GiB/leaf at 5671 generators; interval degrade here
                     # made the frontier explode to 16k boxes where v1's
@@ -604,11 +605,17 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     # keeping only each chunk's per-edge bounds -- the
                     # generator matrices free chunk-wise. Seed the chunk at
                     # half the batch: the single shot just proved B over.
+                    # Multi-sub joins only in box-remainder mode, where the
+                    # per-leaf state is ~n_wide generators and chunks fit
+                    # (mscn_2048d_dual: the round-2 pop at B=720 OOMed the
+                    # single shot and fell to intermediates_crown, whose
+                    # per-factor identity queries never finished a round).
                     outs = {}
 
                     def _zchunk(idx_c):
                         _zl, _zh, zc = backward.fwd.zono(
-                            net, blo[idx_c], bhi[idx_c], return_state=True)
+                            net, blo[idx_c], bhi[idx_c], return_state=True,
+                            box_remainder='all' if z_rad_mode else False)
                         ibc = backward._inter_from_state(
                             net, lambda e: zc[e].bounds())
                         for k2, v in ibc.items():
@@ -625,6 +632,10 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                             torch.cat([o[j] for o in v], dim=0)
                             for j in range(len(v[0])))
                             for k2, v in outs.items()}
+                        if os.environ.get('VC2_DEBUG_CLIP'):
+                            log(f'[vc2/bab] round={rounds} chunked '
+                                f'{"rad-" if z_rad_mode else ""}zono '
+                                f'rescue B={B}')
                     except torch.cuda.OutOfMemoryError:
                         # even one leaf's zono does not fit: the halving
                         # floor re-raised; fall through to the degrades

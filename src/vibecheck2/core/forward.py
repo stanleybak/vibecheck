@@ -624,13 +624,16 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
                 # remainder mode: no new columns; the e^2 residual joins
                 # the off-diagonal box (this mode trades exactly this
                 # correlation for memory). The FIRST-ORDER gens are kept
-                # only while small: remainder mode exists to cap memory,
-                # and carrying (B, n, g) products through chained muls
-                # locked the box for 12 minutes on mscn_2048d_dual
-                # (360 domains x 2048 wide x 300+ gens x 12 muls) --
-                # collapse to rad past the cap (|G|.1 is sound).
+                # while the PER-DOMAIN state stays small: batch-driven
+                # size is the caller's chunker's job (a total-numel cap
+                # here made tightness depend on chunk size -- on
+                # mscn_2048d_dual chunks >63 domains silently collapsed
+                # to box, severing input correlation, and the frontier
+                # exploded to 120k). Per-domain column growth (relu
+                # columns under box_remainder=True chaining through
+                # muls) still collapses to rad (|G|.1 is sound).
                 rad2 = box_off + 0.5 * D.abs().sum(dim=2)
-                if G2.numel() > 40_000_000:
+                if c2.shape[1] * max(len(sym), 1) > 2_000_000:
                     state[name] = ZonoState(
                         c2, torch.zeros(B, c2.shape[1], 0, device=dev,
                                         dtype=dt), [],
