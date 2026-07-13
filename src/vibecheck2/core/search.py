@@ -362,6 +362,28 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     # attempt, rad-mode bounds stay sound)
     z_rad_mode = (backward._zono_cost_bytes(net, 16)
                   > memory.free_bytes(dev) * memory.SAFETY)
+    # forward-only bound regime for the mscn multi-sub family (mul +
+    # reciprocal nets): the planes-probe measured the crown backward adds
+    # no tightness over the forward-zono spec concretization there while
+    # tripling round cost, and v1 wins the family on leaves/sec with
+    # forward-only bounds (720_2048_dual: frontier 5697 -> 476 at equal
+    # rounds; first-ever closure at 392s). Deliberately EXCLUDES relu/
+    # trig-only nets (lsnc: the crown clip is the load-bearing certifier
+    # there). Env-overridable both ways for measurements.
+    # forward-only regime, EXPERIMENT-ONLY (VC2_MSUB_NOCROWN=1): it
+    # closed 720_2048_dual for the first time ever (392s; crown mode
+    # never converges there) but LOSES dual_360 (unknown@159 vs crown's
+    # unsat@92) and 0_500 (the non-dual family needs the crown/clip) --
+    # the same opposite-regimes trap as acasxu 4_7-p1 vs 3_3-p2. Crown
+    # mode stays the default; flipping this per-instance requires the
+    # leaf-rate work (streaming zono state -> bigger chunks) that makes
+    # nocrown fit official budgets first.
+    msub_nocrown = (roots is not None
+                    and os.environ.get('VC2_MSUB_NOCROWN', '') not in
+                    ('', '0'))
+    if msub_nocrown:
+        log('[vc2/bab] multi-sub forward-only bound regime '
+            '(mul+reciprocal family)')
     if z_rad_mode:
         log('[vc2/bab] dense zono projected over budget at B=16; '
             'starting in box-remainder mode')
@@ -718,8 +740,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                                       merged[-1])))
                         inter[k2] = tuple(merged)
             Wq = W if row_groups is None else W[row_groups[brow]]
-            if (os.environ.get('VC2_MSUB_NOCROWN') and zm_res is not None
-                    and brow is not None):
+            if (msub_nocrown and brow is not None
+                    and (zm_res is not None or zout is not None)):
                 # THROUGHPUT EXPERIMENT (planes-probe finding: the dual
                 # family's gap is leaves/sec, not tightness -- v1 runs
                 # forward-only bounds at ~4x our round rate): skip the
@@ -727,8 +749,10 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 # forward-zono spec concretization alone is the bound.
                 # Sound (zm is an independent valid lower bound); loses
                 # the clip's (A, c) linearization for these rounds.
-                lbq = torch.full((blo.shape[0], zm_res.shape[1]),
-                                 -torch.inf, device=dev, dtype=zm_res.dtype)
+                _qn = (zm_res.shape[1] if zm_res is not None
+                       else (Wq.shape[1] if Wq.dim() == 3 else Wq.shape[0]))
+                lbq = torch.full((blo.shape[0], _qn), -torch.inf,
+                                 device=dev, dtype=blo.dtype)
                 Ain = None
             else:
                 lbq, Ain = backward.crown(net, blo, bhi, Wq, inter,
