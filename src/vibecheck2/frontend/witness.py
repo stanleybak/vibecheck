@@ -46,12 +46,9 @@ def _clamp_witness_to_box(witness, x_lo, x_hi, slack=0.0):
     float64 array that is provably within `[x_lo-slack, x_hi+slack]` both as
     float64 and as float32 (the coarser grid → also safe for float64 models).
 
-    `slack` (default 0.0) widens the clamp target to `[lo-slack, hi+slack]` for
-    the box-expansion path: a counterexample that the box-expanded PGD found just
-    OUTSIDE the box must be kept there (clamping it strictly to `[lo, hi]` would
-    re-evaluate the output at the boundary and lose the violation). With
-    `slack <= sat_validate_atol` the result is still within the scorer's
-    `[lo-atol, hi+atol]` acceptance region (scores CORRECT_WITH_TOLERANCE).
+    `slack` must stay 0.0 under the zero-input-tolerance policy (emitted
+    witnesses are strictly in-box); the parameter remains only so the pure
+    helper is testable against widened targets.
 
     Pure function: uses `np.nextafter`/`np.clip` only — it does NOT touch any FP
     rounding mode, so verification arithmetic elsewhere is unaffected (the clamp
@@ -73,8 +70,8 @@ def _clamp_witness_to_box(witness, x_lo, x_hi, slack=0.0):
 _ORT_VALIDATE_SESSIONS = {}
 
 
-def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-4,
-                          emit_slack=0.0):
+def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated,
+                          atol=1e-4):
     """Unified ORT-CPU witness validator for EVERY path (graph + surrogate/attack).
 
     This is the single authoritative gate: load the ORIGINAL ONNX, replay the
@@ -106,15 +103,15 @@ def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-
     except ImportError:
         info['reason'] = 'onnxruntime not installed; skipping validation'
         return True, info
-    # Per-input box check (witness up to `atol` outside is allowed). Validation +
-    # emission then run on the float32-safe CLAMPED point (a box edge can round
-    # outside under the float32 cast ORT/the scorer apply; see
-    # `_clamp_witness_to_box`), never the raw one. Try the STRICT in-box clamp
-    # first (scores CORRECT); only if that does NOT violate and `emit_slack` > 0 do
-    # we retry keeping the witness up to `emit_slack` OUTSIDE the box — the case
-    # where box-expanded PGD found a CE just outside (clamping it strictly in would
-    # re-evaluate the output at the boundary and lose the violation; the just-
-    # outside witness scores CORRECT_WITH_TOLERANCE, no penalty).
+    # POLICY (zero input/output tolerance): the emitted witness is ALWAYS
+    # the float32-safe clamp STRICTLY inside [lo, hi], and its replayed
+    # output must strictly violate. `atol` is a candidate-REPAIR band only:
+    # a raw PGD point up to `atol` outside the box is clamped in and
+    # re-validated (the clamped point either violates strictly or the
+    # candidate is rejected); it never loosens what is emitted. (An
+    # `emit_slack` path that could emit just-outside witnesses --
+    # v1's box-expansion, scorer CORRECT_WITH_TOLERANCE -- was removed
+    # deliberately.)
     raw, boxes_lh = [], []
     for k, w in enumerate(witnesses):
         w = np.asarray(w, np.float64).ravel()
@@ -156,10 +153,6 @@ def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-
         return violated, inbox, y, updates
 
     violated, inbox, y, updates = _eval_at(0.0)
-    if violated is False and float(emit_slack) > 0.0:
-        b_violated, b_inbox, b_y, b_updates = _eval_at(float(emit_slack))
-        if b_violated is True:                      # CE only holds just outside box
-            violated, inbox, y, updates = b_violated, b_inbox, b_y, b_updates
     info['witnesses_inbox'] = inbox
     info['witness_inbox'] = inbox[0] if len(inbox) == 1 else None
     if violated is None:                            # ORT failure -> reject
@@ -177,8 +170,7 @@ def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-
     return False, info
 
 
-def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0,
-                          emit_slack=0.0):
+def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0):
     """Run a SAT witness through ONNXRuntime + check it actually violates
     the spec. Catches spurious counterexamples from PGD/MILP bugs OR from
     graph-builder bugs (vibecheck's internal forward might compute a
@@ -226,7 +218,7 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0,
         return is_ce, upd
 
     return _validate_witness_ort(onnx_path, [w], [(spec.x_lo, spec.x_hi)],
-                                 _output_violated, atol, emit_slack=emit_slack)
+                                 _output_violated, atol)
 
 
 def _onnx_io_meta(onnx_path):

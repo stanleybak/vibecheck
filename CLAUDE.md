@@ -57,8 +57,13 @@ and branch-and-bound.
 - **Cap memory-uncertain runs:** `systemd-run --user --scope -p MemoryMax=8G`.
   The local GPU is an 8 GB laptop part on the machine hosting this session:
   small batches, one GPU job at a time.
-- Every `sat` must survive the ORT-CPU replay chokepoint (input box within
-  1e-4, output strictly violating) before it is emitted.
+- Every `sat` must survive the ORT-CPU replay chokepoint before it is
+  emitted: the emitted witness is the float32-safe clamp STRICTLY inside
+  the input box, and its replayed output must STRICTLY violate — zero
+  input and output tolerance (Stan, 2026-07-12). Raw candidates slightly
+  outside the box may be clamped in and re-validated (repair, not
+  acceptance); within-tolerance near-misses are stashed/flagged as
+  diagnostics only and never become verdicts.
 
 ## Testing
 
