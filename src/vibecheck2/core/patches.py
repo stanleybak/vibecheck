@@ -571,7 +571,31 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None,
         # kernels). OOM halves k and retries the remaining channels.
         k = max(1, int(chan_chunk))
         pend = list(chan_iter)
+        _oomed = False
+        _seq = False
         while pend:
+            if _oomed:
+                # the failed walk's tensors are pinned by the exception
+                # frames until the handler exits; free them BEFORE the
+                # retry, not inside the handler
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                _oomed = False
+            if _seq:
+                # B=2 (+- pair) over budget at this edge: one B=1 walk
+                # per sign, OUTSIDE any exception frame
+                ch = pend[0]
+                pa = PatchAdjoint.identity((C, H, W), ch, B=1,
+                                           device=dev, dtype=lo.dtype)
+                d0 = torch.zeros(1, H * W, device=dev, dtype=lo.dtype)
+                lbs[0, ch] = walk(pa, d0, edge)[0]
+                pa2 = PatchAdjoint.identity((C, H, W), ch, B=1,
+                                            device=dev, dtype=lo.dtype)
+                pa2.v = -pa2.v
+                ubs[0, ch] = -walk(pa2, torch.zeros_like(d0), edge)[0]
+                pend = pend[1:]
+                continue
             grp = pend[:k]
             try:
                 pa = PatchAdjoint.identity_batch((C, H, W), grp,
@@ -584,9 +608,10 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None,
                 ubs[0, grp] = -res[len(grp):]
                 pend = pend[k:]
             except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
+                _oomed = True
                 if k == 1:
-                    raise
+                    _seq = True
+                    continue
                 k = max(1, k // 2)
     if _prof is not None:
         torch.cuda.synchronize()

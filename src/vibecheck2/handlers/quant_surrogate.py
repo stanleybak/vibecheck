@@ -462,13 +462,15 @@ def surrogate_attack(onnx_path, vnnlib_path, timeout, device='cpu',
     fq_path = os.path.join(surrogate_dir, base + '_fq.onnx')
 
     from onnx2torch import convert
-    dev = 'cuda' if (device == 'cuda' and torch.cuda.is_available()) \
-        else 'cpu'
-    if dev == 'cuda':
-        # cap the process so the saturating surrogate (gradient-
-        # checkpointed, ~3GB) can't grab the whole card
-        _tot = torch.cuda.get_device_properties(0).total_memory / 1e9
-        torch.cuda.set_per_process_memory_fraction(min(0.95, 6.0 / _tot), 0)
+    if device == 'cuda':
+        # v1 validated a hybrid GPU-gradient path; THIS port validated
+        # CPU only (50/50 on both CPU regimes). Run the validated path
+        # rather than an unexercised one -- revisit only with a fresh
+        # end-to-end validation (v1's recipe: memory-fraction cap +
+        # gradient checkpointing).
+        log('[vc2/surrogate] GPU grad path unvalidated in this port; '
+            'using CPU')
+    dev = 'cpu' 
     if saturate:
         # non-VNNI scorer: the float/fakequant surrogates track the VNNI
         # output, so their gradient finds nothing here (measured). Build
