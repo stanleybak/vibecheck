@@ -1184,7 +1184,32 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
 
 
 def main(argv=None):
-    """Minimal CLI mirroring v1's verdict conventions for parity harnesses."""
+    """Console entry: dispatch between the VNN-LIB standard CLI (Ch. 5:
+    --name/--version, `verify <query> ...`, `supports <capability>`) and
+    the legacy flat --net/--spec CLI (what the VNNCOMP harness invokes).
+    A bare positional first argument is a query filepath -> implicit
+    `verify` (v1 main dispatch, mirrored)."""
+    import sys as _sys
+    argv = list(_sys.argv[1:]) if argv is None else list(argv)
+    if argv and (argv[0] in ('--name', '--version', 'supports', 'verify')
+                 or not argv[0].startswith('-')):
+        from .cli_standard import dispatch
+        return dispatch(argv)
+    return _legacy_main(argv)
+
+
+def _verdict_str(kind, style):
+    """Spell an internal verdict token for emission. The single point where
+    the two CLI dialects diverge: the VNN-LIB standard writes `timed-out`
+    where VNNCOMP scripts parse `timeout`; all internal logic keeps the
+    canonical 'timeout' token -- translate only when writing (v1 rule)."""
+    if kind == 'timeout' and style == 'standard':
+        return 'timed-out'
+    return kind
+
+
+def _legacy_main(argv=None):
+    """Flat CLI mirroring v1's verdict conventions for parity harnesses."""
     import argparse
     p = argparse.ArgumentParser(prog='vibecheck2')
     p.add_argument('--net', required=True)
@@ -1198,6 +1223,12 @@ def main(argv=None):
     p.add_argument('--net-cache', default=None,
                    help='converted-net cache path: load when present, '
                         'else convert and save (VNNCOMP prepare stage)')
+    p.add_argument('--verdict-style', default='vnncomp',
+                   dest='verdict_style', choices=['vnncomp', 'standard'],
+                   help="Verdict spelling for the results file: 'vnncomp' "
+                        "(default, the competition scripts' 'timeout') or "
+                        "'standard' (the VNN-LIB standard's 'timed-out'); "
+                        'only that word differs')
     p.add_argument('--no-attack', action='store_true',
                    help='disable ALL falsification (soundness sweep): no '
                         'counterexample can be found, so sat instances '
@@ -1284,11 +1315,12 @@ def main(argv=None):
                 io_meta=_resolve_cex_io_meta(a.spec))
         tmp = a.results_file + '.tmp'
         with open(tmp, 'w') as f:
-            f.write(verdict + '\n')
+            f.write(_verdict_str(verdict, a.verdict_style) + '\n')
             if ce is not None:
                 f.write(ce + '\n')
         os.replace(tmp, a.results_file)
-    print(f'[vc2] verdict: {verdict}  ({details["time"]:.2f}s)')
+    print(f'[vc2] verdict: {_verdict_str(verdict, a.verdict_style)}'
+          f'  ({details["time"]:.2f}s)')
     return 0 if verdict == 'unsat' else 1
 
 
