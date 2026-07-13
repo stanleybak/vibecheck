@@ -5,39 +5,16 @@ surrogate_pgd/sign_attack; the v1 settings object collapses to the two
 values it actually read (atol, max_positions). Complete: 'unsat' means
 every placement was evaluated safe on ORT-CPU.
 """
-import gzip
 import itertools
 import os
 import time
 
 import numpy as np
-import onnx
 import onnxruntime as ort
 
 
 
-def _load_onnx_model(path):
-    # Benchmarks ship gzipped and instances.csv names the UN-gz file (`foo.onnx`)
-    # while only `foo.onnx.gz` exists; resolve the .gz sibling so the quantized-op
-    # probe (the first thing prepare does) doesn't crash on every gzipped net.
-    if not os.path.isfile(path) and os.path.isfile(path + '.gz'):
-        path = path + '.gz'
-    if path.endswith('.gz'):
-        with gzip.open(path) as fh:
-            return onnx.load_model_from_string(fh.read())
-    return onnx.load(path)
-
-
-def _model_input_shapes(onnx_path):
-    """Free-input (non-initializer) shapes of the ONNX, in graph order — the authoritative
-    tensor shapes for feeding the model (the spec only carries a flat per-index box)."""
-    m = _load_onnx_model(onnx_path)
-    init = {i.name for i in m.graph.initializer}
-    return [[d.dim_value if d.dim_value > 0 else 1 for d in i.type.tensor_type.shape.dim]
-            for i in m.graph.input if i.name not in init]
-
-
-# ---------------------------------------------------------------------- fold surrogate
+from .quant_surrogate import _load_onnx_model, _model_input_shapes
 
 
 def _worst_margin_np(y, disjuncts):

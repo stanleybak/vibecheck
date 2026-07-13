@@ -232,6 +232,20 @@ def _requeue(f_lo, f_hi, f_worst, f_row, batch, blo, bhi, brow):
                                            min(batch, blo.shape[0]) // 2)
 
 
+
+def _spec_concretize(W3, z):
+    """Forward-zono spec concretization: W.c - |W.G|.1 - |W|.rad per row.
+    A sound lower bound that KEEPS the state's cross-factor correlations
+    end-to-end (extracting per-edge boxes for the backward crown severs
+    them at every mul -- lsnc quadrotor2d: the correlated product state
+    was invisible to the crown). W3: (B, q, n_out); z: output ZonoState."""
+    zm = torch.bmm(W3, z.c.unsqueeze(2)).squeeze(2) \
+        - torch.bmm(W3, z.G).abs().sum(dim=2)
+    if z.rad is not None:
+        zm = zm - torch.bmm(W3.abs(), z.rad.unsqueeze(2)).squeeze(2)
+    return zm
+
+
 def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     device='cpu', batch=4096, split_dims=2, alpha_iters=8,
                     onnx_path=None, attack_every=8, heuristic=None,
@@ -640,18 +654,11 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                             # telemetry: EVERY open box at one value). The
                             # generator form keeps cross-factor correlations
                             # the per-edge crown severs at every mul.
-                            zoc = zc[net.output_name]
                             Wc = (Wq_pre[idx_c] if Wq_pre.dim() == 3
                                   else Wq_pre.unsqueeze(0).expand(
                                       idx_c.numel(), -1, -1))
-                            zmc = torch.bmm(Wc, zoc.c.unsqueeze(2)) \
-                                .squeeze(2) \
-                                - torch.bmm(Wc, zoc.G).abs().sum(dim=2)
-                            if zoc.rad is not None:
-                                zmc = zmc - torch.bmm(
-                                    Wc.abs(),
-                                    zoc.rad.unsqueeze(2)).squeeze(2)
-                            zm_parts.append(zmc.detach())
+                            zm_parts.append(_spec_concretize(
+                                Wc, zc[net.output_name]).detach())
 
                     try:
                         memory.chunked_indices(
@@ -738,21 +745,12 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         # (cutting real counterexamples: unsound)
         lbq_lin = lbq.clone()
         if zout is not None:
-            # forward-zono spec concretization: w.c - |w.G|.1 - |w|.rad is
-            # a sound lower bound that KEEPS the state's cross-factor
-            # correlations end-to-end; extracting per-edge boxes for the
-            # backward crown severs them at every mul (lsnc quadrotor2d:
-            # the correlated product state was invisible to the crown).
             # lbq_lin above stays the PLAIN crown concretization -- the
-            # clip's (A, c) reconstruction must match Ain exactly.
+            # clip's (A, c) reconstruction must match Ain exactly (see
+            # _spec_concretize for why the zono form is tighter here)
             Wq3 = Wq if Wq.dim() == 3 \
                 else Wq.unsqueeze(0).expand(blo.shape[0], -1, -1)
-            zm = torch.bmm(Wq3, zout.c.unsqueeze(2)).squeeze(2) \
-                - torch.bmm(Wq3, zout.G).abs().sum(dim=2)
-            if zout.rad is not None:
-                zm = zm - torch.bmm(Wq3.abs(),
-                                    zout.rad.unsqueeze(2)).squeeze(2)
-            lbq = torch.maximum(lbq, zm)
+            lbq = torch.maximum(lbq, _spec_concretize(Wq3, zout))
             zout = None
         elif zm_res is not None and zm_res.shape == lbq.shape:
             # chunked-rescue rounds: same concretization, assembled

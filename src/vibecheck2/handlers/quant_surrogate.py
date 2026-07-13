@@ -387,6 +387,20 @@ def _parse_v1(txt):
     return SurrogateSpec([('X', (n,), lo, hi)], out_dnf)
 
 
+
+def dnf_margin_np(out_dnf, y):
+    """Violation margin of output y against the DNF, in FLOAT64 per element
+    (a float32 y minus a python rhs collapses to float32 under NEP-50 and
+    would hide a sub-float32 strict buffer). >= buffer means some clause
+    strictly crosses."""
+    best = -np.inf
+    for clause in out_dnf:
+        m = min((float(y[i]) - rhs) if op == 'gt' else (rhs - float(y[i]))
+                for i, op, rhs in clause)
+        best = max(best, m)
+    return float(best)
+
+
 # ---------------------------------------------------------- ORT validate
 
 _ORT_SESSION_CACHE = {}
@@ -508,14 +522,7 @@ def surrogate_attack(onnx_path, vnnlib_path, timeout, device='cpu',
         return torch.stack(clause_vals).max()
 
     def margin_np(y):
-        # float64 per element: a float32 y minus a python rhs collapses to
-        # float32 under NEP-50 and would hide a sub-float32 strict buffer
-        best = -np.inf
-        for clause in spec.out_dnf:
-            m = min((float(y[i]) - rhs) if op == 'gt' else (rhs - float(y[i]))
-                    for i, op, rhs in clause)
-            best = max(best, m)
-        return float(best)
+        return dnf_margin_np(spec.out_dnf, y)
 
     def fq_margin(pts):
         if eval_model is None:
@@ -653,10 +660,7 @@ def try_quant_surrogate(onnx_path, vnnlib_path, timeout, device='cpu',
     boxes = [(lo, hi) for _, _, lo, hi in spec.inputs]
 
     def _violated(inbox, yv):
-        m = max(min((float(yv[i]) - rhs) if op == 'gt'
-                    else (rhs - float(yv[i]))
-                    for i, op, rhs in clause)
-                for clause in spec.out_dnf)
+        m = dnf_margin_np(spec.out_dnf, yv)
         return (m >= strict_buffer), {'worst_margin': m}
 
     ok, vinfo = _validate_witness_ort(onnx_path, wits, boxes, _violated,
