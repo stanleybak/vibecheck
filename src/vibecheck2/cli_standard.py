@@ -16,10 +16,9 @@ route structurally and logs the choice) and every soundness gate behave
 identically in both CLIs. `verify.main` dispatches here; a bare positional
 first argument is an implicit `verify`.
 
-The capabilities table is vc2's OWN (honest deltas from v1: the
-nonlinear-constraint augment transpiler and MNC comparisons are not
-ported; multi-input models run only through the attack-only quantized
-surrogate handler).
+The capabilities table is vc2's OWN (honest deltas from v1: MNC
+comparisons are not ported; multi-input models run only through the
+attack-only quantized surrogate handler).
 """
 
 import argparse
@@ -74,10 +73,7 @@ def _version():
 # the local VNNCOMP 2025+2026 clones).
 _NOTE_REAL = 'bounds computed in real arithmetic, not IEEE-754-faithful'
 _SUPPORTS_TABLE = {
-    '--vnnlib-versions': [
-        '1.0',
-        '2.0 * linear constraints only (nonlinear-constraint augmentation '
-        'is not ported to vibecheck2)'],
+    '--vnnlib-versions': ['1.0', '2.0'],
     '--onnx-opset-versions': ['8', '20'],
     '--onnx-element-types': ['real',
                              f'float32 * {_NOTE_REAL}',
@@ -89,7 +85,9 @@ _SUPPORTS_TABLE = {
     '--multiple-network-theories': ['SNET', 'MENET',
                                     'MINET * two-network pairs only'],
     '--multiple-node-comparison-theories': ['SNC'],
-    '--arithmetic-complexity-theories': ['BND', 'OUTC', 'LIN'],
+    '--arithmetic-complexity-theories': [
+        'BND', 'OUTC', 'LIN',
+        'POLY * polynomial constraints transpiled via nonlinear-augment'],
     '--optimised-disjunctive-reasoning': ['true'],
     '--serialise-assignments': ['true'],
 }

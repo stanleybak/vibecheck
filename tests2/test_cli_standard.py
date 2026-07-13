@@ -24,7 +24,7 @@ def test_name_version(capsys):
 def test_supports_known_and_unknown(capsys):
     assert cs.dispatch(['supports', '--vnnlib-versions']) == 0
     out = capsys.readouterr().out.splitlines()
-    assert out[0] == '1.0' and out[1].startswith('2.0 *')
+    assert out == ['1.0', '2.0']
     assert cs.run_supports(['--no-such-capability']) == 2
     assert 'unknown capability' in capsys.readouterr().err
     assert cs.run_supports([]) == 2

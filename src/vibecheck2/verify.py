@@ -168,9 +168,25 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     try:
         spec = load_vnnlib(vnnlib_path)
     except NotImplementedError as e:
-        # nonlinear v2 specs (ml4acopf 2.0) need the augment transpiler
-        # (handlers); a spec the front end cannot represent is a feature
-        # boundary, not a crash
+        # nonlinear v2 specs (adaptive_cruise): transpile polynomial
+        # constraints into an augmented net + linear v1 spec and verify
+        # THAT through this same pipeline (handlers.nonlinear_augment,
+        # v1 port; oracle-gated, strict sat re-validation on the
+        # original). Any other unsupported spec stays a feature
+        # boundary -> honest unknown.
+        from .handlers.nonlinear_augment import try_augmented_verify
+
+        def _rec(net2, spec2, t2, dev2):
+            return verify(net2, spec2, t2, dev2,
+                          alpha_iters=alpha_iters, pgd_budget=pgd_budget,
+                          attack_off=attack_off, log=log)
+
+        try:
+            return try_augmented_verify(onnx_path, vnnlib_path,
+                                        timeout - (time.time() - t0),
+                                        device, _rec, log=log)
+        except NotImplementedError:
+            pass
         log(f'[vc2] spec not supported: {e}; verdict unknown')
         return 'unknown', {'reason': f'not_implemented: {e}',
                            'time': time.time() - t0}
