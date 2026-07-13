@@ -42,3 +42,6 @@ scratch/
 # Claude Code local config (agents, skills, periodic-campaign loop) — local-only,
 # not part of the published tool.
 .claude/
+
+# Local Claude Code guidance (not published)
+CLAUDE.md
