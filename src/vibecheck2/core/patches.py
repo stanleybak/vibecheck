@@ -61,6 +61,23 @@ class PatchAdjoint:
         pa.chan_lo = channel                 # first edge channel in window
         return pa
 
+    @staticmethod
+    def identity_batch(edge_shape, chans, device='cpu',
+                       dtype=torch.float32):
+        """Identity queries for k channels batched along B as k x {+,-}:
+        B = 2k walks share one geometry (anchors identical); the first
+        conv composition resolves the per-B kernel slice via a GROUPED
+        conv_transpose (bchan). Rows 0..k-1 bound lb, rows k..2k-1 carry
+        negated windows for ub (caller negates the result)."""
+        C, H, W = edge_shape
+        k = len(chans)
+        v = torch.ones(2 * k, H * W, 1, 1, 1, device=device, dtype=dtype)
+        v[k:] = -1.0
+        pa = PatchAdjoint(v, (H, W), (0, 0), (1, 1), edge_shape)
+        pa.bchan = torch.as_tensor(list(chans) + list(chans),
+                                   device=device, dtype=torch.long)
+        return pa
+
     def through_conv(self, kernel, stride, padding, in_shape):
         """Compose with y = conv2d(x, kernel): adjoint w.r.t. x.
 
@@ -69,8 +86,11 @@ class PatchAdjoint:
         start whose channel selects a kernel slice)."""
         B, Q, Cw, ph, pw = self.v.shape
         k = torch.as_tensor(kernel, device=self.v.device, dtype=self.v.dtype)
+        bch = getattr(self, 'bchan', None)
         ci = getattr(self, 'cidx', None)
-        if ci is not None:
+        if bch is not None:
+            pass                        # grouped path slices k[bchan] below
+        elif ci is not None:
             k = k[ci]
         elif Cw != k.shape[0]:
             assert Cw == 1, 'window channels must be full Co or the 1-ch start'
@@ -92,6 +112,22 @@ class PatchAdjoint:
         mask = (((yy >= 0) & (yy < H)).unsqueeze(2)
                 & ((xx >= 0) & (xx < W)).unsqueeze(1))         # (Q, ph, pw)
         v = self.v * mask.unsqueeze(0).unsqueeze(2).to(self.v.dtype)
+        if bch is not None:
+            # per-B kernel slice via grouped conv_transpose: input
+            # (Q, B, ph, pw) with groups=B, weight k[bchan] (B, Ci, kh, kw)
+            assert Cw == 1, 'bchan start must be 1-channel windows'
+            kb = k[bch]                              # (B, Ci, kh, kw)
+            vin = v.squeeze(2).permute(1, 0, 2, 3)   # (Q, B, ph, pw)
+            og = F.conv_transpose2d(vin, kb, stride=stride, groups=B)
+            ph2, pw2 = og.shape[2], og.shape[3]
+            og = og.reshape(Q, B, -1, ph2, pw2).permute(1, 0, 2, 3, 4)
+            pa = PatchAdjoint(
+                og, self.grid,
+                (self.base[0] * sy - padding[0],
+                 self.base[1] * sx - padding[1]),
+                (self.step[0] * sy, self.step[1] * sx), tuple(in_shape))
+            pa.chan_lo = 0
+            return pa
         vals = v.reshape(B * Q, Cw, ph, pw)
         # Q-chunked: deep-edge walks carry ~4GB per conv_transpose output
         # (784 queries x 64ch x 141^2); chunking bounds the transient peak
@@ -157,7 +193,8 @@ class PatchAdjoint:
         C, H, W = self.edge_shape
         gh, gw = self.grid
         dev = self.v.device
-        t4 = t.reshape(B, C, H * W)
+        Bt = t.shape[0] if t.dim() == 2 else 1
+        t4 = t.reshape(Bt, C, H * W)
         ci = getattr(self, 'cidx', None)
         if ci is None:
             cw0 = getattr(self, 'chan_lo', 0)
@@ -180,13 +217,13 @@ class PatchAdjoint:
               & ((xx >= 0) & (xx < W)).unsqueeze(1))          # (Q, ph, pw)
         flat = (yy.clamp(0, H - 1).unsqueeze(2) * W
                 + xx.clamp(0, W - 1).unsqueeze(1))            # (Q, ph, pw)
-        out = torch.empty(B, Q, Cs, ph, pw, device=dev, dtype=t.dtype)
+        out = torch.empty(Bt, Q, Cs, ph, pw, device=dev, dtype=t.dtype)
         # Q-chunks: peak extra memory ~ chunk*Cs*ph*pw
         qc = max(1, int(2e8 // max(1, Cs * ph * pw)))
         for s0 in range(0, Q, qc):
             e0 = min(Q, s0 + qc)
             g = tc[:, :, flat[s0:e0].reshape(-1)]
-            g = g.reshape(B, Cs, e0 - s0, ph, pw).permute(0, 2, 1, 3, 4)
+            g = g.reshape(Bt, Cs, e0 - s0, ph, pw).permute(0, 2, 1, 3, 4)
             out[:, s0:e0] = g * ok[s0:e0].unsqueeze(0).unsqueeze(2) \
                 .to(t.dtype)
         return out
@@ -504,32 +541,53 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None,
         um = unstable.reshape(C, H, W)
     lbs = torch.full((B, C, H * W), -torch.inf, device=dev, dtype=lo.dtype)
     ubs = torch.full((B, C, H * W), torch.inf, device=dev, dtype=lo.dtype)
-    for ch in chan_iter:
-        bbox = None
-        if um is not None:
+    assert B == 1, 'patch_refine batches CHANNELS along the walk batch'
+    if um is not None:
+        # bbox mode stays per-channel (quadrant callers)
+        for ch in chan_iter:
             ys, xs = torch.nonzero(um[ch], as_tuple=True)
             if ys.numel() == 0:
                 continue
             bbox = (int(ys.min()), int(ys.max()) + 1,
                     int(xs.min()), int(xs.max()) + 1)
-        pa = PatchAdjoint.identity((C, H, W), ch, B=B, device=dev,
-                                   dtype=lo.dtype, bbox=bbox)
-        nq = pa.v.shape[1]
-        d0 = torch.zeros(B, nq, device=dev, dtype=lo.dtype)
-        lb_c = walk(pa, d0, edge)
-        pa2 = PatchAdjoint.identity((C, H, W), ch, B=B, device=dev,
-                                    dtype=lo.dtype, bbox=bbox)
-        pa2.v = -pa2.v
-        ub_c = -walk(pa2, torch.zeros_like(d0), edge)
-        if bbox is None:
-            lbs[:, ch] = lb_c
-            ubs[:, ch] = ub_c
-        else:
+            pa = PatchAdjoint.identity((C, H, W), ch, B=1, device=dev,
+                                       dtype=lo.dtype, bbox=bbox)
+            nq = pa.v.shape[1]
+            d0 = torch.zeros(1, nq, device=dev, dtype=lo.dtype)
+            lb_c = walk(pa, d0, edge)
+            pa2 = PatchAdjoint.identity((C, H, W), ch, B=1, device=dev,
+                                        dtype=lo.dtype, bbox=bbox)
+            pa2.v = -pa2.v
+            ub_c = -walk(pa2, torch.zeros_like(d0), edge)
             y0, y1, x0, x1 = bbox
-            lbs[:, ch].reshape(B, H, W)[:, y0:y1, x0:x1] = \
-                lb_c.reshape(B, y1 - y0, x1 - x0)
-            ubs[:, ch].reshape(B, H, W)[:, y0:y1, x0:x1] = \
-                ub_c.reshape(B, y1 - y0, x1 - x0)
+            lbs[:, ch].reshape(1, H, W)[:, y0:y1, x0:x1] = \
+                lb_c.reshape(1, y1 - y0, x1 - x0)
+            ubs[:, ch].reshape(1, H, W)[:, y0:y1, x0:x1] = \
+                ub_c.reshape(1, y1 - y0, x1 - x0)
+    else:
+        # CHANNEL-BATCHED walks: k channels x {+,-} share one walk along
+        # the batch axis (per-channel Python/launch overhead dominated
+        # the vgg cascade; the grouped first-hop resolves per-channel
+        # kernels). OOM halves k and retries the remaining channels.
+        k = max(1, int(chan_chunk))
+        pend = list(chan_iter)
+        while pend:
+            grp = pend[:k]
+            try:
+                pa = PatchAdjoint.identity_batch((C, H, W), grp,
+                                                 device=dev,
+                                                 dtype=lo.dtype)
+                d0 = torch.zeros(2 * len(grp), H * W, device=dev,
+                                 dtype=lo.dtype)
+                res = walk(pa, d0, edge)           # (2k, HW)
+                lbs[0, grp] = res[:len(grp)]
+                ubs[0, grp] = -res[len(grp):]
+                pend = pend[k:]
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if k == 1:
+                    raise
+                k = max(1, k // 2)
     if _prof is not None:
         torch.cuda.synchronize()
         if walk._last is not None:
