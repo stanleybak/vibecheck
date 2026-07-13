@@ -61,7 +61,10 @@ class PatchAdjoint:
         start whose channel selects a kernel slice)."""
         B, Q, Cw, ph, pw = self.v.shape
         k = torch.as_tensor(kernel, device=self.v.device, dtype=self.v.dtype)
-        if Cw != k.shape[0]:
+        ci = getattr(self, 'cidx', None)
+        if ci is not None:
+            k = k[ci]
+        elif Cw != k.shape[0]:
             assert Cw == 1, 'window channels must be full Co or the 1-ch start'
             k = k[self.chan_lo:self.chan_lo + 1]
         sy, sx = stride
@@ -102,6 +105,7 @@ class PatchAdjoint:
         qx = torch.arange(gw, device=dev).repeat(gh)
         ay = self.base[0] + qy * self.step[0]          # (Q,)
         ax = self.base[1] + qx * self.step[1]
+        ci = getattr(self, 'cidx', None)
         cw0 = getattr(self, 'chan_lo', 0)
         for u in range(ph):
             yy = ay + u
@@ -114,8 +118,15 @@ class PatchAdjoint:
                 qi = torch.nonzero(ok, as_tuple=False).flatten()
                 # advanced indices (dims 1, 3, 4) separated by the
                 # channel slice -> the indexed result is (Nq, B, Cw)
-                out[:, qi, cw0:cw0 + Cw, yy[qi], xx[qi]] = \
-                    self.v[:, qi, :, u, v].permute(1, 0, 2)
+                if ci is not None:
+                    for kci, ch in enumerate(ci.tolist()
+                                             if hasattr(ci, 'tolist')
+                                             else ci):
+                        out[:, qi, ch, yy[qi], xx[qi]] = \
+                            self.v[:, qi, kci, u, v]
+                else:
+                    out[:, qi, cw0:cw0 + Cw, yy[qi], xx[qi]] = \
+                        self.v[:, qi, :, u, v].permute(1, 0, 2)
         return out.reshape(B, Q, C * H * W)
 
     def gather_edge(self, t):
@@ -145,6 +156,9 @@ class PatchAdjoint:
         oy, ox = (by + pt) // sy, (bx + pl) // sx
         u = u[:, :, :, :, oy:oy + gh, ox:ox + gw]
         u = u.permute(0, 4, 5, 1, 2, 3).reshape(B, Q, C, ph, pw)
+        ci = getattr(self, 'cidx', None)
+        if ci is not None:
+            return u[:, :, ci]
         cw0 = getattr(self, 'chan_lo', 0)
         return u[:, :, cw0:cw0 + Cw]
 
@@ -163,7 +177,73 @@ class PatchAdjoint:
         pa = PatchAdjoint(v2, self.grid, self.base, self.step,
                           self.edge_shape)
         pa.chan_lo = getattr(self, 'chan_lo', 0)
+        if getattr(self, 'cidx', None) is not None:
+            pa.cidx = self.cidx
         return pa, d
+
+
+
+    def through_block_sel(self, blocks, n_blocks):
+        """Backward through a pair-block gather (decompose_maxpool's
+        u/v Selects): the edge's leading blocks fold into the window's
+        channel axis, so the gather is a pure channel REMAP -- values,
+        anchors and grid are untouched. Current edge (P*Cb, OH, OW) with
+        P = len(blocks) maps to input edge (n_blocks*Cb, OH, OW)."""
+        P = len(blocks)
+        Cf, H, W = self.edge_shape
+        assert Cf % P == 0, (Cf, P)
+        Cb = Cf // P
+        ci = getattr(self, 'cidx', None)
+        if ci is None:
+            cw0 = getattr(self, 'chan_lo', 0)
+            ci = torch.arange(cw0, cw0 + self.v.shape[2],
+                              device=self.v.device)
+        blk = torch.as_tensor(blocks, device=self.v.device,
+                              dtype=torch.long)
+        ci2 = blk[ci // Cb] * Cb + (ci % Cb)
+        pa = PatchAdjoint(self.v, self.grid, self.base, self.step,
+                          (n_blocks * Cb, H, W))
+        pa.cidx = ci2
+        return pa
+
+    def through_pool_win(self, in_shape, stride, offsets):
+        """Backward through the window-stacking Select (decompose_maxpool
+        `/w`, REGULAR pools only): window channel (p, c) at element
+        (u, v) maps to input channel c at (u*sh + i_p, v*sw + j_p);
+        blocks with equal c ACCUMULATE (adjoint linearity). Anchors and
+        steps scale by the pool stride; the window materializes densely
+        (zero interleave), growing (ph-1)*(s-1) + max offset."""
+        B, Q, Cw, ph, pw = self.v.shape
+        C, H, W = in_shape
+        sh, sw = stride
+        cols = len(offsets)
+        Cf = self.edge_shape[0]
+        assert Cf == cols * C, (Cf, cols, C)
+        ci = getattr(self, 'cidx', None)
+        if ci is None:
+            cw0 = getattr(self, 'chan_lo', 0)
+            ci = torch.arange(cw0, cw0 + Cw, device=self.v.device)
+        p_of = (ci // C).tolist()
+        c_of = ci % C
+        cmap = torch.unique(c_of, sorted=True)
+        pos_of = {int(c): k for k, c in enumerate(cmap.tolist())}
+        kh = max(o[0] for o in offsets) + 1
+        kw = max(o[1] for o in offsets) + 1
+        ph2 = (ph - 1) * sh + kh
+        pw2 = (pw - 1) * sw + kw
+        v2 = torch.zeros(B, Q, cmap.numel(), ph2, pw2,
+                         device=self.v.device, dtype=self.v.dtype)
+        for k in range(Cw):
+            i_p, j_p = offsets[p_of[k]]
+            tgt = pos_of[int(c_of[k])]
+            v2[:, :, tgt, i_p::sh, j_p::sw][:, :, :ph, :pw] += \
+                self.v[:, :, k]
+        pa = PatchAdjoint(v2, self.grid,
+                          (self.base[0] * sh, self.base[1] * sw),
+                          (self.step[0] * sh, self.step[1] * sw),
+                          (C, H, W))
+        pa.cidx = cmap
+        return pa
 
 
 def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
@@ -178,7 +258,7 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
     never O(chunk x n_layer): the dense identity refinement on
     vgg16-7's 3.2M-neuron edges is unrunnable at any chunk size.
     """
-    from .linmap import Conv2d, Scale, ScaleShift
+    from .linmap import Conv2d, Scale, ScaleShift, Select
     from .relax import REL
     op_of = dict(net.ops)      # net.order excludes the input op
     B = lo.shape[0]
@@ -191,17 +271,63 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
     c_in = (hi + lo) / 2
     r_in = (hi - lo) / 2
 
-    def walk(pa, d, nm):
-        """Backward from edge `nm`'s OUTPUT patch to the input; returns
-        concretized (lb, ub is via caller sign trick) contributions."""
-        while True:
+    def _cidx(pa):
+        ci = getattr(pa, 'cidx', None)
+        if ci is None:
+            cw0 = getattr(pa, 'chan_lo', 0)
+            ci = torch.arange(cw0, cw0 + pa.v.shape[2], device=pa.v.device)
+        return ci
+
+    def _merge(pa_a, pa_b):
+        """Sum two adjoints on the SAME edge (crown accumulates incoming
+        adjoints BEFORE relaxing the edge's producer -- per-path plane
+        choices are sound but measurably looser through the pool tree's
+        reconvergent adds). Requires aligned anchors; unions channels."""
+        assert pa_a.grid == pa_b.grid and pa_a.base == pa_b.base \
+            and pa_a.step == pa_b.step \
+            and pa_a.edge_shape == pa_b.edge_shape, 'adjoint merge misaligned'
+        ph = max(pa_a.v.shape[3], pa_b.v.shape[3])
+        pw = max(pa_a.v.shape[4], pa_b.v.shape[4])
+        ca, cb = _cidx(pa_a), _cidx(pa_b)
+        cu = torch.unique(torch.cat([ca, cb]), sorted=True)
+        pos = {int(c): k for k, c in enumerate(cu.tolist())}
+        v = torch.zeros(pa_a.v.shape[0], pa_a.v.shape[1], cu.numel(),
+                        ph, pw, device=pa_a.v.device, dtype=pa_a.v.dtype)
+        for pa_x, cx in ((pa_a, ca), (pa_b, cb)):
+            tgt = torch.as_tensor([pos[int(c)] for c in cx.tolist()],
+                                  device=v.device)
+            v[:, :, tgt, :pa_x.v.shape[3], :pa_x.v.shape[4]] += pa_x.v
+        pa = PatchAdjoint(v, pa_a.grid, pa_a.base, pa_a.step,
+                          pa_a.edge_shape)
+        pa.cidx = cu
+        return pa
+
+    def walk(pa0, d, nm0):
+        """Reverse-topological accumulation from edge nm0's OUTPUT patch
+        to the input: incoming adjoints per edge are MERGED before the
+        edge's producer op is applied (matching the dense crown exactly),
+        then concretized at the input."""
+        order_pos = {nm: i for i, nm in enumerate(net.order)}
+        acc = {nm0: pa0}
+        total = None
+        while acc:
+            nm = max(acc, key=lambda k: order_pos.get(k, -1))
+            pa = acc.pop(nm)
             op = op_of[nm]
             if op.kind == 'input':
                 cw = pa.gather_edge(c_in)
                 rw = pa.gather_edge(r_in)
-                lb = d + (pa.v * cw).sum(dim=(2, 3, 4)) \
+                lb = (pa.v * cw).sum(dim=(2, 3, 4)) \
                     - (pa.v.abs() * rw).sum(dim=(2, 3, 4))
-                return lb
+                total = lb if total is None else total + lb
+                continue
+
+            def _push(nm_in, pa_in):
+                if nm_in in acc:
+                    acc[nm_in] = _merge(acc[nm_in], pa_in)
+                else:
+                    acc[nm_in] = pa_in
+
             if op.kind == 'linmap':
                 lm = op.lm
                 if isinstance(lm, Conv2d):
@@ -211,15 +337,15 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
                             dtype=pa.v.dtype).unsqueeze(0).expand(B, -1)
                         d = d + (pa.v * pa.gather_edge(bv)).sum(
                             dim=(2, 3, 4))
-                    pa = pa.through_conv(lm.kernel, lm.stride, lm.padding,
-                                         lm.in_shape)
-                    nm = op.inputs[0]
+                    _push(op.inputs[0],
+                          pa.through_conv(lm.kernel, lm.stride,
+                                          lm.padding, lm.in_shape))
                     continue
                 if isinstance(lm, Scale):
-                    pa = PatchAdjoint(pa.v * lm.a, pa.grid, pa.base,
-                                      pa.step, pa.edge_shape)
-                    pa.chan_lo = getattr(pa, 'chan_lo', 0)
-                    nm = op.inputs[0]
+                    pa2 = PatchAdjoint(pa.v * lm.a, pa.grid, pa.base,
+                                       pa.step, pa.edge_shape)
+                    pa2.cidx = _cidx(pa)
+                    _push(op.inputs[0], pa2)
                     continue
                 if isinstance(lm, ScaleShift):
                     n_e = op_of[op.inputs[0]].n
@@ -233,34 +359,49 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
                         sct = torch.as_tensor(
                             lm.a, device=dev,
                             dtype=pa.v.dtype).reshape(1, -1).expand(B, n_e)
-                        v2 = pa.v * pa.gather_edge(sct)
-                        cl = getattr(pa, 'chan_lo', 0)
-                        pa = PatchAdjoint(v2, pa.grid, pa.base, pa.step,
-                                          pa.edge_shape)
-                        pa.chan_lo = cl
-                    nm = op.inputs[0]
+                        pa2 = PatchAdjoint(pa.v * pa.gather_edge(sct),
+                                           pa.grid, pa.base, pa.step,
+                                           pa.edge_shape)
+                        pa2.cidx = _cidx(pa)
+                        pa = pa2
+                    _push(op.inputs[0], pa)
                     continue
+                if isinstance(lm, Select):
+                    if 'block_sel' in op.params:
+                        bs = op.params['block_sel']
+                        _push(op.inputs[0],
+                              pa.through_block_sel(bs['blocks'],
+                                                   bs['n_blocks']))
+                        continue
+                    if 'pool_win' in op.params:
+                        pwn = op.params['pool_win']
+                        _push(op.inputs[0],
+                              pa.through_pool_win(pwn['in_shape'],
+                                                  pwn['stride'],
+                                                  pwn['offsets']))
+                        continue
+                    raise NotImplementedError(
+                        'patch_refine: unannotated Select (irregular '
+                        'pool window or non-pool gather)')
                 raise NotImplementedError(
                     f'patch_refine: linmap {type(lm).__name__}')
             if op.kind == 'nonlin' and op.fn == 'relu':
                 l0, h0 = inter[nm]
                 al, bl, au, bu = REL['relu'].planes(l0, h0)
                 pa, d = pa.through_planes(al, bl, au, bu, d)
-                nm = op.inputs[0]
+                _push(op.inputs[0], pa)
                 continue
             if op.kind == 'add':
-                cl = getattr(pa, 'chan_lo', 0)
-                pa_a = PatchAdjoint(pa.v, pa.grid, pa.base, pa.step,
-                                    pa.edge_shape)
-                pa_a.chan_lo = cl
                 pa_b = PatchAdjoint(pa.v.clone(), pa.grid, pa.base,
                                     pa.step, pa.edge_shape)
-                pa_b.chan_lo = cl
-                lb_a = walk(pa_a, d, op.inputs[0])
-                lb_b = walk(pa_b, torch.zeros_like(d), op.inputs[1])
-                return lb_a + lb_b
+                pa_b.cidx = _cidx(pa).clone()
+                pa.cidx = _cidx(pa)
+                _push(op.inputs[0], pa)
+                _push(op.inputs[1], pa_b)
+                continue
             raise NotImplementedError(
                 f'patch_refine: op {op.kind}/{getattr(op, "fn", "")}')
+        return total + d
 
     lbs = torch.empty(B, C, H * W, device=dev, dtype=lo.dtype)
     ubs = torch.empty(B, C, H * W, device=dev, dtype=lo.dtype)

@@ -154,8 +154,21 @@ def decompose_maxpool(net):
 
         cols = kh * kw
         cur = f'{name}/w'
+        # regular-window annotation for the PATCH walk (M5): with no
+        # padding repeats, output block p of the stacked Select reads
+        # input (c, oy*sh + i_p, ox*sw + j_p) -- a per-block affine
+        # spatial map the walk composes exactly. Boundary-repeat pools
+        # stay unannotated (the walk falls back to dense there).
+        _regular = (ph == 0 and pw == 0
+                    and (H - kh) % sh == 0 and (W - kw) % sw == 0)
+        _pw_params = {}
+        if _regular:
+            _pw_params['pool_win'] = {
+                'in_shape': (C, H, W), 'out_hw': (OH, OW),
+                'stride': (sh, sw),
+                'offsets': [(i, j) for i in range(kh) for j in range(kw)]}
         emit(cur, 'linmap', [src], n_out * cols,
-             lm=Select(win.T.reshape(-1), n_src))
+             lm=Select(win.T.reshape(-1), n_src), params=_pw_params)
         lvl = 0
         while cols > 1:
             P, odd = cols // 2, cols % 2
@@ -165,9 +178,15 @@ def decompose_maxpool(net):
             od = ev + n_out
             u, v = f'{name}/u{lvl}', f'{name}/v{lvl}'
             emit(u, 'linmap', [cur], npairs,
-                 lm=Select(ev, n_out * cols))
+                 lm=Select(ev, n_out * cols),
+                 params={'block_sel': {
+                     'blocks': [2 * p for p in range(P)],
+                     'n_blocks': cols, 'block': n_out}})
             emit(v, 'linmap', [cur], npairs,
-                 lm=Select(od, n_out * cols))
+                 lm=Select(od, n_out * cols),
+                 params={'block_sel': {
+                     'blocks': [2 * p + 1 for p in range(P)],
+                     'n_blocks': cols, 'block': n_out}})
             nu = f'{name}/n{lvl}'
             emit(nu, 'linmap', [u], npairs, lm=Scale(-1.0, npairs))
             dd = f'{name}/d{lvl}'

@@ -208,3 +208,44 @@ def test_point_taps_capture_sign_inputs():
     # differentiable through the tap (the attractor loss needs this)
     g = torch.autograd.grad(taps['s'].abs().sum(), x)[0]
     assert g is not None and bool((g.abs() > 0).any())
+
+
+def test_patch_refine_parity_through_pool_tree():
+    """patch_refine walks THROUGH a decomposed maxpool (block-gather +
+    window-stacking Selects, the M5 pool-tree chunk) and matches the
+    dense identity-crown refinement exactly."""
+    import torch
+    from vibecheck2.core.graph import Net, Op, decompose_maxpool
+    from vibecheck2.core import backward
+    from vibecheck2.core.patches import patch_refine
+
+    lm1, s1 = _conv(2, 4, 3, 1, 1, (2, 8, 8))       # (4, 8, 8)
+    n1 = int(np.prod(s1))
+    pooled = (4, 4, 4)
+    lm2, s2 = _conv(4, 3, 3, 1, 1, pooled)          # (3, 4, 4)
+    n_in = 2 * 8 * 8
+    ops = {
+        'x': Op('x', 'input', (), (n_in,), n_in),
+        'c1': Op('c1', 'linmap', ('x',), s1, n1, lm=lm1),
+        'r1': Op('r1', 'nonlin', ('c1',), s1, n1, fn='relu'),
+        'p1': Op('p1', 'maxpool', ('r1',), pooled, int(np.prod(pooled)),
+                 params={'in_shape': s1, 'kernel_shape': (2, 2),
+                         'stride': (2, 2), 'padding': (0, 0)}),
+        'c2': Op('c2', 'linmap', ('p1',), s2, int(np.prod(s2)), lm=lm2),
+    }
+    net = Net(ops, ['c1', 'r1', 'p1', 'c2'], 'x', 'c2')
+    net = decompose_maxpool(net)
+    assert 'pool_win' in net.ops['p1/w'].params      # regular pool
+    torch.manual_seed(0)
+    lo = -torch.rand(1, n_in)
+    hi = torch.rand(1, n_in)
+    inter = backward.intermediates(net, lo, hi)
+    lb_p, ub_p = patch_refine(net, 'c2', lo, hi, inter)
+    n2 = int(np.prod(s2))
+    Wc = torch.cat([torch.eye(n2), -torch.eye(n2)])
+    out = backward.crown(net, lo, hi, Wc.unsqueeze(0), inter, start='c2')
+    lb_d, ub_d = out[:, :n2], -out[:, n2:]
+    assert torch.allclose(lb_p, lb_d, atol=1e-4), \
+        float((lb_p - lb_d).abs().max())
+    assert torch.allclose(ub_p, ub_d, atol=1e-4), \
+        float((ub_p - ub_d).abs().max())
