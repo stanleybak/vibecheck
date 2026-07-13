@@ -198,6 +198,7 @@ def verify(net, spec, *, timeout=60, config=None, results_file=None,
         ``.counterexample`` (numpy dict for 'sat'; see `VerifyResult`),
         ``.details`` (verifier verbose object), ``.exit_code``, ``.elapsed``.
     """
+    _quiet_third_party_warnings()          # before any onnxruntime/torch-trace use
     import tempfile
     from .config_loader import parse_set_overrides
     argv = ['--net', str(net), '--spec', str(spec), '--timeout', str(timeout)]
@@ -247,6 +248,51 @@ def _emit_style(args):
     driven through the VNN-LIB standard `verify` CLI). getattr-guarded so tests
     that build a bare namespace keep the legacy spelling."""
     return getattr(args, 'verdict_style', 'vnncomp')
+
+
+_THIRD_PARTY_WARNINGS_QUIETED = False
+
+
+def _quiet_third_party_warnings():
+    """Silence the benign, non-actionable third-party noise a verification run
+    floods stderr with — torch jit-trace TracerWarnings and the numpy 'not
+    writable' UserWarning (from our internal traces / onnx load), plus
+    onnxruntime's GPU device-discovery warnings. The latter are emitted from
+    onnxruntime's C++ layer at its FIRST import (the Python logger-severity API
+    does not gate them), so we do that first import here with fd 2 redirected to
+    /dev/null; every later `import onnxruntime` reuses the cached module.
+
+    Called lazily from the verification entry points (NOT from `import
+    vibecheck`), so a bare import — or `vibecheck --version` — stays fast and
+    neither loads onnxruntime nor mutates global warning filters. Runs once; opt
+    out with VIBECHECK_SHOW_WARNINGS=1. vibecheck's own progress is unaffected.
+    """
+    global _THIRD_PARTY_WARNINGS_QUIETED
+    if _THIRD_PARTY_WARNINGS_QUIETED or os.environ.get('VIBECHECK_SHOW_WARNINGS'):
+        return
+    _THIRD_PARTY_WARNINGS_QUIETED = True
+    import warnings
+    from torch.jit import TracerWarning
+    warnings.filterwarnings('ignore', category=TracerWarning)
+    warnings.filterwarnings('ignore', message='.*not writable.*')
+    # fd-level stderr redirect around the onnxruntime import only; any fd failure
+    # (stderr closed / fd exhaustion) falls back to a plain import, never leaking
+    # a descriptor and never leaving stderr redirected.
+    _fd2 = _devnull = None
+    try:
+        _fd2 = os.dup(2)
+        _devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull, 2)
+    except OSError:
+        pass
+    try:
+        import onnxruntime  # noqa: F401  (first import here, quietly)
+    finally:
+        if _fd2 is not None:
+            os.dup2(_fd2, 2)
+            os.close(_fd2)
+        if _devnull is not None:
+            os.close(_devnull)
 
 
 def _resolve_cex_format(args):
@@ -365,6 +411,7 @@ def _make_parser():
 
 
 def _legacy_main(argv=None):
+    _quiet_third_party_warnings()          # before any onnxruntime/torch-trace use
     args = _make_parser().parse_args(argv)
 
     # Parse --set KEY=VALUE overrides once (validated against default_settings());
