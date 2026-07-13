@@ -21,6 +21,8 @@ fallback at the first op that cannot stay patched.
 """
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.nn.functional as F
 
@@ -43,12 +45,18 @@ class PatchAdjoint:
         self.edge_shape = tuple(edge_shape)  # (C, H, W) of the edge
 
     @staticmethod
-    def identity(edge_shape, channel, B=1, device='cpu', dtype=torch.float32):
-        """One query per spatial position of `channel`: 1x1 one-hot."""
+    def identity(edge_shape, channel, B=1, device='cpu',
+                 dtype=torch.float32, bbox=None):
+        """One query per spatial position of `channel`: 1x1 one-hot.
+        bbox=(y0, y1, x0, x1) restricts the query grid to a subrectangle
+        (the anchors are affine, so a cropped grid is just a base shift
+        -- the cascaded refiner queries only the unstable cluster)."""
         C, H, W = edge_shape
-        v = torch.zeros(B, H * W, 1, 1, 1, device=device, dtype=dtype)
+        y0, y1, x0, x1 = (0, H, 0, W) if bbox is None else bbox
+        gh, gw = y1 - y0, x1 - x0
+        v = torch.zeros(B, gh * gw, 1, 1, 1, device=device, dtype=dtype)
         v[:, :, 0, 0, 0] = 1.0
-        pa = PatchAdjoint(v, (H, W), (0, 0), (1, 1), edge_shape)
+        pa = PatchAdjoint(v, (gh, gw), (y0, x0), (1, 1), edge_shape)
         pa.channel = channel                 # window C-axis = [channel]
         pa.chan_lo = channel                 # first edge channel in window
         return pa
@@ -156,6 +164,8 @@ class PatchAdjoint:
         oy, ox = (by + pt) // sy, (bx + pl) // sx
         u = u[:, :, :, :, oy:oy + gh, ox:ox + gw]
         u = u.permute(0, 4, 5, 1, 2, 3).reshape(B, Q, C, ph, pw)
+        if getattr(self, '_gather_full', False):
+            return u                        # caller slices (shared cache)
         ci = getattr(self, 'cidx', None)
         if ci is not None:
             return u[:, :, ci]
@@ -246,7 +256,8 @@ class PatchAdjoint:
         return pa
 
 
-def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
+def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None,
+                 channels=None, unstable=None):
     """Bounds for EVERY element of conv edge `edge` via patch-structured
     backward CROWN: identity queries per (channel, y, x), chunked by
     channel, walked back to the network input while every op stays
@@ -302,6 +313,9 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
         pa.cidx = cu
         return pa
 
+    import os as _os
+    _prof = {} if _os.environ.get('VC2_PATCH_PROF') else None
+
     def walk(pa0, d, nm0):
         """Reverse-topological accumulation from edge nm0's OUTPUT patch
         to the input: incoming adjoints per edge are MERGED before the
@@ -314,6 +328,15 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
             nm = max(acc, key=lambda k: order_pos.get(k, -1))
             pa = acc.pop(nm)
             op = op_of[nm]
+            if _prof is not None:
+                torch.cuda.synchronize()
+                _now = time.time()
+                if walk._last is not None:
+                    k0, t0_ = walk._last
+                    _prof[k0] = _prof.get(k0, 0.0) + (_now - t0_)
+                _kind = (type(op.lm).__name__ if op.kind == 'linmap'
+                         else op.kind + ':' + getattr(op, 'fn', ''))
+                walk._last = (_kind, _now)
             if op.kind == 'input':
                 cw = pa.gather_edge(c_in)
                 rw = pa.gather_edge(r_in)
@@ -386,10 +409,44 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
                 raise NotImplementedError(
                     f'patch_refine: linmap {type(lm).__name__}')
             if op.kind == 'nonlin' and op.fn == 'relu':
-                l0, h0 = inter[nm]
-                al, bl, au, bu = REL['relu'].planes(l0, h0)
-                pa, d = pa.through_planes(al, bl, au, bu, d)
-                _push(op.inputs[0], pa)
+                key = (nm, pa.grid, pa.base, pa.step,
+                       pa.v.shape[3], pa.v.shape[4])
+                got = _gcache.get(key)
+                if got is None:
+                    if nm not in _planes:
+                        l0, h0 = inter[nm]
+                        _planes[nm] = REL['relu'].planes(l0, h0)
+                    al, bl, au, bu = _planes[nm]
+                    pa._gather_full = True
+                    got = (pa.gather_edge(al), pa.gather_edge(bl),
+                           pa.gather_edge(au), pa.gather_edge(bu))
+                    pa._gather_full = False
+                    nbytes = sum(t.numel() * t.element_size() for t in got)
+                    # cap the cache (the early wide edges' gathers are
+                    # GBs; they are also the ones every walk repays)
+                    if _gcache_sz[0] + nbytes < 3e9:
+                        _gcache[key] = got
+                        _gcache_sz[0] += nbytes
+                ll_f, bl_f, lh_f, bh_f = got
+                ci = getattr(pa, 'cidx', None)
+                if ci is None:
+                    cw0 = getattr(pa, 'chan_lo', 0)
+                    sl = slice(cw0, cw0 + pa.v.shape[2])
+                    ll, blg, lh, bhg = (ll_f[:, :, sl], bl_f[:, :, sl],
+                                        lh_f[:, :, sl], bh_f[:, :, sl])
+                else:
+                    ll, blg, lh, bhg = (ll_f[:, :, ci], bl_f[:, :, ci],
+                                        lh_f[:, :, ci], bh_f[:, :, ci])
+                pos = pa.v > 0
+                v2 = pa.v * torch.where(pos, ll, lh)
+                d = d + (pa.v * torch.where(pos, blg, bhg)).sum(
+                    dim=(2, 3, 4))
+                pa2 = PatchAdjoint(v2, pa.grid, pa.base, pa.step,
+                                   pa.edge_shape)
+                pa2.chan_lo = getattr(pa, 'chan_lo', 0)
+                if ci is not None:
+                    pa2.cidx = ci
+                _push(op.inputs[0], pa2)
                 continue
             if op.kind == 'add':
                 pa_b = PatchAdjoint(pa.v.clone(), pa.grid, pa.base,
@@ -403,16 +460,61 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None):
                 f'patch_refine: op {op.kind}/{getattr(op, "fn", "")}')
         return total + d
 
-    lbs = torch.empty(B, C, H * W, device=dev, dtype=lo.dtype)
-    ubs = torch.empty(B, C, H * W, device=dev, dtype=lo.dtype)
-    for c0 in range(0, C, chan_chunk):
-        for ch in range(c0, min(c0 + chan_chunk, C)):
-            pa = PatchAdjoint.identity((C, H, W), ch, B=B, device=dev,
-                                       dtype=lo.dtype)
-            d0 = torch.zeros(B, H * W, device=dev, dtype=lo.dtype)
-            lbs[:, ch] = walk(pa, d0, edge)
-            pa2 = PatchAdjoint.identity((C, H, W), ch, B=B, device=dev,
-                                        dtype=lo.dtype)
-            pa2.v = -pa2.v
-            ubs[:, ch] = -walk(pa2, torch.zeros_like(d0), edge)
+    # channels: restrict the (C x HW identity queries) to the channels
+    # that still matter -- the cascaded caller passes the set with any
+    # unstable element (vgg relu4: 122 unstable of 802k spread over a
+    # few dozen channels; refining all 256 cost 99.5s for nothing).
+    # Unrefined channels return (-inf, +inf): callers intersect.
+    walk._last = None
+    _gcache = {}
+    _gcache_sz = [0]
+    _planes = {}
+    if channels is None:
+        chan_iter = list(range(C))
+    else:
+        chan_iter = sorted(int(c) for c in channels)
+    # unstable (B-agnostic bool over the edge, reshaped (C, H, W)):
+    # crop each channel's query grid to its unstable BOUNDING BOX --
+    # unstable positions cluster spatially, and full-frame grids paid
+    # 3136 queries for ~4 useful ones on vgg relu5. Unqueried elements
+    # return (-inf, +inf); callers intersect with existing bounds.
+    um = None
+    if unstable is not None:
+        um = unstable.reshape(C, H, W)
+    lbs = torch.full((B, C, H * W), -torch.inf, device=dev, dtype=lo.dtype)
+    ubs = torch.full((B, C, H * W), torch.inf, device=dev, dtype=lo.dtype)
+    for ch in chan_iter:
+        bbox = None
+        if um is not None:
+            ys, xs = torch.nonzero(um[ch], as_tuple=True)
+            if ys.numel() == 0:
+                continue
+            bbox = (int(ys.min()), int(ys.max()) + 1,
+                    int(xs.min()), int(xs.max()) + 1)
+        pa = PatchAdjoint.identity((C, H, W), ch, B=B, device=dev,
+                                   dtype=lo.dtype, bbox=bbox)
+        nq = pa.v.shape[1]
+        d0 = torch.zeros(B, nq, device=dev, dtype=lo.dtype)
+        lb_c = walk(pa, d0, edge)
+        pa2 = PatchAdjoint.identity((C, H, W), ch, B=B, device=dev,
+                                    dtype=lo.dtype, bbox=bbox)
+        pa2.v = -pa2.v
+        ub_c = -walk(pa2, torch.zeros_like(d0), edge)
+        if bbox is None:
+            lbs[:, ch] = lb_c
+            ubs[:, ch] = ub_c
+        else:
+            y0, y1, x0, x1 = bbox
+            lbs[:, ch].reshape(B, H, W)[:, y0:y1, x0:x1] = \
+                lb_c.reshape(B, y1 - y0, x1 - x0)
+            ubs[:, ch].reshape(B, H, W)[:, y0:y1, x0:x1] = \
+                ub_c.reshape(B, y1 - y0, x1 - x0)
+    if _prof is not None:
+        torch.cuda.synchronize()
+        if walk._last is not None:
+            k0, t0_ = walk._last
+            _prof[k0] = _prof.get(k0, 0.0) + (time.time() - t0_)
+        print('[patch-prof] ' + ' '.join(
+            f'{k}={v:.2f}s' for k, v in
+            sorted(_prof.items(), key=lambda x: -x[1])), flush=True)
     return lbs.reshape(B, -1), ubs.reshape(B, -1)
