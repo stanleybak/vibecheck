@@ -19,6 +19,33 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[dev]"
 
 The tool and tests can then be invoked with `.venv/bin/python`.
 
+## Dependencies
+
+Three packages are pinned to the **exact** versions used by the VNN-COMP 2026
+scorer and must not be floated:
+
+- **`onnx==1.21.0`** and **`onnxruntime==1.26.0`** — the official scorer replays
+  every `sat` witness on exactly these versions. vibecheck validates its own
+  counterexamples on the same engine, so a newer onnxruntime computing slightly
+  different floating-point outputs could make the scorer reject a witness
+  vibecheck accepts.
+- **`vnnlib==1.0.2`** — the VNNLIB-2.0 parser the scorer uses; pinned so v2
+  counterexample validation is bit-identical to official scoring.
+
+Bump these only when the official scorer's pins move, and move them together.
+
+`torch` is intentionally left unpinned. Note the default wheel is a CUDA build
+and is large: on a typical install `torch` plus the NVIDIA CUDA runtime libraries
+it pulls in total roughly **4 GB** (~1.2 GB torch + ~2.7 GB CUDA). For a
+CPU-only install, install torch from PyTorch's CPU index first, e.g.
+`pip install torch --index-url https://download.pytorch.org/whl/cpu`, then
+install vibecheck.
+
+`gurobipy` is a required dependency — the default `graph` mode's LP/MILP
+tightening uses it. The pip wheel ships a size-limited license that is sufficient
+for the bundled example and the test suite; a full Gurobi license is only needed
+for large models.
+
 ## Usage
 
 vibecheck implements the VNN-LIB standard's solver CLI:
@@ -28,6 +55,7 @@ vibecheck verify <query.vnnlib> --network NAME=<model.onnx> [--timeout SECONDS] 
                  [--serialise-assignments DIR]
 vibecheck supports <capability>        # e.g. --onnx-operators
 vibecheck --name | --version
+vibecheck --examples-dir               # path to the bundled example files
 ```
 
 `verify` prints the verdict (`sat`/`unsat`/`unknown`/`timed-out`) as the first
@@ -36,15 +64,18 @@ to stderr); `--serialise-assignments DIR` writes the assignment as ONNX
 TensorProtos instead. In `supports` output, a `*` after an identifier marks
 partial support, with a short note on the same line.
 
-Example, on the bundled ACAS-Xu network (`examples/`) with a property that holds.
-Everything except the final `unsat` is progress on stderr (trimmed here):
+Example, on the bundled ACAS-Xu network with a property that holds. The example
+files ship with the package; `vibecheck --examples-dir` prints their location, so
+`cd` there first to run with short filenames. Everything except the final `unsat`
+is progress on stderr (trimmed here):
 
 ```console
-$ vibecheck verify examples/prop_1.vnnlib --network N=examples/ACASXU_run2a_2_2_batch_2000.onnx --timeout 60
+$ cd "$(vibecheck --examples-dir)"
+$ vibecheck verify prop_1.vnnlib --network N=ACASXU_run2a_2_2_batch_2000.onnx --timeout 60
 Auto-config: acasxu_2023.yaml | rule 5: low input-dim (<=20) FC (input-split) | Low-dimensional ReLU FC (ACAS-Xu family): batched input-split BaB, hybrid ACAS-Xu path off.
-Loading network: examples/ACASXU_run2a_2_2_batch_2000.onnx
+Loading network: ACASXU_run2a_2_2_batch_2000.onnx
   22 ops, 6 ReLU layers, 0 fork points, input shape: (1, 1, 1, 5)
-Loading spec: examples/prop_1.vnnlib
+Loading spec: prop_1.vnnlib
   1 constraint(s), 1 disjunct(s)
 Running graph verification (device=gpu, impl=optimized, profile=auto:acasxu_2023.yaml(rule 5), timeout=60.0s)...
 [pgd] no CE: restarts=100 iters=100/100 gap(best_margin)=+4.012e+00 elapsed=0.29s
@@ -60,7 +91,7 @@ unsat
 And a violated property, where stdout is the verdict plus the satisfying assignment:
 
 ```console
-$ vibecheck verify examples/prop_2.vnnlib --network N=examples/ACASXU_run2a_2_2_batch_2000.onnx --timeout 60  2>/dev/null
+$ vibecheck verify prop_2.vnnlib --network N=ACASXU_run2a_2_2_batch_2000.onnx --timeout 60  2>/dev/null
 sat
 X float32 [1,1,1,5]
 0.6208617091178894
@@ -77,13 +108,39 @@ Y float32 [1,5]
 ```
 
 The `Auto-config:` line shows config selection: with no `--config`, vibecheck
-picks a bundled per-benchmark config (`configs/*.yaml`) from the structure of
-the network and spec (input dim, conv/transformer/nonlinear ops, network-pair
-kind) and logs which rule fired. Override it with `--config configs/<name>.yaml`.
+auto-selects a bundled per-benchmark config from the structure of the network and
+spec (input dim, conv/transformer/nonlinear ops, network-pair kind) and logs which
+rule fired. To override, pass your own YAML with `--config /path/to/config.yaml`
+(its keys map 1:1 to the tool's settings).
 
 The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
 --results-file out.txt`, the form the VNNCOMP harness drives) is unchanged; see
 `vibecheck --help`.
+
+## Programmatic use
+
+`vibecheck.verify()` runs the **same** production pipeline as the CLI — auto-config
+selection, nonlinear augmentation, network-pair merge, and every soundness gate —
+and returns a `VerifyResult` you can inspect in-process:
+
+```python
+from vibecheck import verify
+
+r = verify("model.onnx", "property.vnnlib", timeout=60)
+
+print(r.verdict)         # 'unsat' | 'sat' | 'unknown' | 'timeout' | 'error'
+if r.verdict == "sat":
+    x = r.counterexample["X"]   # numpy array: the violating input
+    y = r.counterexample["Y"]   # numpy array: the network's output on X
+print(r.details)         # verifier's verbose object (bounds/timings/config) — for debugging
+print(r.elapsed)         # wall-clock seconds
+```
+
+For a network **pair** (isomorphic / monotonic), `counterexample` is keyed per
+network: `{'X_f', 'Y_f', 'X_g', 'Y_g'}`. With no `config=`, `verify()` auto-selects
+a bundled config; pass `config="path/to.yaml"` to override, or `results_file=` to
+also write the VNNCOMP verdict line. Unlike the CLI it does **not** arm the
+hard-timeout process-kill watchdog, so it is safe to call from your own code.
 
 ## Tests
 
@@ -137,14 +194,13 @@ cp tests/paths.yaml.template tests/paths.yaml
 ```
 
 To run a single instance through the CLI, point `--net` / `--spec` at files in the
-clone and select the matching config:
+clone (auto-config picks the matching bundled config):
 
 ```bash
 BENCH=~/repositories/vnncomp2025_benchmarks/benchmarks/acasxu_2023
 .venv/bin/python -m vibecheck.main \
     --net  "$BENCH/onnx/ACASXU_run2a_1_1_batch_2000.onnx" \
     --spec "$BENCH/vnnlib/prop_3.vnnlib" \
-    --config configs/acasxu_2023.yaml \
     --timeout 120 --results-file /tmp/r.txt
 cat /tmp/r.txt   # -> unsat (verified)
 ```

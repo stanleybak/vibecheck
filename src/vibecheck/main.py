@@ -5,6 +5,8 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import numpy as np
 
@@ -15,6 +17,53 @@ from .pgd import pgd_box_expand_amount
 
 _DTYPES = {'float32': np.float32, 'float64': np.float64,
            'f32': np.float32, 'f64': np.float64}
+
+
+@dataclass
+class VerifyResult:
+    """The outcome of a verification run (returned by `verify()`).
+
+    verdict: 'unsat' (proved safe) | 'sat' (counterexample found) |
+             'unknown' | 'timeout' | 'error'.
+    counterexample: for 'sat' only, a dict of numpy arrays of the witness
+             replayed on the ORIGINAL network(s):
+               single network -> {'X': ndarray, 'Y': ndarray}
+               network pair    -> {'X_f','Y_f','X_g','Y_g'}
+             None for any other verdict.
+    details: the verifier's verbose object (bounds/timings/config) for the
+             graph path; None for attack-mode paths.
+    exit_code: process exit code the CLI uses (0 verified, 1 unknown/sat, 2 error).
+    elapsed: wall-clock seconds.
+    """
+    verdict: str
+    counterexample: Optional[dict] = None
+    details: Any = None
+    exit_code: int = 0
+    elapsed: float = 0.0
+
+
+class _VerifyDone(SystemExit):
+    """Raised at every terminal point of the verification pipeline to carry the
+    `VerifyResult` out to the boundary. It subclasses `SystemExit` on purpose:
+    `_legacy_main`'s crash handler is `except SystemExit: raise` BEFORE its
+    `except BaseException`, so this propagates cleanly (never masked as 'error'),
+    and if the CLI leaves it uncaught the process still exits with the right code
+    (`SystemExit.code` = exit_code). `verify()` catches it and returns `.result`.
+    """
+    def __init__(self, result):
+        super().__init__(result.exit_code)
+        self.result = result
+
+
+def _pipeline_result(sat_state, details, exit_code, t_start):
+    """Build the terminal VerifyResult from the verdict + numpy CE the emit
+    functions recorded into `sat_state` (falling back to the exit code)."""
+    verdict = sat_state.get('final_verdict') or \
+        {0: 'unsat', 2: 'error'}.get(exit_code, 'unknown')
+    return VerifyResult(verdict=verdict,
+                        counterexample=sat_state.get('final_ce'),
+                        details=details, exit_code=exit_code,
+                        elapsed=time.time() - t_start)
 
 
 def _require_input_file(path, label):
@@ -105,11 +154,81 @@ def main():
     positional first argument is a query filepath -> implicit `verify`, so
     `vibecheck query.vnnlib --network f=m.onnx` works without spelling it out."""
     argv = sys.argv[1:]
-    if argv and (argv[0] in ('--name', '--version', 'supports', 'verify')
+    if argv and (argv[0] in ('--name', '--version', '--examples-dir', 'supports', 'verify')
                  or not argv[0].startswith('-')):
         from .cli_standard import dispatch
         return dispatch(argv)
     return _legacy_main(argv)
+
+
+def verify(net, spec, *, timeout=60, config=None, results_file=None,
+           verbose=False, extra_args=None):
+    """Verify an ONNX network against a VNNLIB spec and return a `VerifyResult`.
+
+    Runs the SAME production pipeline as the CLI — auto-config selection,
+    nonlinear augmentation, network-pair merge, and every SAT-witness soundness
+    gate — so the verdict is identical to ``vibecheck verify ...``. Unlike the
+    CLI it does NOT arm the hard-timeout process-kill watchdog, so it is safe to
+    call in-process.
+
+    Parameters
+    ----------
+    net : str
+        Path to the ONNX network (or a network-pair ``--net`` field string).
+    spec : str
+        Path to the VNNLIB specification.
+    timeout : float
+        Cooperative time budget in seconds.
+    config : str, optional
+        Path to a YAML config; when omitted, auto-config selects one from the
+        network/spec structure (same as the CLI).
+    results_file : str, optional
+        Also write the VNNCOMP results line to this path. When omitted, a temp
+        file is used internally (the pipeline needs one to build the verdict and
+        counterexample) and removed afterward.
+    verbose : bool
+        Enable per-phase progress printing.
+    extra_args : list, optional
+        Extra raw flat-CLI flags, e.g. ``['--device', 'cpu']``.
+
+    Returns
+    -------
+    VerifyResult
+        ``.verdict`` ('unsat'|'sat'|'unknown'|'timeout'|'error'),
+        ``.counterexample`` (numpy dict for 'sat'; see `VerifyResult`),
+        ``.details`` (verifier verbose object), ``.exit_code``, ``.elapsed``.
+    """
+    import tempfile
+    from .config_loader import parse_set_overrides
+    argv = ['--net', str(net), '--spec', str(spec), '--timeout', str(timeout)]
+    if config is not None:
+        argv += ['--config', str(config)]
+    if verbose:
+        argv += ['--verbose']
+    if extra_args:
+        argv += [str(a) for a in extra_args]
+    _tmp = None
+    if results_file is not None:
+        argv += ['--results-file', str(results_file)]
+    else:
+        _fd, _tmp = tempfile.mkstemp(suffix='.vibecheck-result')
+        os.close(_fd)
+        argv += ['--results-file', _tmp]
+    args = _make_parser().parse_args(argv)
+    args.set_overrides = parse_set_overrides(args.set_kv)
+    _auto_select_config(args)          # auto-config unless --config was given
+    _resolve_cex_format(args)          # cex_version/io_decls from the ORIGINAL spec
+    try:
+        _verify(args, {'emitted': False})
+    except _VerifyDone as done:
+        result = done.result
+    finally:
+        if _tmp is not None:
+            try:
+                os.remove(_tmp)
+            except OSError:
+                pass
+    return result
 
 
 def _verdict_str(kind, style):
@@ -130,7 +249,31 @@ def _emit_style(args):
     return getattr(args, 'verdict_style', 'vnncomp')
 
 
-def _legacy_main(argv=None):
+def _resolve_cex_format(args):
+    """Set args.cex_version + args.cex_io_decls from the ORIGINAL spec (BEFORE
+    _verify rewrites args.spec for pair/augment) + the config's
+    `counterexample_format` ('auto' -> match the input vnnlib version). Every emit
+    path reads these, so both the CLI and `verify()` must call it before `_verify`."""
+    _cf = 'auto'
+    if args.config:
+        from .config_loader import load_config
+        _cf = load_config(args.config).get('counterexample_format', 'auto')
+    try:
+        args.cex_version = _resolve_cex_version(_cf, args.spec)
+        # The spec-declared I/O names/dtypes/shapes for a v2 cex, resolved ONCE so all
+        # emit paths use them (not the ONNX node names). See _resolve_cex_io_meta.
+        args.cex_io_decls = _resolve_cex_io_meta(args.spec)
+    except OSError:
+        # 'auto' reads the spec head to detect its version; if it isn't readable yet (a dummy
+        # path with a monkeypatched loader, or a not-yet-materialized file), fall back to v1
+        # FORMAT. This is cosmetic only — a genuinely-missing spec still fails LOUDLY at the
+        # verification load (graph/spec loaders), which the crash handler records as 'error'.
+        args.cex_version = '1.0'
+        args.cex_io_decls = None
+
+
+def _make_parser():
+    """Build the legacy flat-CLI argument parser (shared by the CLI and `verify()`)."""
     parser = argparse.ArgumentParser(
         description='VibeCheck — Neural Network Verification via Zonotope Analysis')
     parser.add_argument('--net', required=True, help='Path to ONNX network')
@@ -218,7 +361,11 @@ def _legacy_main(argv=None):
                              "'standard' (the VNN-LIB standard's 'timed-out'). The "
                              "`vibecheck verify` CLI passes 'standard'; only the "
                              'timeout word differs.')
-    args = parser.parse_args(argv)
+    return parser
+
+
+def _legacy_main(argv=None):
+    args = _make_parser().parse_args(argv)
 
     # Parse --set KEY=VALUE overrides once (validated against default_settings());
     # applied to the built settings at every construction site below + in the
@@ -343,26 +490,7 @@ def _legacy_main(argv=None):
               f'  spec:  {vnnlib_pkl if vnnlib_pkl else "(skipped — parsed at run time)"}')
         sys.exit(0)
 
-    # Resolve the counterexample on-disk FORMAT version once, from the original spec
-    # (BEFORE _verify rewrites args.spec for pair/augment) + the config's
-    # `counterexample_format` ('auto' -> match the input vnnlib version). Both the graph
-    # and surrogate emit paths read args.cex_version.
-    _cf = 'auto'
-    if args.config:
-        from .config_loader import load_config
-        _cf = load_config(args.config).get('counterexample_format', 'auto')
-    try:
-        args.cex_version = _resolve_cex_version(_cf, args.spec)
-        # The spec-declared I/O names/dtypes/shapes for a v2 cex, resolved ONCE here so all
-        # three emit paths use them (not the ONNX node names). See _resolve_cex_io_meta.
-        args.cex_io_decls = _resolve_cex_io_meta(args.spec)
-    except OSError:
-        # 'auto' reads the spec head to detect its version; if it isn't readable yet (a dummy
-        # path with a monkeypatched loader, or a not-yet-materialized file), fall back to v1
-        # FORMAT. This is cosmetic only — a genuinely-missing spec still fails LOUDLY at the
-        # verification load (graph/spec loaders), which the crash handler records as 'error'.
-        args.cex_version = '1.0'
-        args.cex_io_decls = None
+    _resolve_cex_format(args)
 
     # Shared across _verify and this crash handler: tracks whether a 'sat'
     # (+counterexample) was already written to the results file, so a later
@@ -446,16 +574,16 @@ def _verify(args, sat_state=None):
     # ONNX). See surrogate_pgd.py / sign_attack.py / torch_attack.py / cctsdb_yolo.py.
     _surr = _maybe_surrogate_attack(args, sat_state)   # INT8-quantized (smart_turn)
     if _surr is not None:
-        sys.exit(_surr)
+        raise _VerifyDone(_pipeline_result(sat_state, None, _surr, t_start))
     _sgn = _maybe_sign_attack(args, sat_state)          # binarized `Sign` nets
     if _sgn is not None:
-        sys.exit(_sgn)
+        raise _VerifyDone(_pipeline_result(sat_state, None, _sgn, t_start))
     _tch = _maybe_torch_attack(args, sat_state)         # generic onnx2torch PGD
     if _tch is not None:
-        sys.exit(_tch)
+        raise _VerifyDone(_pipeline_result(sat_state, None, _tch, t_start))
     _cct = _maybe_cctsdb_yolo(args, sat_state)          # YOLO patch grid
     if _cct is not None:
-        sys.exit(_cct)
+        raise _VerifyDone(_pipeline_result(sat_state, None, _cct, t_start))
 
     # Nonlinear v2 spec handling (empty-input + transpile-to-augmented) — gated
     # OFF by default (config `nonlinear_v2_augment: true`). Both pre-checks
@@ -468,7 +596,7 @@ def _verify(args, sat_state=None):
         # Runs on the ORIGINAL v2 spec BEFORE the augment. See input_feasibility.py.
         _empty = _maybe_empty_input(args)
         if _empty is not None:
-            sys.exit(_empty)
+            raise _VerifyDone(_pipeline_result(sat_state, None, _empty, t_start))
         # Transpile the nonlinear v2 spec to an augmented ONNX + linear v1 spec up
         # front, then verify normally. See nonlinear_augment.py (ORT-oracle-gated).
         _maybe_nonlinear_augment(args)
@@ -725,13 +853,15 @@ def _verify(args, sat_state=None):
                 if args.verbose:
                     _log_cex_values(_w_final, _vinfo_f.get('out'))
             # NOTE: VC's own `_validate_sat_witness` above (input box <=atol, output
-            # STRICT at out_atol=0) is the production gate — it is ~4 ms even on a
-            # 1.27M-dim spec, vs ~24 s for the vendored competition checker (which
-            # Python-evaluates every input-bound assertion). We keep the vendored
-            # `vnncomp_cex_v2` module only as a TEST ORACLE: tests assert VC's
-            # verdict is bit-identical to the competition checker (see
-            # tests/test_competition_cex_equiv.py), so we get the competition's
-            # exact semantics without paying its per-assertion cost in the sweep.
+            # STRICT at out_atol=0) is the fast production gate — ~4 ms even on a
+            # 1.27M-dim spec. But it replays the graph's LOADED net, which for a
+            # nonlinear-AUGMENT or network-PAIR instance is the transformed
+            # (augmented / merged) net, not the originals the scorer replays. For
+            # those two cases we add an ORIGINAL-net backstop below that replays the
+            # untransformed original network(s) with `cex_check_v2` (the scorer's
+            # exact vnnlib semantics), catching any float32/numerical discrepancy the
+            # transformed graph would hide. `cex_check_v2` is also the reference the
+            # equivalence tests pin VC's fast gate against (test_competition_cex_equiv).
             #
             # AUGMENT-ONLY backstop: a nonlinear-v2 augmented `sat` is primarily
             # gated INSIDE verify_graph — the shared `_sat_disposition` classifier
@@ -756,13 +886,28 @@ def _verify(args, sat_state=None):
                           f'v2 spec ({_res}: {_msg}) — downgrading, not emitting SAT')
                     line = 'timeout' if timed_out else 'unknown'
                     _w_final = None
+            # NETWORK-PAIR backstop: the fast gate above validated the MERGED net,
+            # but the scorer replays the two ORIGINAL nets (f, g) against the original
+            # 2-network spec. Re-check the witness on the originals via cex_check_v2
+            # and downgrade (never emit) if it isn't accepted there — so a merge
+            # approximation artifact can't yield a scorer-rejected `sat`.
+            if line == 'sat' and getattr(args, 'pair_cex_info', None) is not None:
+                _acc, _res, _msg = _validate_cex_v2_competition(
+                    args, spec, _w_final,
+                    cex_fmt=settings.counterexample_precision)
+                if not _acc:
+                    print('  [validate] pair SAT witness rejected on the ORIGINAL '
+                          f'two-net spec ({_res}: {_msg}) — downgrading, not emitting SAT')
+                    line = 'timeout' if timed_out else 'unknown'
+                    _w_final = None
         if line == 'unknown' and (
                 timed_out or (args.timeout is not None and t_total >= args.timeout - 2.0)):
             line = 'timeout'
         _emit_result(args, spec, line, _w_final, sat_state,
                      settings.counterexample_precision)
 
-    sys.exit(0 if result == 'verified' else 1)
+    raise _VerifyDone(_pipeline_result(
+        sat_state, details, 0 if result == 'verified' else 1, t_start))
 
 
 def _maybe_network_pair(args):
@@ -784,6 +929,10 @@ def _maybe_network_pair(args):
     nf = _paths[0]
     ng = _paths[1] if len(_paths) > 1 else _paths[0]
     args.pair_cex_info = (nf, ng, npair.parse_multinet(npair._read_vnnlib_text(args.spec)))
+    # Preserve the ORIGINAL 2-network spec so the scorer-faithful CE check can
+    # replay the two original nets against it (args.spec is about to become the
+    # merged v1 spec). Same attr the augment path uses.
+    args.orig_spec_for_cex = args.spec
     args.net = merged_onnx
     args.spec = merged_spec
 
@@ -1297,10 +1446,13 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g',
             with open(args.results_file, 'w') as f:
                 f.write('sat\n' + ce + '\n')
             sat_state['emitted'] = True
+            sat_state['final_verdict'] = 'sat'
+            sat_state['final_ce'] = {'X': x, 'Y': y}
             return
     if not sat_state.get('emitted'):
         with open(args.results_file, 'w') as f:
             f.write(_verdict_str(verdict, _emit_style(args)) + '\n')
+        sat_state['final_verdict'] = verdict
 
 
 def _log_cex_values(x, y, log=print):
@@ -1374,13 +1526,24 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
     os.replace(tmp, args.results_file)
     if line == 'sat':
         sat_state['emitted'] = True
+    # Record the persisted verdict + numpy counterexample for VerifyResult. This
+    # runs only when we actually (over)write — the never-downgrade early-return
+    # above leaves an earlier 'sat' record intact.
+    sat_state['final_verdict'] = line
+    sat_state['final_ce'] = (_counterexample_arrays(args, spec, witness)
+                             if line == 'sat' and ce is not None else None)
 
 
 def _validate_cex_v2_competition(args, spec, witness, cex_fmt='.17g'):
-    """Validate the v2 counterexample vibecheck would emit using the VENDORED
-    competition checker (`vnncomp_cex_v2.validate_cex_v2`, bit-identical to the
-    VNN-COMP 2026 scorer). Builds the exact CE string we'd write, drops it in a
-    temp file, and runs the scorer's validator against the original --net/--spec.
+    """Validate the v2 counterexample vibecheck would emit the way the VNN-COMP
+    2026 scorer does: replay the ORIGINAL network(s) on ORT-CPU against the
+    ORIGINAL v2 spec (`cex_check_v2.validate_cex_v2`), ignoring the solver's Y.
+    Builds the exact CE string we'd write, drops it in a temp file, and runs the
+    checker. Never validates a merged/augmented graph — replaying the untransformed
+    original is what catches float32/numerical edge cases.
+
+    Handles single-network specs (nominal + nonlinear-augment) and 2-network
+    pairs (isomorphic: two distinct nets; monotonic: g equal-to f, one net).
 
     Returns (accepted, result_str, message). `accepted` is True iff the scorer
     would award the instance (CORRECT or CORRECT_UP_TO_TOLERANCE). A build
@@ -1388,18 +1551,28 @@ def _validate_cex_v2_competition(args, spec, witness, cex_fmt='.17g'):
     never emitted.
     """
     import tempfile
-    from .vnncomp_cex_v2 import validate_cex_v2, ACCEPTED_RESULTS
+    from .cex_check_v2 import validate_cex_v2, ACCEPTED_RESULTS
     _io = getattr(args, 'cex_io_decls', None)
     _orig = getattr(args, 'orig_net_for_cex', None)
-    # The competition replays/parses the ORIGINAL v2 instance. For augmented runs
-    # args.net/args.spec are the internal augmented v1 versions, so fall back to the
-    # preserved originals (orig_net_for_cex / orig_spec_for_cex).
-    val_net = _orig if _orig is not None else args.net
+    _pair = getattr(args, 'pair_cex_info', None)
+    # The scorer replays/parses the ORIGINAL v2 instance. For augmented/merged runs
+    # args.net/args.spec are the internal (augmented / merged v1) versions, so fall
+    # back to the preserved originals (orig_net_for_cex / orig_spec_for_cex).
     val_spec = getattr(args, 'orig_spec_for_cex', None) or args.spec
-    if _orig is not None:
+    if _pair is not None:
+        # Network pair: reconstruct the per-net tensors by replaying the two
+        # ORIGINAL nets, emit X_f,Y_f,X_g,Y_g, and validate against both originals.
+        from . import network_pair as npair
+        nf, ng, ir = _pair
+        _xf, _yf = npair.reconstruct_pair_cex(nf, ng, ir, witness)
+        ce = _format_cex('2.0', args.net, _xf, _yf, cex_fmt, io_meta=_io)
+        val_net = [('f', nf), ('g', ng)]
+    elif _orig is not None:
         ce = _counterexample_sexpr_orig(_orig, witness, cex_fmt, '2.0', io_meta=_io)
+        val_net = _orig
     else:
         ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt, '2.0', io_meta=_io)
+        val_net = args.net
     if ce is None:
         return False, 'no_ce', 'could not build counterexample (no ORT output)'
     tf = tempfile.NamedTemporaryFile('w', suffix='.counterexample', delete=False)
@@ -1415,14 +1588,10 @@ def _validate_cex_v2_competition(args, spec, witness, cex_fmt='.17g'):
     return (res in ACCEPTED_RESULTS), res, msg
 
 
-def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0',
-                          io_meta=None):
-    """Build the counterexample for a SAT witness in the v1 (flat) or v2 (per-tensor)
-    format. Returns the cex string or None if the ONNX output can't be computed (e.g.
-    onnxruntime missing). Y is obtained from the same ORT forward the soundness validator
-    runs, so it matches the scoring harness's recomputed output within tolerance.
-    """
-    import numpy as np
+def _cex_xy(onnx_path, spec, witness):
+    """The (X, Y) numpy arrays of a SAT witness: X the float32-safe in-box witness,
+    Y the ORT-CPU forward (same forward the soundness validator runs). Returns
+    (x_flat, y_flat) float64, or None if ORT can't produce an output."""
     from .verify_graph import _validate_sat_witness
     x = np.asarray(witness).flatten().astype(np.float64)
     # _validate_sat_witness runs ORT and stashes the output in info['out'].
@@ -1434,18 +1603,27 @@ def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0
     # via ORT), so the scorer's box check passes despite FP edge rounding.
     if info.get('witness_inbox') is not None:
         x = np.asarray(info['witness_inbox']).flatten().astype(np.float64)
-    y = np.asarray(y).flatten().astype(np.float64)
+    return x, np.asarray(y).flatten().astype(np.float64)
+
+
+def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0',
+                          io_meta=None):
+    """Build the counterexample for a SAT witness in the v1 (flat) or v2 (per-tensor)
+    format. Returns the cex string or None if the ONNX output can't be computed (e.g.
+    onnxruntime missing). Y is obtained from the same ORT forward the soundness validator
+    runs, so it matches the scoring harness's recomputed output within tolerance.
+    """
+    xy = _cex_xy(onnx_path, spec, witness)
+    if xy is None:
+        return None
     # v2: emit with the SPEC's declared I/O names (io_meta), not the ONNX node names.
-    return _format_cex(version, onnx_path, x, y, cex_fmt, io_meta=io_meta)
+    return _format_cex(version, onnx_path, xy[0], xy[1], cex_fmt, io_meta=io_meta)
 
 
-def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0',
-                               io_meta=None):
-    """Counterexample for a nonlinear-AUGMENTED instance: X is the witness, Y is the
-    ORIGINAL net's output recomputed in float32 CPU ORT (the same arithmetic the VNNCOMP
-    scorer uses), formatted per the spec version (v2 uses io_meta = the original spec's
-    declared I/O names). Returns None if ORT can't run."""
-    import numpy as np
+def _cex_xy_orig(orig_onnx, witness):
+    """(X, Y) for a nonlinear-AUGMENTED instance: X is the witness, Y is the
+    ORIGINAL net's float32 CPU-ORT output (the arithmetic the scorer uses).
+    Returns (x_flat, y_flat) float64, or None if ORT can't run."""
     try:
         import onnxruntime as ort
     except ImportError:
@@ -1466,9 +1644,40 @@ def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0'
         y = sess.run(None, {in_meta.name: x.reshape(in_shape).astype(np.float32)})[0]
     except (RuntimeError, OSError, ValueError):
         return None
-    return _format_cex(version, orig_onnx, x,
-                       np.asarray(y).flatten().astype(np.float64), cex_fmt,
-                       io_meta=io_meta)
+    return x, np.asarray(y).flatten().astype(np.float64)
+
+
+def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0',
+                               io_meta=None):
+    """Counterexample for a nonlinear-AUGMENTED instance (see `_cex_xy_orig`),
+    formatted per the spec version. Returns None if ORT can't run."""
+    xy = _cex_xy_orig(orig_onnx, witness)
+    if xy is None:
+        return None
+    return _format_cex(version, orig_onnx, xy[0], xy[1], cex_fmt, io_meta=io_meta)
+
+
+def _counterexample_arrays(args, spec, witness):
+    """The numpy counterexample dict for `VerifyResult` — the witness replayed on
+    the ORIGINAL network(s), matching the emitted CE:
+      network pair -> {'X_f','Y_f','X_g','Y_g'}   (per-net tensors)
+      single net   -> {'X','Y'}                   (augment uses the original net)
+    Returns None if the witness is None or ORT can't produce an output."""
+    if witness is None:
+        return None
+    _orig = getattr(args, 'orig_net_for_cex', None)
+    _pair = getattr(args, 'pair_cex_info', None)
+    if _pair is not None:
+        from . import network_pair as npair
+        x, y = npair.reconstruct_pair_cex(_pair[0], _pair[1], _pair[2], witness)
+        n = _pair[2]['n']                       # per-network input dim
+        out = y.shape[0] // 2                    # per-network output dim
+        return {'X_f': x[:n], 'Y_f': y[:out], 'X_g': x[n:], 'Y_g': y[out:]}
+    xy = _cex_xy_orig(_orig, witness) if _orig is not None \
+        else _cex_xy(args.net, spec, witness)
+    if xy is None:
+        return None
+    return {'X': xy[0], 'Y': xy[1]}
 
 
 if __name__ == '__main__':

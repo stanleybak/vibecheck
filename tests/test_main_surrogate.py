@@ -80,8 +80,9 @@ def test_config_flag_gates_nonlinear_augment(tmp_path):
     assert vbmain._config_flag(_args(config=str(c1)), 'nonlinear_v2_augment') is True
     # the ONE benchmark that needs it has it enabled in its shipped config
     import yaml
+    from vibecheck.config_loader import config_path
     acc = yaml.safe_load(
-        open('configs/adaptive_cruise_control_non_linear_2026.yaml'))
+        open(config_path('adaptive_cruise_control_non_linear_2026.yaml')))
     assert acc.get('nonlinear_v2_augment') is True
 
 

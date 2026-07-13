@@ -82,15 +82,31 @@ def test_name(capsys):
 def test_version_from_metadata(monkeypatch, capsys):
     import importlib.metadata
     monkeypatch.setattr(importlib.metadata, 'version',
-                        lambda name: {'vibecheck': '9.9.9'}[name])
+                        lambda name: {'vibecheck-nn': '9.9.9'}[name])
     assert cs.dispatch(['--version']) == 0
     assert capsys.readouterr().out == '9.9.9\n'
 
 
+def test_examples_dir(capsys):
+    """--examples-dir prints the bundled examples path (ships in the package so a
+    pip-installed user can run the README quickstart without a source checkout)."""
+    assert cs.dispatch(['--examples-dir']) == 0
+    out = capsys.readouterr().out.strip()
+    assert out.endswith(os.path.join('vibecheck', 'examples'))
+    assert os.path.isdir(out)
+    assert os.path.isfile(os.path.join(out, 'ACASXU_run2a_2_2_batch_2000.onnx'))
+
+
 def test_version_fallback_reads_pyproject(monkeypatch, capsys):
     """No installed package metadata (dev checkout via PYTHONPATH): the version
-    comes from pyproject.toml and must be a plain semver string."""
+    comes from pyproject.toml and must be a plain semver string. This fallback
+    only exists for a source checkout; an installed wheel has no adjacent
+    pyproject.toml (and its metadata lookup always succeeds), so skip there."""
     import importlib.metadata
+    pyproject = os.path.join(os.path.dirname(cs.__file__), '..', '..',
+                             'pyproject.toml')
+    if not os.path.exists(pyproject):
+        pytest.skip('installed package: no source pyproject.toml (dev-only path)')
 
     def _raise(name):
         raise importlib.metadata.PackageNotFoundError(name)
@@ -99,8 +115,6 @@ def test_version_fallback_reads_pyproject(monkeypatch, capsys):
     assert cs.dispatch(['--version']) == 0
     out = capsys.readouterr().out.strip()
     assert re.fullmatch(r'\d+(\.\d+)+', out)
-    pyproject = os.path.join(os.path.dirname(cs.__file__), '..', '..',
-                             'pyproject.toml')
     with open(pyproject) as f:
         assert out == re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M).group(1)
 

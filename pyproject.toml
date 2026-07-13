@@ -1,15 +1,21 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vibecheck"
-version = "0.1.0"
+name = "vibecheck-nn"
+version = "1.0.0"
 description = "Vibe-Coded Neural Network Verification Tool"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Stanley Bak" }]
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "scipy",
+    # YAML config loading is core: config_loader / config_detect / spec all import
+    # it at runtime (the auto-config selector and --config parsing).
+    "pyyaml",
     # onnx/onnxruntime are PINNED to the VNNCOMP 2026 witness-replay environment
     # (onnx 1.21.0 / onnxruntime 1.26.0 / Python 3.12). The official scorer replays
     # every `sat` witness on exactly these versions; vibecheck validates its own
@@ -46,13 +52,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-cov", "pyyaml", "onnxruntime==1.26.0"]
+dev = ["pytest", "pytest-cov", "onnxruntime==1.26.0"]
 
 [project.scripts]
 vibecheck = "vibecheck.main:main"
 
+[project.urls]
+Homepage = "https://github.com/stanleybak/vibecheck-nn"
+Repository = "https://github.com/stanleybak/vibecheck-nn"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+vibecheck = ["configs/*.yaml", "examples/*"]
 
 [tool.pytest.ini_options]
 markers = [

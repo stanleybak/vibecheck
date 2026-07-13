@@ -1,4 +1,4 @@
-"""Auto-config detection: interpretable structural rules -> configs/*.yaml.
+"""Auto-config detection: interpretable structural rules -> vibecheck/configs/*.yaml.
 
 When no ``--config`` is given, ``detect_config`` picks the closest existing category
 config from a small, interpretable fingerprint of the network + spec (input dim, params,

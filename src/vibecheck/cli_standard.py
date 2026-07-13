@@ -27,6 +27,9 @@ import sys
 import tempfile
 
 TOOL_NAME = 'vibecheck'
+# PyPI distribution name (import package + console script stay `vibecheck`; the
+# name `vibecheck` was already taken on PyPI, so we distribute as `vibecheck-nn`).
+DIST_NAME = 'vibecheck-nn'
 
 
 def dispatch(argv):
@@ -36,6 +39,9 @@ def dispatch(argv):
         return 0
     if argv[0] == '--version':
         print(_version())
+        return 0
+    if argv[0] == '--examples-dir':
+        print(_examples_dir())
         return 0
     if argv[0] == 'supports':
         return run_supports(argv[1:])
@@ -49,12 +55,21 @@ def _version():
     checkout run via PYTHONPATH=src (not pip-installed)."""
     import importlib.metadata
     try:
-        return importlib.metadata.version(TOOL_NAME)
+        return importlib.metadata.version(DIST_NAME)
     except importlib.metadata.PackageNotFoundError:
         pyproject = os.path.join(os.path.dirname(__file__), '..', '..',
                                  'pyproject.toml')
         with open(pyproject) as f:
             return re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M).group(1)
+
+
+def _examples_dir():
+    """Absolute path to the bundled examples/ directory (a small ACAS-Xu ONNX +
+    vnnlib specs), so a pip-installed user can run the README quickstart without
+    a source checkout. Resolves inside the package whether run from source or an
+    installed wheel."""
+    from importlib.resources import files
+    return str(files('vibecheck') / 'examples')
 
 
 # --------------------------------------------------------------------- supports

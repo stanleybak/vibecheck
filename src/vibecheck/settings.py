@@ -1544,8 +1544,8 @@ def default_settings(**overrides):
         # (no penalty, but not SAT ground truth). The replayed OUTPUT must
         # violate the spec with NO tolerance. That output tolerance is therefore
         # FIXED at 0.0 and is deliberately NOT a setting (hard-wired `out_atol=0.0`
-        # at every `_validate_sat_witness` call site and in the vendored
-        # competition checker vnncomp_cex_v2.py), so no config can ever loosen it.
+        # at every `_validate_sat_witness` call site and in the scorer-faithful
+        # checker cex_check_v2.py), so no config can ever loosen it.
         # (VC also clamps the emitted witness strictly in-box, so its inputs are
         # exact and it scores CORRECT, not merely CORRECT_WITH_TOLERANCE.)
         sat_validate_atol=1e-4,
