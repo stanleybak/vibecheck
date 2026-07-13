@@ -718,8 +718,21 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                                                       merged[-1])))
                         inter[k2] = tuple(merged)
             Wq = W if row_groups is None else W[row_groups[brow]]
-            lbq, Ain = backward.crown(net, blo, bhi, Wq, inter,
-                                      return_input_adjoint=True)
+            if (os.environ.get('VC2_MSUB_NOCROWN') and zm_res is not None
+                    and brow is not None):
+                # THROUGHPUT EXPERIMENT (planes-probe finding: the dual
+                # family's gap is leaves/sec, not tightness -- v1 runs
+                # forward-only bounds at ~4x our round rate): skip the
+                # per-round backward crown in multi-sub rad rounds; the
+                # forward-zono spec concretization alone is the bound.
+                # Sound (zm is an independent valid lower bound); loses
+                # the clip's (A, c) linearization for these rounds.
+                lbq = torch.full((blo.shape[0], zm_res.shape[1]),
+                                 -torch.inf, device=dev, dtype=zm_res.dtype)
+                Ain = None
+            else:
+                lbq, Ain = backward.crown(net, blo, bhi, Wq, inter,
+                                          return_input_adjoint=True)
         except torch.cuda.OutOfMemoryError:
             # v1's round-level pattern: push the popped batch back, halve
             # the batch, retry (one guard covers every stage of the bound;
@@ -863,7 +876,9 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             continue
         if open_mask.any():
             olo, ohi = blo[open_mask], bhi[open_mask]
-            oA = Ain[open_mask]
+            # crown skipped (VC2_MSUB_NOCROWN experiment): no (A, c)
+            # linearization -> no clip, widest-dim scoring
+            oA = Ain[open_mask] if Ain is not None else None
             # ABC clip, per disjunct (v1 / abcrown clip_input_domain): a CE
             # satisfying disjunct d must lie in ALL of d's halfspaces
             # L_r(x) <= 0, so clip the box against each open disjunct's
@@ -872,7 +887,13 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             # (iso instance_3: v1 with this clip 55s / ~2.5k queue, without
             # it timeout -- it is the load-bearing certifier, not the alpha)
             oref = refuted[open_mask]
-            if brow is not None:
+            if oA is None:
+                feas_any = torch.ones(olo.shape[0], dtype=torch.bool,
+                                      device=dev)
+                xl_u, xh_u = olo, ohi
+                if brow is not None:
+                    orow = brow[open_mask]
+            elif brow is not None:
                 # multi-sub: each domain clips against ITS OWN rows'
                 # halfspaces A_r.x + c_r <= 0 (a pure conjunction; group
                 # mode iterates the disjunct's rows, each tightening the
@@ -947,7 +968,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     f'open_disj_mean={float((~oref).float().sum(1).mean()):.2f}')
             olo = torch.where(feas_any.unsqueeze(1), xl_u, olo)
             ohi = torch.where(feas_any.unsqueeze(1), xh_u, ohi)
-            olo, ohi, oA = olo[feas_any], ohi[feas_any], oA[feas_any]
+            olo, ohi = olo[feas_any], ohi[feas_any]
+            oA = oA[feas_any] if oA is not None else None
             if brow is not None:
                 orow = orow[feas_any]
                 # per-domain query bound = the domain's OWN row (weight-deduped
@@ -960,7 +982,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             # Smart-Branching: estimated improvement per input dim; split the
             # top `split_dims` dims simultaneously -> 2^k children.
             # 'widest' ignores sensitivity (v1's dist_shift setting).
-            if heuristic == 'widest':
+            if heuristic == 'widest' or oA is None:
                 score = ohi - olo
             else:
                 # (group mode: oA's rows are the domain's OWN rows already,
@@ -998,7 +1020,18 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                                        'bounded': n_bounded,
                                        'splits': n_split,
                                        'reason': 'host_ram_cap'}
-            if brow is not None:
+            if brow is not None and oA is None:
+                # crown-skip mode: no parent linear forms for child
+                # pre-refutation; every child enqueues with the parent's
+                # bound as its frontier priority
+                w = lbq_open
+                reps_c = ch_lo.shape[0] // olo.shape[0]
+                f_lo = torch.cat([f_lo, ch_lo.to(fdev)])
+                f_hi = torch.cat([f_hi, ch_hi.to(fdev)])
+                f_row = torch.cat([f_row, orow.repeat(reps_c).to(fdev)])
+                f_worst = torch.cat([f_worst,
+                                     w.repeat(reps_c).to(fdev)])
+            elif brow is not None:
                 w = lbq_open                    # already per-domain (No,)
                 # child pre-refutation (abcrown's concretize step): the
                 # parent's own linear forms (A, c) are valid on any subset,

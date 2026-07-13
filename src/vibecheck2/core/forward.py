@@ -1072,3 +1072,208 @@ def alpha_zono(net, lo, hi, W, iters=200, lr=0.5, thresholds=None,
     if return_alphas:
         return best, best_alphas
     return best
+
+
+# --------------------------------------------------------------- planes
+
+class PlaneState:
+    """Forward-LiRPA bound state: per-neuron affine LOWER and UPPER planes
+    in the INPUT coordinates, plus the concretized box.
+
+        Al x + bl  <=  y  <=  Au x + bu   for all x in [xl, xh]
+
+    Al/Au: (B, n, n_in); bl/bu, lo, hi: (B, n). Unlike the zonotope's
+    single affine form with symmetric radius, the two INDEPENDENT planes
+    survive McCormick substitution at mul/reciprocal with per-subbox
+    factor bounds -- v1's forward-LiRPA, the piece that closes the
+    mscn_2048d family where the rad-collapsed zono pins at ~-2e-3."""
+
+    __slots__ = ('Al', 'bl', 'Au', 'bu', 'lo', 'hi')
+
+    def __init__(self, Al, bl, Au, bu, lo, hi):
+        self.Al, self.bl, self.Au, self.bu = Al, bl, Au, bu
+        self.lo, self.hi = lo, hi
+
+    def bounds(self):
+        return self.lo, self.hi
+
+    def linear_lb(self, W3):
+        """Sound lower bound of W y over the box: rows of W pick the lower
+        or upper plane by sign, evaluated at the plane's own box optimum
+        (already folded into lo/hi). W3: (B, q, n) -> (B, q)."""
+        return (torch.bmm(W3.clamp(min=0), self.lo.unsqueeze(2))
+                + torch.bmm(W3.clamp(max=0), self.hi.unsqueeze(2))
+                ).squeeze(2)
+
+
+def _pl_box(Al, bl, Au, bu, xl3, xh3):
+    """Concretize planes over the box: batched matmul with sign splits.
+    xl3/xh3: (B, n_in, 1)."""
+    lo = bl + (torch.bmm(Al.clamp(min=0), xl3)
+               + torch.bmm(Al.clamp(max=0), xh3)).squeeze(2)
+    hi = bu + (torch.bmm(Au.clamp(min=0), xh3)
+               + torch.bmm(Au.clamp(max=0), xl3)).squeeze(2)
+    return lo, hi
+
+
+def planes_supported(net):
+    """True when every op has a planes rule below (the multi-sub tight
+    forward is only offered where it fully applies; callers fall back to
+    the zonotope path otherwise)."""
+    from . import linmap as lmm
+    for nm in net.order:
+        op = net.ops[nm]
+        if op.kind == 'linmap':
+            if not isinstance(op.lm, (lmm.Dense, lmm.ScaleShift,
+                                      lmm.Select, lmm.SumAxis)):
+                return False
+        elif op.kind == 'nonlin':
+            if op.fn not in REL:
+                return False
+        elif op.kind not in ('add', 'mul', 'concat', 'input'):
+            return False
+    return True
+
+
+def planes(net, lo, hi, return_state=False):
+    """Forward-LiRPA pass (v1 forward_lirpa port): compose per-op affine
+    lower/upper planes in input coordinates. Nonlinearities reuse the SAME
+    RelaxLib planes the backward crown uses (one relaxation library); mul
+    is abc's middle McCormick (r=0.5) with sign-conditional substitution
+    of the factor planes -- the load-bearing difference vs the rad-mode
+    zonotope, which collapses factor correlations into |rad|."""
+    dev, dt = lo.device, lo.dtype
+    B, n_in = lo.shape
+    xl3 = lo.unsqueeze(2)
+    xh3 = hi.unsqueeze(2)
+    eye = torch.eye(n_in, device=dev, dtype=dt).expand(B, n_in, n_in)
+    zb = torch.zeros(B, n_in, device=dev, dtype=dt)
+    state = {net.input_name: PlaneState(eye, zb, eye, zb.clone(),
+                                        lo.clone(), hi.clone())}
+
+    def _mk(Al, bl, Au, bu):
+        lo_b, hi_b = _pl_box(Al, bl, Au, bu, xl3, xh3)
+        return PlaneState(Al, bl, Au, bu, lo_b, hi_b)
+
+    for name in net.order:
+        op = net.ops[name]
+        if op.kind == 'linmap':
+            z = state[op.inputs[0]]
+            from . import linmap as lmm
+            if isinstance(op.lm, lmm.Dense):
+                Wp = _op_const(op, 'Wpos', dev,
+                               lambda: torch.as_tensor(
+                                   op.lm.W, device=dev,
+                                   dtype=dt).clamp(min=0), dtype=dt)
+                Wn = _op_const(op, 'Wneg', dev,
+                               lambda: torch.as_tensor(
+                                   op.lm.W, device=dev,
+                                   dtype=dt).clamp(max=0), dtype=dt)
+                Al = torch.matmul(Wp, z.Al) + torch.matmul(Wn, z.Au)
+                Au = torch.matmul(Wp, z.Au) + torch.matmul(Wn, z.Al)
+                bl = z.bl @ Wp.T + z.bu @ Wn.T
+                bu = z.bu @ Wp.T + z.bl @ Wn.T
+            elif isinstance(op.lm, (lmm.Select, lmm.SumAxis)):
+                # all-nonnegative maps (gather / axis-sum, lin_abs == lin):
+                # no sign split; apply lin columnwise to the plane matrices
+                q = z.Al.shape[2]
+
+                def _mapmat(A):
+                    return op.lm.lin(
+                        A.transpose(1, 2).reshape(B * q, -1)) \
+                        .reshape(B, q, -1).transpose(1, 2).contiguous()
+
+                Al, Au = _mapmat(z.Al), _mapmat(z.Au)
+                bl, bu = op.lm.lin(z.bl), op.lm.lin(z.bu)
+            elif isinstance(op.lm, lmm.ScaleShift):
+                if op.lm.a is None:
+                    Al, Au, bl, bu = z.Al, z.Au, z.bl.clone(), z.bu.clone()
+                else:
+                    a = _op_const(op, 'ssa', dev,
+                                  lambda: torch.as_tensor(
+                                      op.lm.a, device=dev,
+                                      dtype=dt).reshape(-1), dtype=dt)
+                    ap, an = a.clamp(min=0), a.clamp(max=0)
+                    Al = ap.view(1, -1, 1) * z.Al + an.view(1, -1, 1) * z.Au
+                    Au = ap.view(1, -1, 1) * z.Au + an.view(1, -1, 1) * z.Al
+                    bl = ap * z.bl + an * z.bu
+                    bu = ap * z.bu + an * z.bl
+            else:
+                raise NotImplementedError(
+                    f'planes: linmap {type(op.lm).__name__} at {name!r}')
+            if getattr(op.lm, 'b', None) is not None:
+                bvec = _op_const(op, 'ssb', dev,
+                                 lambda: torch.as_tensor(
+                                     op.lm.b, device=dev,
+                                     dtype=dt).reshape(-1), dtype=dt)
+                bl = bl + bvec
+                bu = bu + bvec
+            state[name] = _mk(Al, bl, Au, bu)
+        elif op.kind == 'nonlin':
+            z = state[op.inputs[0]]
+            al, ibl, au, ibu = REL[op.fn].planes(z.lo, z.hi, op.params)
+            alp, aln = al.clamp(min=0), al.clamp(max=0)
+            aup, aun = au.clamp(min=0), au.clamp(max=0)
+            Al = alp.unsqueeze(2) * z.Al + aln.unsqueeze(2) * z.Au
+            bl = alp * z.bl + aln * z.bu + ibl
+            Au = aup.unsqueeze(2) * z.Au + aun.unsqueeze(2) * z.Al
+            bu = aup * z.bu + aun * z.bl + ibu
+            state[name] = _mk(Al, bl, Au, bu)
+        elif op.kind == 'add':
+            za, zc = state[op.inputs[0]], state[op.inputs[1]]
+            state[name] = _mk(za.Al + zc.Al, za.bl + zc.bl,
+                              za.Au + zc.Au, za.bu + zc.bu)
+        elif op.kind == 'mul':
+            za, zc = state[op.inputs[0]], state[op.inputs[1]]
+            # abc BoundMul middle McCormick (r=0.5), v1 forward_lirpa
+            # verbatim: y >= alpha a + beta c + gamma_l and
+            # y <= alpha a + beta c + gamma_u with alpha/beta the factor
+            # midpoints; the factor PLANES substitute in sign-
+            # conditionally, keeping per-subbox input correlation.
+            alpha = (zc.lo + zc.hi) * 0.5        # coefficient on a
+            beta = (za.lo + za.hi) * 0.5         # coefficient on c
+            g_l = -0.5 * (zc.hi * za.hi + zc.lo * za.lo)
+            g_u = -0.5 * (zc.lo * za.hi + zc.hi * za.lo)
+            ap, an = alpha.clamp(min=0), alpha.clamp(max=0)
+            bp, bn = beta.clamp(min=0), beta.clamp(max=0)
+            Al = (ap.unsqueeze(2) * za.Al + an.unsqueeze(2) * za.Au
+                  + bp.unsqueeze(2) * zc.Al + bn.unsqueeze(2) * zc.Au)
+            bl = (ap * za.bl + an * za.bu + bp * zc.bl + bn * zc.bu + g_l)
+            Au = (an.unsqueeze(2) * za.Al + ap.unsqueeze(2) * za.Au
+                  + bn.unsqueeze(2) * zc.Al + bp.unsqueeze(2) * zc.Au)
+            bu = (an * za.bl + ap * za.bu + bn * zc.bl + bp * zc.bu + g_u)
+            st = _mk(Al, bl, Au, bu)
+            # emission-declared output range (mscn cardinality heads)
+            if 'out_lo' in op.params:
+                st.lo = st.lo.clamp_min(op.params['out_lo'])
+            if 'out_hi' in op.params:
+                st.hi = torch.maximum(
+                    st.hi.clamp_max(op.params['out_hi']), st.lo)
+            state[name] = st
+        elif op.kind == 'concat':
+            base = _op_const(op, 'base', dev,
+                             lambda: torch.as_tensor(op.params['base'],
+                                                     device=dev, dtype=dt),
+                             dtype=dt)
+            n_out = op.params['n_out']
+            Al = torch.zeros(B, n_out, n_in, device=dev, dtype=dt)
+            Au = torch.zeros(B, n_out, n_in, device=dev, dtype=dt)
+            bl = base.expand(B, -1).clone()
+            bu = bl.clone()
+            for si, (src, pos) in enumerate(zip(op.inputs,
+                                                op.params['positions'])):
+                p = _op_const(op, ('pos', si), dev,
+                              lambda: torch.as_tensor(pos, device=dev))
+                zp = state[src]
+                Al[:, p] = zp.Al
+                Au[:, p] = zp.Au
+                bl[:, p] = zp.bl
+                bu[:, p] = zp.bu
+            state[name] = _mk(Al, bl, Au, bu)
+        else:
+            raise NotImplementedError(
+                f'planes: op kind {op.kind!r} at {name!r}')
+    out = state[net.output_name]
+    if return_state:
+        return out.lo, out.hi, state
+    return out.lo, out.hi
