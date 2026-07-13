@@ -93,7 +93,15 @@ class PatchAdjoint:
                 & ((xx >= 0) & (xx < W)).unsqueeze(1))         # (Q, ph, pw)
         v = self.v * mask.unsqueeze(0).unsqueeze(2).to(self.v.dtype)
         vals = v.reshape(B * Q, Cw, ph, pw)
-        out = F.conv_transpose2d(vals, k, stride=stride)
+        # Q-chunked: deep-edge walks carry ~4GB per conv_transpose output
+        # (784 queries x 64ch x 141^2); chunking bounds the transient peak
+        n_bq = vals.shape[0]
+        qc = max(1, int(3e8 // max(1, k.shape[1] * (ph + k.shape[2])
+                                   * (pw + k.shape[3]))))
+        outs_c = [F.conv_transpose2d(vals[s0:s0 + qc], k, stride=stride)
+                  for s0 in range(0, n_bq, qc)]
+        out = torch.cat(outs_c) if len(outs_c) > 1 else outs_c[0]
+        del outs_c
         ph2, pw2 = out.shape[2], out.shape[3]
         pa = PatchAdjoint(
             out.reshape(B, Q, -1, ph2, pw2), self.grid,
@@ -140,37 +148,48 @@ class PatchAdjoint:
     def gather_edge(self, t):
         """Window-aligned values of an edge tensor t (B, C*H*W) ->
         (B, Q, Cw, ph, pw): element (q, c, u, v) reads t at this window
-        element's edge position (out-of-range -> 0). The regular anchor
-        grid makes this one padded unfold."""
+        element's edge position (out-of-range -> 0). Indexed per-QUERY
+        gather: the previous full-frame F.unfold materialized windows for
+        every image position (L), not just the Q anchors -- 54GB at
+        relu8-depth walks (Q=784 vs L=12544) and the reason deep vgg
+        edges OOMed. Chunked over Q to bound the peak."""
         B, Q, Cw, ph, pw = self.v.shape
         C, H, W = self.edge_shape
         gh, gw = self.grid
-        sy, sx = self.step
-        by, bx = self.base
-        t4 = t.reshape(B, C, H, W)
-        # pad so every anchor lands in-range: left/top by -base (if
-        # negative), right/bottom to cover the last window
-        pl, pt = max(0, -bx), max(0, -by)
-        pr = max(0, bx + (gw - 1) * sx + pw - W)
-        pb = max(0, by + (gh - 1) * sy + ph - H)
-        t4 = F.pad(t4, (pl, pr, pt, pb))
-        u = F.unfold(t4, (ph, pw), stride=(sy, sx))    # (B, C*ph*pw, L)
-        u = u.reshape(B, C, ph, pw, -1)
-        gh_a = (t4.shape[2] - ph) // sy + 1
-        gw_a = (t4.shape[3] - pw) // sx + 1
-        u = u.reshape(B, C, ph, pw, gh_a, gw_a)
-        # anchor (0,0) of the query grid sits at padded coord
-        # (by+pt, bx+pl), stride-aligned by construction
-        oy, ox = (by + pt) // sy, (bx + pl) // sx
-        u = u[:, :, :, :, oy:oy + gh, ox:ox + gw]
-        u = u.permute(0, 4, 5, 1, 2, 3).reshape(B, Q, C, ph, pw)
-        if getattr(self, '_gather_full', False):
-            return u                        # caller slices (shared cache)
+        dev = self.v.device
+        t4 = t.reshape(B, C, H * W)
         ci = getattr(self, 'cidx', None)
-        if ci is not None:
-            return u[:, :, ci]
-        cw0 = getattr(self, 'chan_lo', 0)
-        return u[:, :, cw0:cw0 + Cw]
+        if ci is None:
+            cw0 = getattr(self, 'chan_lo', 0)
+            if getattr(self, '_gather_full', False):
+                tc = t4
+            else:
+                tc = t4[:, cw0:cw0 + Cw]
+        elif getattr(self, '_gather_full', False):
+            tc = t4
+        else:
+            tc = t4[:, ci]
+        Cs = tc.shape[1]
+        qy = torch.arange(gh, device=dev).repeat_interleave(gw)
+        qx = torch.arange(gw, device=dev).repeat(gh)
+        yy = (self.base[0] + qy * self.step[0]).unsqueeze(1) \
+            + torch.arange(ph, device=dev)                    # (Q, ph)
+        xx = (self.base[1] + qx * self.step[1]).unsqueeze(1) \
+            + torch.arange(pw, device=dev)                    # (Q, pw)
+        ok = (((yy >= 0) & (yy < H)).unsqueeze(2)
+              & ((xx >= 0) & (xx < W)).unsqueeze(1))          # (Q, ph, pw)
+        flat = (yy.clamp(0, H - 1).unsqueeze(2) * W
+                + xx.clamp(0, W - 1).unsqueeze(1))            # (Q, ph, pw)
+        out = torch.empty(B, Q, Cs, ph, pw, device=dev, dtype=t.dtype)
+        # Q-chunks: peak extra memory ~ chunk*Cs*ph*pw
+        qc = max(1, int(2e8 // max(1, Cs * ph * pw)))
+        for s0 in range(0, Q, qc):
+            e0 = min(Q, s0 + qc)
+            g = tc[:, :, flat[s0:e0].reshape(-1)]
+            g = g.reshape(B, Cs, e0 - s0, ph, pw).permute(0, 2, 1, 3, 4)
+            out[:, s0:e0] = g * ok[s0:e0].unsqueeze(0).unsqueeze(2) \
+                .to(t.dtype)
+        return out
 
     def through_planes(self, lam_lo, b_lo, lam_hi, b_hi, d):
         """Compose with a nonlin's two-sided linear planes (lower-bound
@@ -422,6 +441,8 @@ def patch_refine(net, edge, lo, hi, inter, chan_chunk=8, device=None,
                            pa.gather_edge(au), pa.gather_edge(bu))
                     pa._gather_full = False
                     nbytes = sum(t.numel() * t.element_size() for t in got)
+                    if pa.v.shape[3] * pa.v.shape[4] > 4096:
+                        nbytes = float('inf')   # huge-window: never cache
                     # cap the cache (the early wide edges' gathers are
                     # GBs; they are also the ones every walk repays)
                     if _gcache_sz[0] + nbytes < 3e9:
