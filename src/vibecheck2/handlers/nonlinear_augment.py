@@ -20,6 +20,17 @@ A nonlinear INPUT constraint g(X) {<,<=} 0 is just another atom -> another outpu
 folded into the DNF (so "g(X) violated OR property holds" over the full box, which
 is sound: points failing g are outside the real input region).
 
+STRICT direct input bounds (`X_i {<,>} a`, |coef| == 1) fold into the box at the
+NEXT representable value of the original net's input dtype instead of the closure
+value. Exact rewrite, sound in BOTH directions: the official 2026 checker
+(vnncomp2026_results 28455bb "fix bound precision") casts the witness assignment
+to the ONNX input dtype BEFORE evaluating input atoms, so the legal witness set
+is the input-dtype grid and {grid x : x > a} == {grid x : x >= succ_grid(a)}
+with nothing in between. Restricted to |coef| == 1 because for those atoms the
+checker's fp64 evaluation (+/-x + b vs 0) is sign-exact; a scaled atom's rounded
+evaluation can disagree with the implied bound by an ulp, so scaled and mixed
+strict atoms keep the closure fold (sound superset).
+
 The polynomial DNF is produced by vibecheck's own v2 parser (parse_vnnlib_v2 ->
 PolynomialConstraint terms/bias/strict); only the linear-only VNNSpec adapter
 rejects degree>=2, which this module bypasses. Correctness is gated by an
@@ -75,12 +86,32 @@ def is_nonlinear_v2_spec(vnnlib_text):
     return False
 
 
-def analyze(prop):
+def _grid_succ(a, dt):
+    """Smallest value of the float grid `dt` STRICTLY greater than fp64 `a`."""
+    g = dt(a)                          # round to nearest grid point
+    while float(g) <= a:
+        g = np.nextafter(g, dt(np.inf))
+    return float(g)
+
+
+def _grid_pred(a, dt):
+    """Largest value of the float grid `dt` STRICTLY less than fp64 `a`."""
+    g = dt(a)
+    while float(g) >= a:
+        g = np.nextafter(g, dt(-np.inf))
+    return float(g)
+
+
+def analyze(prop, in_grid=None):
     """Return (feats, cons, clauses, xbox).
     feats: ordered distinct monomials (tuples of var names).
     cons: distinct (coef_row {feat_idx:coef}, bias, strict).
     clauses: list of constraint-index lists (the DNF).
-    xbox: dict X-index -> [lo, hi] from the single-variable linear constraints."""
+    xbox: dict X-index -> [lo, hi] from the single-variable linear constraints.
+    in_grid: numpy float dtype of the net's input (np.float32/np.float64) or
+    None. When set, a STRICT direct bound (|coef| == 1) folds at the next grid
+    value (exact rewrite of the checker's witness set, see module docstring);
+    None or scaled/strict-mixed atoms keep the closure value."""
     feats, fidx = [], {}
 
     def feat_id(m):
@@ -89,19 +120,27 @@ def analyze(prop):
         return fidx[m]
 
     cons, cidx, clauses = [], {}, []
-    xlo, xhi = {}, {}
+    per_lo, per_hi = [], []      # one {xi: bound} dict per clause
     for cl in prop.spec.clauses:
         idxs = []
+        clo, chi = {}, {}
         for c in list(getattr(prop.spec, 'common', ())) + cl.constraints:
             # single-var linear X constraint -> also fold into the input box
             if (len(c.terms) == 1 and len(c.terms[0][0]) == 1
                     and c.terms[0][0][0].startswith('X')):
                 (var,), coef = c.terms[0][0], c.terms[0][1]
                 _, xi = _var_idx(var)
+                snap = c.strict and in_grid is not None and abs(coef) == 1.0
                 if coef < 0:                       # -|c|X + b <= 0 -> X >= b/|c|
-                    lo = c.bias / (-coef); xlo[xi] = min(xlo.get(xi, lo), lo)
+                    lo = c.bias / (-coef)
+                    if snap:
+                        lo = _grid_succ(lo, in_grid)
+                    clo[xi] = max(clo.get(xi, lo), lo)
                 else:                              # cX + b <= 0 -> X <= -b/c
-                    hi = -c.bias / coef; xhi[xi] = max(xhi.get(xi, hi), hi)
+                    hi = -c.bias / coef
+                    if snap:
+                        hi = _grid_pred(hi, in_grid)
+                    chi[xi] = min(chi.get(xi, hi), hi)
             row = {}
             for mono, coef in c.terms:
                 row[feat_id(mono)] = row.get(feat_id(mono), 0.0) + coef
@@ -110,8 +149,14 @@ def analyze(prop):
                 cidx[key] = len(cons); cons.append((row, c.bias, c.strict))
             idxs.append(cidx[key])
         clauses.append(idxs)
-    xbox = {i: [xlo.get(i, -1e6), xhi.get(i, 1e6)]
-            for i in sorted(set(xlo) | set(xhi))}
+        per_lo.append(clo); per_hi.append(chi)
+    # box = union over clauses: tightest bound WITHIN a clause (max of los /
+    # min of his), loosest ACROSS clauses -- a clause with no bound on a var
+    # contributes the +-1e6 default, so no clause's region is ever cut.
+    xbox = {}
+    for xi in sorted(set().union(*per_lo, *per_hi)):
+        xbox[xi] = [min(d.get(xi, -1e6) for d in per_lo),
+                    max(d.get(xi, 1e6) for d in per_hi)]
     return feats, cons, clauses, xbox
 
 
@@ -148,9 +193,15 @@ def _feat_value_nodes(feats, x_in, y_out, in_dim, out_dim):
     return nodes, inits, fnames
 
 
+_GRID_OF_ELEM = {TensorProto.FLOAT: np.float32, TensorProto.DOUBLE: np.float64}
+
+
 def augment(f_path, prop, out_path):
-    feats, cons, clauses, xbox = analyze(prop)
     mf = _prep(_load_onnx(f_path), 'f_')
+    # the checker casts the witness to the ORIGINAL net's input dtype before
+    # evaluating input atoms -> that grid is what strict bounds snap to
+    in_grid = _GRID_OF_ELEM.get(_free_input(mf).type.tensor_type.elem_type)
+    feats, cons, clauses, xbox = analyze(prop, in_grid=in_grid)
     fin = _free_input(mf).name
     fout = mf.graph.output[0].name
     in_shape = [d.dim_value for d in _free_input(mf).type.tensor_type.shape.dim]
@@ -250,9 +301,13 @@ def oracle(f_path, aug_path, feats, cons, xbox, n_in, in_shape, n=120, seed=0):
     return worst
 
 
+_CACHE_VERSION = 2      # bump on any change that alters the emitted artifacts
+
+
 def _cache_paths(net_path, vnnlib_path):
     h = hashlib.md5((os.path.abspath(net_path) + '|'
-                     + os.path.abspath(vnnlib_path)).encode()).hexdigest()[:12]
+                     + os.path.abspath(vnnlib_path)
+                     + f'|v{_CACHE_VERSION}').encode()).hexdigest()[:12]
     d = tempfile.gettempdir()
     return (os.path.join(d, f'vibecheck2_nlaug_{h}.onnx'),
             os.path.join(d, f'vibecheck2_nlaug_{h}.vnnlib'))
