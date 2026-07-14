@@ -378,3 +378,26 @@ def try_augmented_verify(onnx_path, vnnlib_path, timeout, device,
                                   y.astype(np.float64), '.17g',
                                   io_meta=_resolve_cex_io_meta(vnnlib_path))
     return 'sat', det
+
+
+def maybe_empty_input(vnnlib_path, log=print):
+    """INPUT-REGION PREFILTER (v1 main._maybe_empty_input ordering: runs
+    BEFORE the possibly multi-GB net parse). True iff the spec is a
+    nonlinear-v2 property whose per-clause pure-X constraints are jointly
+    infeasible -- the assert set has no solution for ANY output, so the
+    query is vacuously unsat in milliseconds. SOUND: the HC4 contractor
+    never reports a non-empty region as empty (mixed X-Y atoms are no-op
+    contractors; 1e-9 keep-tolerance guards fp noise). adaptive_cruise
+    ships 18/50 such instances."""
+    try:
+        text = _read_vnnlib_text(vnnlib_path)
+    except OSError:
+        return False                 # unreadable: the loader reports it
+    if not is_nonlinear_v2_spec(text):
+        return False
+    from ..frontend.input_feasibility import empty_input_region
+    if empty_input_region(parse_vnnlib_v2(text)):
+        log('[vc2] route: nonlinear-v2 input region EMPTY (HC4 '
+            'contractor) -> vacuously unsat, no verification')
+        return True
+    return False

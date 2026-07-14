@@ -142,3 +142,24 @@ def test_legacy_cli_untouched(tmp_path, capsys):
                   '--results-file', str(rf)])
     assert rf.read_text().splitlines()[0] == 'unsat'
     assert code == 0
+
+
+def test_nonlinear_augment_empty_region(tmp_path, capsys):
+    """A nonlinear-v2 spec whose X-constraints are jointly infeasible is
+    vacuously unsat via the input-region prefilter -- no net evaluation
+    (the onnx path can even be bogus)."""
+    q = tmp_path / 'empty.vnnlib'
+    q.write_text(
+        '(vnnlib-version <2.0>)\n'
+        '(declare-network f (declare-input X real [1,2])'
+        ' (declare-output Y real [1,1]))\n'
+        '(assert (and (>= X[0,0] 30.0) (<= X[0,0] 40.0)))\n'
+        '(assert (and (>= X[0,1] 0.0) (<= X[0,1] 1.0)))\n'
+        # the quadratic empties the region: X1^2 <= 1 but 200*X0 >= 6000
+        '(assert (>= (* X[0,1] X[0,1]) (* X[0,0] 200.0)))\n'
+        '(assert (> Y[0,0] 0.0))\n')
+    net = tmp_path / 'missing.onnx'   # never touched
+    code = vmain(['verify', str(q), '--network', f'f={net}',
+                  '--timeout', '30'])
+    assert capsys.readouterr().out.splitlines()[0] == 'unsat'
+    assert code == 0

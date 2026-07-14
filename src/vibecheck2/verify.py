@@ -120,6 +120,13 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     from .frontend.spec import VNNSpec
     from .frontend.vnnlib_loader import load_vnnlib
     t0 = time.time()
+    # v1 ordering: the nonlinear-v2 input-region prefilter runs BEFORE
+    # the net parse -- an empty region is vacuously unsat in milliseconds
+    # (handlers.nonlinear_augment.maybe_empty_input; sound HC4 contractor)
+    from .handlers.nonlinear_augment import maybe_empty_input
+    if maybe_empty_input(vnnlib_path, log=log):
+        return 'unsat', {'time': time.time() - t0,
+                         'reason': 'empty_input_region'}
     try:
         if net_cache and os.path.exists(net_cache):
             # VNNCOMP prepare-stage cache: the conversion ran once in
@@ -1258,20 +1265,11 @@ def _legacy_main(argv=None):
         # ORT-oracle-gated), then verify normally (design: frontends port)
         from .frontend import network_pair as npair
         a.net, a.spec = npair.build_merged_instance(a.net, a.spec)
-    else:
-        # nonlinear v2 spec (adaptive_cruise): v1's ORT-oracle-gated
-        # transpile to an augmented onnx + linear v1 spec. NOTE: an unsat on
-        # the augmented instance is sound for the original; a sat witness is
-        # re-validated by the chokepoint on the AUGMENTED net here, and the
-        # strict original-spec disposition is handler work (v1
-        # _sat_disposition), so borderline CEs may differ from v1 for now.
-        from .frontend import nonlinear_augment as nla
-        try:
-            text = nla._read_vnnlib_text(a.spec)
-        except (OSError, ValueError):
-            text = ''
-        if text and nla.is_nonlinear_v2_spec(text):
-            a.net, a.spec = nla.build_augmented_instance(a.net, a.spec)
+    # (a CLI-level nonlinear-v2 pre-transpile lived in an else-branch
+    # here; superseded by the verify()-level route: the input-region
+    # prefilter runs before the net parse, and a sat is re-validated
+    # STRICTLY against the original polynomial clauses -- closing the
+    # old path's flagged disposition gap)
     if a.results_file:                        # pre-seed like v1
         with open(a.results_file, 'w') as f:
             f.write('timeout\n')
