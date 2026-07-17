@@ -4,47 +4,43 @@
 
 The **vibecheck** formal verification tool is a high-performance, vibe-coded decision procedure for neural networks. Given an ONNX neural network and a VNNLIB specification, vibecheck tries to prove the property or find a counterexample. It solves the same open-loop neural network verification problem as established verifiers like [α,β-CROWN](https://github.com/Verified-Intelligence/alpha-beta-CROWN), [Marabou](https://github.com/NeuralNetworkVerification/Marabou), and [NNV](https://github.com/verivital/nnv), hopefully faster and on larger networks. Does your neural network pass the vibecheck?
 
-## Setup
-
-Use the [uv](https://docs.astral.sh/uv/) package manager for setup and configuration:
+## Install
 
 ```bash
-# Install uv (if you don't have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+pip install vibecheck-nn
+```
 
-uv python install 3.12
-uv venv --python 3.12 .venv
+This provides both the `vibecheck` command-line tool and the importable `vibecheck`
+Python package (requires Python 3.10+). For an isolated, always-available CLI,
+install it with [pipx](https://pipx.pypa.io/) instead:
+
+```bash
+pipx install vibecheck-nn
+```
+
+vibecheck depends on PyTorch, whose default wheel is a large CUDA build (roughly
+4 GB). On a CPU-only machine, install the CPU build of torch first, then vibecheck:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install vibecheck-nn
+```
+
+The default `graph` mode uses Gurobi (`gurobipy`, installed automatically) for its
+LP/MILP tightening. The bundled license is size-limited but fine for small models
+and the examples; verifying large networks needs a full
+[Gurobi license](https://www.gurobi.com/) (free for academics).
+
+### From source (development)
+
+```bash
+git clone https://github.com/stanleybak/vibecheck-nn
+cd vibecheck-nn
+uv venv --python 3.12 .venv                        # https://docs.astral.sh/uv/
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[dev]"
 ```
 
-The tool and tests can then be invoked with `.venv/bin/python`.
-
-## Dependencies
-
-Three packages are pinned to the **exact** versions used by the VNN-COMP 2026
-scorer and must not be floated:
-
-- **`onnx==1.21.0`** and **`onnxruntime==1.26.0`** — the official scorer replays
-  every `sat` witness on exactly these versions. vibecheck validates its own
-  counterexamples on the same engine, so a newer onnxruntime computing slightly
-  different floating-point outputs could make the scorer reject a witness
-  vibecheck accepts.
-- **`vnnlib==1.0.2`** — the VNNLIB-2.0 parser the scorer uses; pinned so v2
-  counterexample validation is bit-identical to official scoring.
-
-Bump these only when the official scorer's pins move, and move them together.
-
-`torch` is intentionally left unpinned. Note the default wheel is a CUDA build
-and is large: on a typical install `torch` plus the NVIDIA CUDA runtime libraries
-it pulls in total roughly **4 GB** (~1.2 GB torch + ~2.7 GB CUDA). For a
-CPU-only install, install torch from PyTorch's CPU index first, e.g.
-`pip install torch --index-url https://download.pytorch.org/whl/cpu`, then
-install vibecheck.
-
-`gurobipy` is a required dependency — the default `graph` mode's LP/MILP
-tightening uses it. The pip wheel ships a size-limited license that is sufficient
-for the bundled example and the test suite; a full Gurobi license is only needed
-for large models.
+Then use `.venv/bin/vibecheck` for the CLI and `.venv/bin/python` for the tests.
 
 ## Usage
 
@@ -119,8 +115,8 @@ The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
 
 ## Programmatic use
 
-`vibecheck.verify()` runs the **same** production pipeline as the CLI — auto-config
-selection, nonlinear augmentation, network-pair merge, and every soundness gate —
+`vibecheck.verify()` runs the **same** production pipeline as the CLI (auto-config
+selection, nonlinear augmentation, network-pair merge, and every soundness gate)
 and returns a `VerifyResult` you can inspect in-process:
 
 ```python
@@ -132,7 +128,7 @@ print(r.verdict)         # 'unsat' | 'sat' | 'unknown' | 'timeout' | 'error'
 if r.verdict == "sat":
     x = r.counterexample["X"]   # numpy array: the violating input
     y = r.counterexample["Y"]   # numpy array: the network's output on X
-print(r.details)         # verifier's verbose object (bounds/timings/config) — for debugging
+print(r.details)         # verifier's verbose object (bounds/timings/config), for debugging
 print(r.elapsed)         # wall-clock seconds
 ```
 
