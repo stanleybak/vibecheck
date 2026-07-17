@@ -49,7 +49,7 @@ vibecheck implements the VNN-LIB standard's solver CLI:
 ```bash
 vibecheck verify <query.vnnlib> --network NAME=<model.onnx> [--timeout SECONDS] \
                  [--serialise-assignments DIR]
-vibecheck supports <capability>        # e.g. --onnx-operators
+vibecheck supports <capability>        # for example --onnx-operators
 vibecheck --name | --version
 vibecheck --examples-dir               # path to the bundled example files
 ```
@@ -115,94 +115,59 @@ The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
 
 ## Programmatic use
 
-`vibecheck.verify()` runs the **same** production pipeline as the CLI (auto-config
-selection, nonlinear augmentation, network-pair merge, and every soundness gate)
-and returns a `VerifyResult` you can inspect in-process:
+`vibecheck.verify()` runs a verification like the CLI and returns a `VerifyResult`:
 
 ```python
+from importlib.resources import files
 from vibecheck import verify
 
-r = verify("model.onnx", "property.vnnlib", timeout=60)
+# a bundled ACAS-Xu example that has a counterexample
+ex = files("vibecheck") / "examples"
+r = verify(net=str(ex / "ACASXU_run2a_2_2_batch_2000.onnx"),
+           spec=str(ex / "prop_2.vnnlib"), timeout=60)
 
-print(r.verdict)         # 'unsat' | 'sat' | 'unknown' | 'timeout' | 'error'
-if r.verdict == "sat":
-    x = r.counterexample["X"]   # numpy array: the violating input
-    y = r.counterexample["Y"]   # numpy array: the network's output on X
-print(r.details)         # verifier's verbose object (bounds/timings/config), for debugging
-print(r.elapsed)         # wall-clock seconds
+print(r.verdict)              # 'sat'  (else 'unsat' / 'unknown' / 'timeout' / 'error')
+print(r.counterexample["X"])  # the violating input       (numpy array)
+print(r.counterexample["Y"])  # the network's output on X
 ```
 
-For a network **pair** (isomorphic / monotonic), `counterexample` is keyed per
-network: `{'X_f', 'Y_f', 'X_g', 'Y_g'}`. With no `config=`, `verify()` auto-selects
-a bundled config; pass `config="path/to.yaml"` to override, or `results_file=` to
-also write the VNNCOMP verdict line. Unlike the CLI it does **not** arm the
-hard-timeout process-kill watchdog, so it is safe to call from your own code.
+```
+sat
+[ 0.62086171 -0.0186218  -0.02431598  0.47021741 -0.46439469]
+[ 0.02380177 -0.02130638  0.02323286 -0.01635957  0.02302136]
+```
+
+`VerifyResult` also carries `.details` (the verifier's verbose object) and `.elapsed`.
 
 ## Tests
 
 ```bash
-# Unit tests: no external data, ~1-2 min (drop --cov for a faster run)
-.venv/bin/python -m pytest tests/ -k "not vnncomp" -m "not integration" \
-    --cov=src/vibecheck --cov-report=term
+# Unit tests: no external data, ~1-2 min
+.venv/bin/python -m pytest tests/ -k "not vnncomp" -m "not integration"
 
 # Per-benchmark verdict regressions (need a local benchmark clone; see below)
 .venv/bin/python -m pytest tests/integration -m integration
 ```
 
-The unit tests build synthetic ONNX/VNNLIB inline and need no external data, so
-they run on a fresh clone. Only the **integration** tests read benchmark paths
-from `tests/paths.yaml` (gitignored).
-
-Run a single unit test by node id, or a single integration case by its
-parametrized `desc` (the `-k` terms are AND-ed):
-
-```bash
-.venv/bin/python -m pytest tests/test_zonotope.py::test_propagate_fc -v
-.venv/bin/python -m pytest tests/integration/test_acasxu_2023.py -k "1_1 and prop_3" -m integration -v
-```
-
-## Running specific VNNCOMP benchmarks
-
-The integration tests (and any direct CLI run on competition models) load
-ONNX/VNNLIB from a local clone of the VNNCOMP benchmarks kept elsewhere on your
-system. The sets are published per year as `VNN-COMP/vnncomp<year>_benchmarks`,
-e.g. [vnncomp2025_benchmarks](https://github.com/VNN-COMP/vnncomp2025_benchmarks)
-and [vnncomp2026_benchmarks](https://github.com/VNN-COMP/vnncomp2026_benchmarks).
-Clone one and unpack its models:
+The [vnncomp2025_benchmarks](https://github.com/VNN-COMP/vnncomp2025_benchmarks)
+and [vnncomp2026_benchmarks](https://github.com/VNN-COMP/vnncomp2026_benchmarks)
+repositories hold hundreds of ONNX networks and VNNLIB specs you can run. Clone
+one, run its `setup.sh` to download the models, and point vibecheck at any instance:
 
 ```bash
 git clone https://github.com/VNN-COMP/vnncomp2025_benchmarks.git
 cd vnncomp2025_benchmarks
-./setup.sh        # downloads + unpacks the per-benchmark onnx/vnnlib
+./setup.sh        # downloads and unpacks the per-benchmark onnx/vnnlib
+
+# a quick ACAS-Xu sat case
+BENCH=benchmarks/acasxu_2023
+vibecheck verify "$BENCH/vnnlib/prop_2.vnnlib" \
+    --network N="$BENCH/onnx/ACASXU_run2a_1_2_batch_2000.onnx" --timeout 60   # -> sat
 ```
 
-> **Gotcha:** `setup.sh` seeds the network generator from the clone's directory
-> name, and on some machines that seed fails to build a few of the largest
-> networks. If it errors on a big benchmark, rename the clone directory (which
-> changes the seed) and re-run. This is an upstream benchmark-repo quirk, not a
-> vibecheck issue.
-
-To enable the integration tests, point `tests/paths.yaml` at the clone:
-
-```bash
-cp tests/paths.yaml.template tests/paths.yaml
-# edit `vnncomp_benchmarks:` to the clone root, e.g. ~/repositories/vnncomp2025_benchmarks
-```
-
-To run a single instance through the CLI, point `--net` / `--spec` at files in the
-clone (auto-config picks the matching bundled config):
-
-```bash
-BENCH=~/repositories/vnncomp2025_benchmarks/benchmarks/acasxu_2023
-.venv/bin/python -m vibecheck.main \
-    --net  "$BENCH/onnx/ACASXU_run2a_1_1_batch_2000.onnx" \
-    --spec "$BENCH/vnnlib/prop_3.vnnlib" \
-    --timeout 120 --results-file /tmp/r.txt
-cat /tmp/r.txt   # -> unsat (verified)
-```
-
-Each benchmark's `instances.csv` lists its `(onnx, vnnlib, timeout)` triples; pick
-any row to reproduce a specific case.
+The integration tests run such instances as regressions; point them at your clone
+by copying `tests/paths.yaml.template` to `tests/paths.yaml` and setting
+`vnncomp_benchmarks:` to the clone root.
 
 ## Contributors
 
