@@ -2,12 +2,12 @@
 
 Schema: keys map 1:1 to `Settings` attrs. The YAML contains ONLY the
 overrides on top of `default_settings()` (which itself is dumped to
-`configs/default.yaml` for reference). Validation: every key must exist
+`vibecheck/configs/default.yaml` for reference). Validation: every key must exist
 in `default_settings()` — typos surface as KeyError at load time, not
 silently ignored.
 """
-import os
 import yaml
+from importlib.resources import files
 from pathlib import Path
 
 from .settings import default_settings
@@ -18,14 +18,15 @@ from .settings import default_settings
 #   description: one-sentence summary of the config's strategy, printed when it's used.
 _RESERVED_META = frozenset({'description'})
 
-# configs/ lives at the repo root (this file is src/vibecheck/config_loader.py).
-_CONFIGS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'configs')
+# configs/ is bundled inside the package (src/vibecheck/configs/), so it resolves
+# correctly whether run from a source checkout or an installed wheel. `files()`
+# returns a Traversable rooted at the package's install location.
+_CONFIGS_DIR = files('vibecheck') / 'configs'
 
 
 def config_path(name):
     """Absolute path to a bundled config by basename (e.g. 'acasxu_2023.yaml')."""
-    return os.path.join(_CONFIGS_DIR, name)
+    return str(_CONFIGS_DIR / name)
 
 
 def config_description(path):
@@ -57,7 +58,7 @@ def load_config(path):
     unknown = sorted(k for k in overrides if k not in known)
     assert not unknown, (
         f'unknown setting keys in {path}: {unknown}\n'
-        f'(known keys: see configs/default.yaml)')
+        f'(known keys: see vibecheck/configs/default.yaml)')
     return overrides
 
 
@@ -78,6 +79,6 @@ def parse_set_overrides(pairs):
         key, raw = item.split('=', 1)
         key = key.strip()
         assert key in known, (
-            f'unknown --set key {key!r} (known keys: see configs/default.yaml)')
+            f'unknown --set key {key!r} (known keys: see vibecheck/configs/default.yaml)')
         out[key] = yaml.safe_load(raw)
     return out

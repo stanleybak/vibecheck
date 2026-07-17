@@ -1,13 +1,14 @@
-"""Equivalence tests: VC's fast counterexample acceptance vs the VENDORED
-competition checker (vnncomp_cex_v2, byte-for-byte the VNN-COMP 2026 scorer).
+"""Equivalence tests: VC's fast counterexample acceptance (surrogate_pgd) vs the
+scorer-faithful checker (cex_check_v2, whose verdicts are pinned bit-identical to
+the VNN-COMP 2026 scorer by tests/test_cex_check_v2.py's frozen goldens).
 
-VC uses its own ~4 ms vectorized check in production (the competition's per-
+VC uses its own ~4 ms vectorized surrogate check in production (the full per-
 assertion checker is ~24 s on a 1.27M-dim spec). These tests assert VC's
-accept/reject VERDICT is identical to the competition checker on representative
-v2 instances — most importantly the STRICT-output (`>`/`<`) boundary that
-smart_turn hits (Y == threshold must be rejected) and the input-box tolerance.
+accept/reject VERDICT is identical to cex_check_v2 on representative v2
+instances — most importantly the STRICT-output (`>`/`<`) boundary that smart_turn
+hits (Y == threshold must be rejected) and the input-box tolerance.
 
-Requires the `vnnlib` package (pinned dep) — same as the competition checker.
+Requires the `vnnlib` package (pinned dep) — same as cex_check_v2.
 """
 import os
 import tempfile
@@ -16,7 +17,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from vibecheck.vnncomp_cex_v2 import validate_cex_v2, ACCEPTED_RESULTS
+from vibecheck.cex_check_v2 import validate_cex_v2, ACCEPTED_RESULTS
 from vibecheck.surrogate_pgd import parse_box_and_output
 
 

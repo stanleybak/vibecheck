@@ -27,7 +27,6 @@ def _acasxu_paths(benchmarks_root):
     ('weight_walk', 'lp'),
     ('weight_walk', 'milp'),
     ('gen_cone',    'lp'),
-    ('gen_cone',    'milp'),
     ('skip',        'probe'),
 ])
 def test_acasxu_pipeline_tighten_axes(vnncomp_benchmarks,

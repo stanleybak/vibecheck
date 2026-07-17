@@ -39,3 +39,4 @@ from .verify_zono_bnb import zonotope_bnb_verify
 from .settings import default_settings
 from .vnnlib_loader import load_vnnlib, parse_vnnlib_text
 from .spec import VNNSpec, Conjunct, Constraint, PairwiseConstraint
+from .main import verify, VerifyResult
