@@ -144,9 +144,6 @@ sat
 ```bash
 # Unit tests: no external data, ~1-2 min
 .venv/bin/python -m pytest tests/ -k "not vnncomp" -m "not integration"
-
-# Per-benchmark verdict regressions (need a local benchmark clone; see below)
-.venv/bin/python -m pytest tests/integration -m integration
 ```
 
 The [vnncomp2025_benchmarks](https://github.com/VNN-COMP/vnncomp2025_benchmarks)
@@ -164,10 +161,6 @@ BENCH=benchmarks/acasxu_2023
 vibecheck verify "$BENCH/vnnlib/prop_2.vnnlib" \
     --network N="$BENCH/onnx/ACASXU_run2a_1_2_batch_2000.onnx" --timeout 60   # -> sat
 ```
-
-The integration tests run such instances as regressions; point them at your clone
-by copying `tests/paths.yaml.template` to `tests/paths.yaml` and setting
-`vnncomp_benchmarks:` to the clone root.
 
 ## Contributors
 
