@@ -1,147 +1,84 @@
-"""Unit tests for nonlinear_augment: transpile a NONLINEAR v2 spec (degree>=2
-polynomial atoms, X*Y coupling) into an augmented ONNX (runs f, then computes each
-constraint polynomial as an extra output) + a linear v1 DNF spec. Covers detection,
-analysis (feats/cons/xbox), the augmentation graph, the v1 emitter, and the
-oracle-gated end-to-end builder, on a tiny synthetic 2-in/1-out net.
-"""
+"""Nonlinear-v2 augment handler: strict-bound grid tightening.
+
+The official 2026 checker (vnncomp2026_results 28455bb) casts the witness
+assignment to the ONNX input dtype before evaluating input atoms, so the
+legal witness set is the input-dtype grid and a STRICT direct bound
+`X > a` is exactly `X >= succ_grid(a)`. These tests pin that fold."""
 import numpy as np
-import onnx
-from onnx import helper, TensorProto
-import onnxruntime as ort
-import pytest
 
-from vibecheck import nonlinear_augment as nla
-from vibecheck.vnnlib_loader import parse_vnnlib_v2, load_vnnlib
+from vibecheck.handlers.nonlinear_augment import (_grid_pred, _grid_succ,
+                                                   analyze)
+from vibecheck.frontend.vnnlib_loader import parse_vnnlib_v2
 
 
-# tiny net f(X) = X0 + X1  (Gemm, 2-in -> 1-out)
-def _tiny_net(path):
-    W = helper.make_tensor('W', TensorProto.FLOAT, [1, 2], [1.0, 1.0])
-    b = helper.make_tensor('b', TensorProto.FLOAT, [1], [0.0])
-    node = helper.make_node('Gemm', ['X', 'W', 'b'], ['Y'], transB=1)
-    g = helper.make_graph(
-        [node], 'f',
-        [helper.make_tensor_value_info('X', TensorProto.FLOAT, [1, 2])],
-        [helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 1])],
-        [W, b])
-    m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 13)])
-    m.ir_version = 7
-    onnx.save(m, path)
+def test_grid_succ_pred_f32():
+    s0 = _grid_succ(0.0, np.float32)
+    assert s0 > 0.0 and np.float32(s0) > 0.0
+    assert float(np.nextafter(np.float32(s0), np.float32(-np.inf))) <= 0.0
+    p40 = _grid_pred(40.0, np.float32)
+    assert p40 < 40.0 and float(np.nextafter(np.float32(p40),
+                                             np.float32(np.inf))) >= 40.0
+    # non-representable threshold: smallest f32 strictly above 0.1
+    s = _grid_succ(0.1, np.float32)
+    assert s > 0.1 and float(np.nextafter(np.float32(s),
+                                          np.float32(-np.inf))) <= 0.1
 
 
-# nonlinear v2 spec: X-box [0,1]^2, two output clauses, a degree-2 monomial
-# (X0*X1), an X*Y coupling (X0*Y0), and a STRICT atom (Y0 < 1.0).
-_V2 = """
-(vnnlib-version <2.0>)
-(declare-network f (declare-input X float32 [1,2]) (declare-output Y float32 [1,1]))
-(assert (and (>= X[0,0] 0.0) (<= X[0,0] 1.0)))
-(assert (and (>= X[0,1] 0.0) (<= X[0,1] 1.0)))
-(assert (or (<= (* X[0,0] X[0,1]) 0.5)
-            (and (< Y[0,0] 1.0) (<= (* X[0,0] Y[0,0]) 0.3))))
-"""
-
-_V1_LINEAR = """
-(declare-const X_0 Real)
-(declare-const Y_0 Real)
-(assert (<= X_0 1.0))
-(assert (>= X_0 0.0))
-(assert (<= Y_0 0.0))
-"""
-
-_V2_LINEAR = """
-(vnnlib-version <2.0>)
-(declare-network N (declare-input X float32 [1]) (declare-output Y float32 [1]))
-(assert (<= X[0] 1.0))
-(assert (>= X[0] 0.0))
-(assert (<= Y[0] 0.0))
-"""
+def test_grid_succ_pred_f64_identity_grid():
+    a = 1.25
+    assert _grid_succ(a, np.float64) == float(np.nextafter(a, np.inf))
+    assert _grid_pred(a, np.float64) == float(np.nextafter(a, -np.inf))
 
 
-def test_var_idx():
-    assert nla._var_idx('X_0') == ('X', 0)
-    assert nla._var_idx('Y_3') == ('Y', 3)
+_SPEC = (
+    '(vnnlib-version <2.0>)\n'
+    '(declare-network f (declare-input X real [1,2])'
+    ' (declare-output Y real [1,1]))\n'
+    '(assert (and (>= X[0,0] 0.0) (<= X[0,0] 20.0)))\n'
+    '(assert (and (>= X[0,1] 0.0) (<= X[0,1] 40.0)))\n'
+    '(assert (> X[0,0] 0.0))\n'
+    '(assert (< X[0,1] 40.0))\n'
+    '(assert (>= (* X[0,0] 200.0) (* X[0,1] X[0,1])))\n'
+    '(assert (> Y[0,0] 0.0))\n')
 
 
-def test_is_nonlinear_v2_spec():
-    assert nla.is_nonlinear_v2_spec(_V2) is True
-    assert nla.is_nonlinear_v2_spec(_V1_LINEAR) is False     # v1 -> not 2.0
-    assert nla.is_nonlinear_v2_spec(_V2_LINEAR) is False     # v2 but degree 1
-    # v2-detected but unparseable -> caught (VnnlibParseError) -> False
-    assert nla.is_nonlinear_v2_spec(
-        "(vnnlib-version <2.0>)\n(declare-network N "
-        "(declare-input X float32 [1]) (declare-output Y float32 [1]))\n"
-        "(assert (badop X[0] 0))") is False
+def test_analyze_strict_fold_snaps_direct_bounds():
+    prop = parse_vnnlib_v2(_SPEC)
+    _, _, _, xbox = analyze(prop, in_grid=np.float32)
+    # strict > 0 beats the coexisting nonstrict >= 0 within the clause
+    assert xbox[0][0] == _grid_succ(0.0, np.float32)
+    # strict < 40 with |coef|==1 -> largest f32 below 40
+    assert xbox[1][1] == _grid_pred(40.0, np.float32)
 
 
-def test_is_nonlinear_fast_path_skips_parse(monkeypatch):
-    """A linear v2 spec (no `(*`/`(/` node) returns False via the fast-path —
-    WITHOUT the O(spec-size) `parse_vnnlib_v2` (which is ~37s on smart_turn's
-    121 MB input box). Proven by making the parser blow up if reached."""
-    def _boom(*a, **k):
-        raise AssertionError('parse_vnnlib_v2 must not run for a linear spec')
-    monkeypatch.setattr(nla, 'parse_vnnlib_v2', _boom)
-    lin = ('(vnnlib-version <2.0>)\n(declare-network N (declare-input X float32 '
-           '[1,2]) (declare-output Y float32 [1,1]))\n'
-           '(assert (<= X[0,0] 1.0))\n(assert (> Y[0,0] 0.5))\n')
-    assert nla.is_nonlinear_v2_spec(lin) is False
-    monkeypatch.undo()
-    # A spec WITH a multiplication is NOT short-circuited -> parsed -> nonlinear.
-    nl = ('(vnnlib-version <2.0>)\n(declare-network N (declare-input X float32 '
-          '[1,2]) (declare-output Y float32 [1,1]))\n'
-          '(assert (>= (* X[0,0] X[0,0]) 1.0))\n')
-    assert nla.is_nonlinear_v2_spec(nl) is True
+def test_analyze_per_clause_bounds_not_globalized():
+    """A bound present in only ONE clause of the DNF must not cut the other
+    clause's region (the box covers the union)."""
+    prop = parse_vnnlib_v2(
+        '(vnnlib-version <2.0>)\n'
+        '(declare-network f (declare-input X real [1,1])'
+        ' (declare-output Y real [1,1]))\n'
+        '(assert (and (>= X[0,0] 0.0) (<= X[0,0] 20.0)))\n'
+        '(assert (>= (* X[0,0] X[0,0]) 0.0))\n'
+        '(assert (or (and (>= X[0,0] 5.0) (> Y[0,0] 0.0))\n'
+        '            (and (< Y[0,0] -1.0))))\n')
+    _, _, _, xbox = analyze(prop)
+    assert xbox[0] == [0.0, 20.0]        # clause-2 has no X lower bound > 0
 
 
-def test_analyze_feats_cons_xbox():
-    prop = parse_vnnlib_v2(_V2)
-    feats, cons, clauses, xbox = nla.analyze(prop)
-    # degree-2 monomials present
-    assert any(len(m) == 2 for m in feats)
-    # X-box folded from the single-var linear constraints
-    assert xbox[0] == [0.0, 1.0]
-    assert xbox[1] == [0.0, 1.0]
-    # a STRICT constraint exists (Y0 < 1.0) and a non-strict one
-    assert any(strict for (_row, _b, strict) in cons)
-    assert any(not strict for (_row, _b, strict) in cons)
-    # DNF has two clauses
-    assert len(clauses) == 2
+def test_analyze_strict_fold_closure_without_grid():
+    prop = parse_vnnlib_v2(_SPEC)
+    _, _, _, xbox = analyze(prop, in_grid=None)
+    assert xbox[1][1] == 40.0            # closure: strictness dropped
 
 
-def test_build_augmented_instance_oracle_and_threshold(tmp_path):
-    net = str(tmp_path / 'f.onnx')
-    _tiny_net(net)
-    spec_path = str(tmp_path / 'spec.vnnlib')
-    open(spec_path, 'w').write(_V2)
-    aug_onnx, aug_vnnlib = nla.build_augmented_instance(net, spec_path)
-
-    # the v1 spec uses threshold 0 for BOTH strict and non-strict (sound superset)
-    txt = open(aug_vnnlib).read()
-    assert '-0.0001' not in txt and '-1e-04' not in txt
-    spec = load_vnnlib(aug_vnnlib)
-    for dj in spec.disjuncts:
-        for c in dj.constraints:
-            assert c.value == 0.0 and c.op == '<='
-
-    # augmented ONNX output == the true polynomial values at a sample point
-    prop = parse_vnnlib_v2(_V2)
-    feats, cons, _clauses, _xbox = nla.analyze(prop)
-    sess = ort.InferenceSession(open(aug_onnx, 'rb').read(),
-                                providers=['CPUExecutionProvider'])
-    x = np.array([0.3, 0.7], np.float32)
-    y_net = float(x[0] + x[1])
-    ref = nla._poly_eval(cons, x.astype(np.float64), np.array([y_net]), feats)
-    got = sess.run(None, {'X': x.reshape(1, 2)})[0].flatten()
-    np.testing.assert_allclose(got, ref, atol=1e-4)
-
-
-def test_build_augmented_instance_oracle_failure(tmp_path, monkeypatch):
-    """The oracle gates correctness: a wrong polynomial reference must raise."""
-    net = str(tmp_path / 'f.onnx')
-    _tiny_net(net)
-    spec_path = str(tmp_path / 'spec.vnnlib')
-    open(spec_path, 'w').write(_V2)
-    # corrupt _poly_eval so augmented output != reference -> oracle assert fires
-    monkeypatch.setattr(nla, '_poly_eval',
-                        lambda *a, **k: np.full(len(a[0]), 1e9))
-    with pytest.raises(AssertionError, match='oracle FAIL'):
-        nla.build_augmented_instance(net, spec_path)
+def test_analyze_scaled_strict_not_snapped():
+    prop = parse_vnnlib_v2(
+        '(vnnlib-version <2.0>)\n'
+        '(declare-network f (declare-input X real [1,1])'
+        ' (declare-output Y real [1,1]))\n'
+        '(assert (and (>= X[0,0] 0.0) (<= X[0,0] 20.0)))\n'
+        '(assert (> (* X[0,0] 2.0) 1.0))\n'
+        '(assert (>= (* X[0,0] X[0,0]) Y[0,0]))\n')
+    _, _, _, xbox = analyze(prop, in_grid=np.float32)
+    assert xbox[0][0] == 0.5             # closure value, no ulp snap

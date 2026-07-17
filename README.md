@@ -26,10 +26,11 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install vibecheck-nn
 ```
 
-The default `graph` mode uses Gurobi (`gurobipy`, installed automatically) for its
-LP/MILP tightening. The bundled license is size-limited but fine for small models
-and the examples; verifying large networks needs a full
-[Gurobi license](https://www.gurobi.com/) (free for academics).
+On a few hard networks vibecheck escalates to an exact MILP refutation backed by
+Gurobi (`gurobipy`, installed automatically). The bundled license is size-limited
+but fine for small models and the examples; large networks that reach that
+escalation need a full [Gurobi license](https://www.gurobi.com/) (free for
+academics).
 
 ### From source (development)
 
@@ -68,19 +69,14 @@ is progress on stderr (trimmed here):
 ```console
 $ cd "$(vibecheck --examples-dir)"
 $ vibecheck verify prop_1.vnnlib --network N=ACASXU_run2a_2_2_batch_2000.onnx --timeout 60
-Auto-config: acasxu_2023.yaml | rule 5: low input-dim (<=20) FC (input-split) | Low-dimensional ReLU FC (ACAS-Xu family): batched input-split BaB, hybrid ACAS-Xu path off.
-Loading network: ACASXU_run2a_2_2_batch_2000.onnx
-  22 ops, 6 ReLU layers, 0 fork points, input shape: (1, 1, 1, 5)
-Loading spec: prop_1.vnnlib
-  1 constraint(s), 1 disjunct(s)
-Running graph verification (device=gpu, impl=optimized, profile=auto:acasxu_2023.yaml(rule 5), timeout=60.0s)...
-[pgd] no CE: restarts=100 iters=100/100 gap(best_margin)=+4.012e+00 elapsed=0.29s
-[branch] iter=0 split X_1 (width=1.0000) leaves=1
-...
-[branch] iter=7 split X_2 (width=0.1250) leaves=17
-
-Result: verified
-  Time: 2.24s
+[vibecheck] device auto-selected: cuda
+[   0.1s] [vibecheck] Net(13 ops, in=5, out=5, input:1, linmap:7, relu:6)
+[   1.1s] [vibecheck/pgd] best_margin=+4.012e+00 iters=49 t=0.28s
+[   1.1s] [vibecheck] crown: worst=-5215.2451 open=1/1
+[   1.3s] [vibecheck] alpha-crown: worst=-1436.0988 open=1/1
+[   1.3s] [vibecheck/bab] refine probe: crown=-995.688 zono=-3352.839 -> full_refine=True
+[   1.6s] [vibecheck] input_split_bab (wide slice, alpha=8): unsat {'bounded': 397, 'splits': 99, 'rounds': 9}
+[vibecheck] verdict: unsat  (1.60s)
 unsat
 ```
 
@@ -90,24 +86,23 @@ And a violated property, where stdout is the verdict plus the satisfying assignm
 $ vibecheck verify prop_2.vnnlib --network N=ACASXU_run2a_2_2_batch_2000.onnx --timeout 60  2>/dev/null
 sat
 X float32 [1,1,1,5]
-0.6208617091178894
--0.01862180233001709
--0.024315983057022095
-0.47021740674972534
--0.46439468860626221
+0.61291265487670898
+-0.0035594701766967773
+-0.15507221221923828
+0.48228561878204346
+-0.46316659450531006
 Y float32 [1,5]
-0.023801768198609352
--0.021306384354829788
-0.023232858628034592
--0.016359567642211914
-0.023021360859274864
+0.051299020648002625
+-0.021836085245013237
+0.024599984288215637
+-0.014120602980256081
+0.023107599467039108
 ```
 
-The `Auto-config:` line shows config selection: with no `--config`, vibecheck
-auto-selects a bundled per-benchmark config from the structure of the network and
-spec (input dim, conv/transformer/nonlinear ops, network-pair kind) and logs which
-rule fired. To override, pass your own YAML with `--config /path/to/config.yaml`
-(its keys map 1:1 to the tool's settings).
+There is nothing to configure: vibecheck picks its verification route (attack,
+bound propagation, branch-and-bound, and the specialized handlers) from the
+structure of the network and spec, and the progress lines on stderr show which
+routes fired. `--device` defaults to CUDA when available, CPU otherwise.
 
 The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
 --results-file out.txt`, the form the VNNCOMP harness drives) is unchanged; see
@@ -133,17 +128,17 @@ print(r.counterexample["Y"])  # the network's output on X
 
 ```
 sat
-[ 0.62086171 -0.0186218  -0.02431598  0.47021741 -0.46439469]
-[ 0.02380177 -0.02130638  0.02323286 -0.01635957  0.02302136]
+[[[[ 0.61291265 -0.00355947 -0.15507221  0.48228562 -0.4631666 ]]]]
+[[ 0.05129902 -0.02183609  0.02459998 -0.0141206   0.0231076 ]]
 ```
 
-`VerifyResult` also carries `.details` (the verifier's verbose object) and `.elapsed`.
+`VerifyResult` also carries `.details` (timings and the route taken) and `.elapsed`.
 
 ## Tests
 
 ```bash
-# Unit tests: no external data, ~1-2 min
-.venv/bin/python -m pytest tests/ -k "not vnncomp" -m "not integration"
+# Unit tests: no external data, ~10 seconds
+.venv/bin/python -m pytest tests/
 ```
 
 The [vnncomp2025_benchmarks](https://github.com/VNN-COMP/vnncomp2025_benchmarks)
@@ -168,7 +163,8 @@ vibecheck verify "$BENCH/vnnlib/prop_2.vnnlib" \
 - **1.0.0**: the VNN-COMP 2026 engine with a reworked CLI (the VNN-LIB standard
   solver interface plus the legacy flat form) and pip packaging
   (`pip install vibecheck-nn`).
-- **1.1.0**: a clean-slate reimplementation of the verification core. Roughly
+- **1.1.0** (this release): a clean-slate reimplementation of the verification
+  core. Roughly
   95% as good as 1.0.0 on the VNN-COMP 2026 benchmarks (it solves about 97% as
   many instances, for about 92% of the score), with a much cleaner design in
   under a third of the code (about 18k lines versus 59k).

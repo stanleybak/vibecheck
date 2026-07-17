@@ -13,9 +13,6 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "scipy",
-    # YAML config loading is core: config_loader / config_detect / spec all import
-    # it at runtime (the auto-config selector and --config parsing).
-    "pyyaml",
     # onnx/onnxruntime are PINNED to the VNNCOMP 2026 witness-replay environment
     # (onnx 1.21.0 / onnxruntime 1.26.0 / Python 3.12). The official scorer replays
     # every `sat` witness on exactly these versions; vibecheck validates its own
@@ -24,10 +21,10 @@ dependencies = [
     # floats. Bump both together only when the official scorer's pins move.
     "onnx==1.21.0",
     "torch",
-    "dotmap",
-    # Gurobi is used by the default `graph` mode's LP/MILP tightening. The pip
-    # wheel ships a size-limited license that is sufficient for the unit +
-    # integration tests; a full license is only needed for large models.
+    # Gurobi backs the exact-MILP refutation escalation (core/milp.py) that the
+    # pipeline reaches for on spread-slack relu nets. The pip wheel ships a
+    # size-limited license sufficient for the unit tests and the bundled
+    # examples; a full license is only needed for large models.
     "gurobipy",
     # onnxsim constant-folds dynamic-shape subgraphs (Shape/Gather/Concat) and
     # spectral-norm weight divisions into static form before graph construction.
@@ -41,21 +38,18 @@ dependencies = [
     # unpinned install pulling a newer ORT could compute a different witness Y and disagree
     # with the official scorer. CPUExecutionProvider is forced at every call site.
     "onnxruntime==1.26.0",
-    # surrogate-attack mode (surrogate_pgd.py): converts the folded float surrogate of an
-    # INT8-quantized model to torch for gradient-PGD. onnx2torch handles transformer ops
-    # (Softmax/Erf/LayerNorm) that vibecheck's own forward graph does not.
+    # quantized-surrogate attack handler (handlers/quant_surrogate.py): converts the
+    # folded float surrogate of an INT8-quantized model to torch for gradient-PGD.
+    # onnx2torch handles transformer ops (Softmax/Erf/LayerNorm) that vibecheck's own
+    # forward graph does not.
     "onnx2torch",
-    # VNNLIB-2.0 parser used by the VENDORED competition counterexample checker
-    # (vnncomp_cex_v2.py). PINNED to the exact version the VNN-COMP 2026 scorer
-    # uses so our v2 CE validation is bit-identical to the official scoring.
-    "vnnlib==1.0.2",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov", "onnxruntime==1.26.0"]
 
 [project.scripts]
-vibecheck = "vibecheck.main:main"
+vibecheck = "vibecheck.verify:main"
 
 [project.urls]
 Homepage = "https://github.com/stanleybak/vibecheck-nn"
@@ -65,7 +59,7 @@ Repository = "https://github.com/stanleybak/vibecheck-nn"
 where = ["src"]
 
 [tool.setuptools.package-data]
-vibecheck = ["configs/*.yaml", "examples/*"]
+vibecheck = ["examples/*"]
 
 [tool.pytest.ini_options]
 markers = [
