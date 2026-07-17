@@ -152,6 +152,17 @@ cat /tmp/r.txt   # -> unsat (verified)
 Each benchmark's `instances.csv` lists its `(onnx, vnnlib, timeout)` triples; pick
 any row to reproduce a specific case.
 
+## Versions
+
+- **`vnncomp_2026`** (git tag): the exact code submitted to VNN-COMP 2026.
+- **1.0.0**: the VNN-COMP 2026 engine with a reworked CLI (the VNN-LIB standard
+  solver interface plus the legacy flat form) and pip packaging
+  (`pip install vibecheck-nn`).
+- **1.1.0**: a clean-slate reimplementation of the verification core. Roughly
+  95% as good as 1.0.0 on the VNN-COMP 2026 benchmarks (it solves about 97% as
+  many instances, for about 92% of the score), with a much cleaner design in
+  under a third of the code (about 18k lines versus 59k).
+
 ## Contributors
 
 * [Stanley Bak](https://stanleybak.com) (lead)
