@@ -265,7 +265,7 @@ def run_verify(argv):
     if a.device is not None:
         legacy += ['--device', 'cuda' if a.device == 'gpu' else 'cpu']
 
-    from .verify import _legacy_main
+    from .pipeline import _legacy_main
     stdout = sys.stdout
     code = 0
     try:

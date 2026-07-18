@@ -76,7 +76,7 @@ def test_multisub_minigroups_all_refuted_unsat():
     aggregation; the identity net closes each chunk in one round.
     """
     from vibecheck.frontend.spec import VNNSpec, Conjunct, Constraint
-    from vibecheck.verify import _verify_groups, _subbox_groups
+    from vibecheck.pipeline import _verify_groups, _subbox_groups
     net = _identity_net()                       # y = x over R^2
     N = 1100
     disj = []

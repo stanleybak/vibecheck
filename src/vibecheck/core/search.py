@@ -1722,7 +1722,22 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             for bi in torch.nonzero(open_mask, as_tuple=False).flatten().tolist():
                 if best_edge[bi] is None:
                     # no unstable relu left: relaxation exact -> the domain
-                    # can only be sat; try to falsify, else give up loudly
+                    # can only be sat; try to falsify ONCE, else give up
+                    # loudly (previously returned unknown without the
+                    # attempt its comment promised: a 61%-of-box violation
+                    # region came back 'unknown' when splits exhausted
+                    # before the attack cadence ever fired)
+                    if onnx_path is not None and spec is not None:
+                        cand, _ = attack.pgd(net, spec, lo=lo1[0], hi=hi1[0],
+                                             restarts=128, iters=60,
+                                             device=device, time_budget=1.5,
+                                             seed=rounds)
+                        if cand is not None:
+                            ok, vinfo = attack.validate(onnx_path, spec,
+                                                        cand, log=log)
+                            if ok:
+                                return 'sat', {'witness': np.asarray(
+                                    vinfo.get('witness_inbox', cand))}
                     return 'unknown', {'reason': 'exhausted splits',
                                        'bounded': n_bounded}
                 base = batch_doms[bi].splits
@@ -1752,7 +1767,9 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                         fl_ch, bd_ch, ad_ch))
                     tick += 1
             if onnx_path is not None and (
-                    rounds % attack_every == 1
+                    attack_every <= 1          # every round (x % 1 == 1
+                                               # is never true)
+                    or rounds % attack_every == 1
                     or time.time() - last_atk > 8.0):
                 last_atk = time.time()
                 # BaB-GUIDED seeds (v1 _pgd_refine): each open (domain,

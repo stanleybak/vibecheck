@@ -250,7 +250,7 @@ def verify(net, spec, *, timeout=60, device=None, results_file=None,
 
 def _verify_paths(net, spec, *, timeout, device, results_file, extra_args):
     """File-path core of `verify()` (both arguments already canonical)."""
-    from .verify import _make_flat_parser, _run_flat
+    from .pipeline import _make_flat_parser, _run_flat
     argv = ['--net', str(net), '--spec', str(spec), '--timeout', str(timeout)]
     if device is not None:
         argv += ['--device', str(device)]

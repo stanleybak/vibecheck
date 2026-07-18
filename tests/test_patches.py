@@ -128,7 +128,7 @@ def test_peel_output_softmax():
     """Terminal softmax peels for pure-difference rows; stays for
     threshold rows (bias)."""
     from vibecheck.core.graph import Net, Op
-    from vibecheck.verify import _peel_output_softmax
+    from vibecheck.pipeline import _peel_output_softmax
     from vibecheck.frontend.spec import (VNNSpec, Conjunct, Constraint,
                                           PairwiseConstraint)
 

@@ -14,7 +14,7 @@ rm -f "$RESULTS_FILE"
 echo "[vc2:run] BEGIN category=$CATEGORY timeout=${TIMEOUT}s onnx=$ONNX_FILE"
 T0=$(date +%s.%N)
 NOATK=""; [ "${VC2_NO_ATTACK:-0}" = "1" ] && NOATK="--no-attack"
-"$PY" -m vibecheck.verify \
+"$PY" -m vibecheck.pipeline \
 	--net "$ONNX_FILE" --spec "$VNNLIB_FILE" \
 	--timeout "$TIMEOUT" --device "${VC2_DEVICE:-cuda}" \
 	$NOATK --results-file "$RESULTS_FILE"

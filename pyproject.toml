@@ -49,7 +49,7 @@ dependencies = [
 dev = ["pytest", "pytest-cov", "onnxruntime==1.26.0"]
 
 [project.scripts]
-vibecheck = "vibecheck.verify:main"
+vibecheck = "vibecheck.pipeline:main"
 
 [project.urls]
 Homepage = "https://github.com/stanleybak/vibecheck-nn"

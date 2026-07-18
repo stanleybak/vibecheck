@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from vibecheck import cli_standard as cs
-from vibecheck.verify import _verdict_str, main as vmain
+from vibecheck.pipeline import _verdict_str, main as vmain
 
 
 def test_name_version(capsys):

@@ -14,9 +14,9 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH="${VC2_SRC:-$TOOL_DIR
 echo "[vc2:prepare] BEGIN category=$CATEGORY onnx=$ONNX_FILE vnnlib=$VNNLIB_FILE"
 
 # narrow stale-proc kill (match ONLY vc2's verifier cmdline; never a broad kill)
-stale() { pgrep -f 'vibecheck\.verify' >/dev/null 2>&1; }
-pkill -f 'vibecheck\.verify' 2>/dev/null || true
-w=0; while stale && [ $w -lt 20 ]; do pkill -9 -f 'vibecheck\.verify' 2>/dev/null || true; sleep 1; w=$((w+1)); done
+stale() { pgrep -f 'vibecheck\.pipeline' >/dev/null 2>&1; }
+pkill -f 'vibecheck\.pipeline' 2>/dev/null || true
+w=0; while stale && [ $w -lt 20 ]; do pkill -9 -f 'vibecheck\.pipeline' 2>/dev/null || true; sleep 1; w=$((w+1)); done
 
 # GPU sanity: a missing/blind GPU means every timed run falls to CPU and times
 # out, so make it LOUD (non-fatal: the run still gets a chance).
