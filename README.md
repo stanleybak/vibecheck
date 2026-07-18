@@ -134,6 +134,29 @@ sat
 
 `VerifyResult` also carries `.details` (timings and the route taken) and `.elapsed`.
 
+Files are just one input form. `net` also accepts an in-memory `onnx.ModelProto`,
+serialized ONNX bytes, or a `torch.nn.Module` (exported with `torch.onnx.export`;
+pass `example_input=`), and `spec` accepts raw VNNLIB text or a `Spec` builder
+(an input box plus unsafe output regions):
+
+```python
+import torch
+from vibecheck import Spec, verify
+
+model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.ReLU())
+spec = Spec(x_lo=[0, 0], x_hi=[1, 1]).forbid([[1.0, 0.0]], [-100.0])  # unsafe: y0 >= 100
+r = verify(model, spec, timeout=30, example_input=torch.zeros(1, 2))
+print(r.verdict)   # 'unsat': y0 can never reach 100 on the unit box
+```
+
+Each `forbid(W, b)` call adds one unsafe disjunct (all rows of `W @ y + b >= 0`
+holding at once); rows must be single-output thresholds or zero-bias differences,
+the same grammar VNNLIB benchmark properties use — for anything richer, pass
+VNNLIB text. Whatever the input form, verification always runs on serialized
+ONNX + VNNLIB: every `sat` witness is replayed against exactly those bytes by the
+same ORT-CPU forward the VNNCOMP scorer uses, and for a torch module the verdict
+is a statement about the exported graph.
+
 ## Tests
 
 ```bash

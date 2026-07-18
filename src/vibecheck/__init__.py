@@ -34,4 +34,4 @@ _torch.backends.cuda.matmul.allow_tf32 = False
 _torch.backends.cudnn.allow_tf32 = False
 del _torch
 
-from .api import VerifyResult, verify
+from .api import Spec, VerifyResult, verify
