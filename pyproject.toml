@@ -62,6 +62,11 @@ where = ["src"]
 vibecheck = ["examples/*"]
 
 [tool.pytest.ini_options]
+# Two tiers: `pytest tests/` runs the quick suite (seconds); the thorough
+# coverage tier is opt-in via `pytest tests/ -m thorough` (a -m on the
+# command line overrides the default below).
+addopts = "-m 'not thorough'"
 markers = [
     "integration: per-benchmark verdict regression tests (slow; require GPU + vnncomp benchmarks)",
+    "thorough: comprehensive coverage tier (minutes, still no benchmark files); run with -m thorough",
 ]
