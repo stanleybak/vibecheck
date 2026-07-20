@@ -1,4 +1,4 @@
-"""THOROUGH tier: ONNX op-conversion sweep (frontend/onnx_loader +
+"""ONNX op-conversion sweep (frontend/onnx_loader +
 frontend/network + core/graph).
 
 One tiny model per op family; each must load through the full front end
@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 import torch
 
-pytestmark = pytest.mark.thorough
 
 _rng = np.random.default_rng(21)
 

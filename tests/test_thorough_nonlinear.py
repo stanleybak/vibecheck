@@ -1,4 +1,4 @@
-"""THOROUGH tier: the nonlinear-v2 route (handlers/nonlinear_augment) end
+"""The nonlinear-v2 route (handlers/nonlinear_augment) end
 to end -- polynomial atoms transpiled into an augmented net + linear spec
 (adaptive_cruise shape), and the HC4 input-region prefilter."""
 import numpy as np
@@ -7,7 +7,6 @@ import pytest
 import vibecheck.pipeline as vp
 from vibecheck.handlers.nonlinear_augment import is_nonlinear_v2_spec
 
-pytestmark = pytest.mark.thorough
 
 _HEAD = """(vnnlib-version <2.0>)
 (declare-network f

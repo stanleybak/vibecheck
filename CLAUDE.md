@@ -68,10 +68,10 @@ and branch-and-bound.
 ## Testing
 
 ```bash
-# vibecheck2 unit tests (fast, no benchmark files)
-PYTHONPATH=src taskset -c 0,1 ~/repositories/vibecheck-nn/.venv/bin/python -m pytest tests2/ -q
-# v1 suite (regression safety when touching shared v1 code)
-taskset -c 0,1 .venv/bin/python -m pytest tests/ -k "not vnncomp" -m "not integration" -q
+# unit tests (fast, no benchmark files). Since the 1.1.0 restructure the
+# clean-slate engine IS src/vibecheck (v1 lives on origin/main + the
+# vnncomp_2026 tag); tests2/ became tests/.
+PYTHONPATH=src taskset -c 0,1 .venv/bin/python -m pytest tests/ -q
 # point-prop / verdict parity vs ORT and the results matrix: scripts in scratch/clean_slate/
 ```
 

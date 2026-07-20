@@ -1,4 +1,4 @@
-"""THOROUGH tier: VNNLIB parsing edges (frontend/vnnlib_loader) and the
+"""VNNLIB parsing edges (frontend/vnnlib_loader) and the
 witness chokepoint's zero-tolerance policy (frontend/witness)."""
 import gzip
 
@@ -10,7 +10,6 @@ from vibecheck.frontend.witness import (_clamp_witness_to_box,
                                         _validate_sat_witness,
                                         _vnnlib_version)
 
-pytestmark = pytest.mark.thorough
 
 
 def test_or_blocks_union_input_box():

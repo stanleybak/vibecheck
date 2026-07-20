@@ -1,4 +1,4 @@
-"""THOROUGH tier: pipeline routes that the quick suite doesn't reach --
+"""Pipeline routes beyond the basics --
 the smooth-op (sin) relaxation route, the net-cache, the network-pair
 route through the flat runner, load-failure disposition, and the standard
 CLI's --serialise-assignments output."""
@@ -11,7 +11,6 @@ import torch
 import vibecheck.pipeline as vp
 from vibecheck import Spec
 
-pytestmark = pytest.mark.thorough
 
 
 def _sin_net(tmp_path):

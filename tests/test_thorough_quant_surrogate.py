@@ -1,4 +1,4 @@
-"""THOROUGH tier: the quantized-surrogate attack handler end to end
+"""The quantized-surrogate attack handler end to end
 (handlers/quant_surrogate) on a synthetic QDQ net.
 
 Net: X[1,4] float -> QDQ(X) -> Gemm(W, b) -> Y[1,2], the smart_turn
@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 import torch
 
-pytestmark = pytest.mark.thorough
 
 _W = np.array([[1.0, -1.0, 0.5, 0.25],
                [-0.5, 1.0, -0.25, 0.5]], np.float32)

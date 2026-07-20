@@ -160,15 +160,11 @@ is a statement about the exported graph.
 ## Tests
 
 ```bash
-# Quick tier (default): no external data, ~10 seconds
+# Unit tests: no external data, ~15 seconds
 .venv/bin/python -m pytest tests/
 
-# Thorough tier: the comprehensive coverage suite (op-conversion sweep,
-# handler flows, pipeline routes; still synthetic-only and fast)
-.venv/bin/python -m pytest tests/ -m thorough
-
-# Both tiers together, with line coverage
-.venv/bin/python -m pytest tests/ -m '' --cov=src/vibecheck --cov-report=term
+# with line coverage
+.venv/bin/python -m pytest tests/ --cov=src/vibecheck --cov-report=term
 ```
 
 The [vnncomp2025_benchmarks](https://github.com/VNN-COMP/vnncomp2025_benchmarks)
