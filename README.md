@@ -18,6 +18,15 @@ install it with [pipx](https://pipx.pypa.io/) instead:
 pipx install vibecheck-nn
 ```
 
+The `vibecheck` command is on your PATH whenever its install environment is active
+(or globally, with pipx). Otherwise, invoke it as a module in any environment where
+the package is installed:
+
+```bash
+python -m vibecheck --version
+python -m vibecheck verify <query.vnnlib> --network N=<model.onnx> --timeout 60
+```
+
 vibecheck depends on PyTorch, whose default wheel is a large CUDA build (roughly
 4 GB). On a CPU-only machine, install the CPU build of torch first, then vibecheck:
 
@@ -145,26 +154,31 @@ differences. For anything richer, pass raw VNNLIB text instead.
 
 ## Tests
 
+The unit tests take about 20 seconds and require no external models or data.
+
 ```bash
-# Unit tests: no external data, ~15 seconds
 .venv/bin/python -m pytest tests/
 ```
 
 The [vnncomp2025_benchmarks](https://github.com/VNN-COMP/vnncomp2025_benchmarks)
 and [vnncomp2026_benchmarks](https://github.com/VNN-COMP/vnncomp2026_benchmarks)
-repositories hold hundreds of ONNX networks and VNNLIB specs you can run. Clone
-one, run its `setup.sh` to download the models, and point vibecheck at any instance:
+repositories hold hundreds of ONNX networks and VNNLIB specs you can run as
+tests. Clone one and point vibecheck at any instance:
 
 ```bash
 git clone https://github.com/VNN-COMP/vnncomp2025_benchmarks.git
 cd vnncomp2025_benchmarks
-./setup.sh        # downloads and unpacks the per-benchmark onnx/vnnlib
+./setup.sh        # optional: downloads large models for benchmarks that need them
 
-# a quick ACAS-Xu sat case
+# extract row 0 (Id 0) of the acasxu instances.csv and run it
 BENCH=benchmarks/acasxu_2023
-vibecheck verify "$BENCH/vnnlib/prop_2.vnnlib" \
-    --network N="$BENCH/onnx/ACASXU_run2a_1_2_batch_2000.onnx" --timeout 60   # -> sat
+IFS=, read -r ONNX VNNLIB TIMEOUT < "$BENCH/instances.csv"
+vibecheck verify "$BENCH/$VNNLIB" --network N="$BENCH/$ONNX" --timeout "$TIMEOUT"   # -> unsat
 ```
+
+The expected verdict for each instance is published in the VNN-COMP report; for
+2025 see [arXiv:2512.19007](https://arxiv.org/abs/2512.19007), Table 70 (Id 0 is
+the row run above).
 
 ## Versions
 
