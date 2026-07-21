@@ -26,10 +26,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install vibecheck-nn
 ```
 
-On a few hard networks vibecheck escalates to an exact MILP refutation backed by
-Gurobi (`gurobipy`, installed automatically). The bundled license is size-limited
-but fine for small models and the examples; large networks that reach that
-escalation need a full [Gurobi license](https://www.gurobi.com/) (free for
+Certain analysis features build on Gurobi (`gurobipy`, installed automatically).
+The bundled license is size-limited but fine for small models and the examples;
+larger networks need a full [Gurobi license](https://www.gurobi.com/) (free for
 academics).
 
 ### From source (development)
@@ -45,7 +44,7 @@ Then use `.venv/bin/vibecheck` for the CLI and `.venv/bin/python` for the tests.
 
 ## Usage
 
-vibecheck implements the VNN-LIB standard's solver CLI:
+vibecheck implements the [VNN-LIB standard](https://www.vnnlib.org/)'s solver CLI:
 
 ```bash
 vibecheck verify <query.vnnlib> --network NAME=<model.onnx> [--timeout SECONDS] \
@@ -61,10 +60,10 @@ to stderr); `--serialise-assignments DIR` writes the assignment as ONNX
 TensorProtos instead. In `supports` output, a `*` after an identifier marks
 partial support, with a short note on the same line.
 
-Example, on the bundled ACAS-Xu network with a property that holds. The example
-files ship with the package; `vibecheck --examples-dir` prints their location, so
-`cd` there first to run with short filenames. Everything except the final `unsat`
-is progress on stderr (trimmed here):
+The example below verifies the bundled ACAS-Xu network against a property that
+holds. `vibecheck --examples-dir` prints where the bundled files live, so `cd`
+there first to use short filenames. Everything except the final `unsat` is
+progress on stderr (trimmed here):
 
 ```console
 $ cd "$(vibecheck --examples-dir)"
@@ -98,15 +97,6 @@ Y float32 [1,5]
 -0.014120602980256081
 0.023107599467039108
 ```
-
-There is nothing to configure: vibecheck picks its verification route (attack,
-bound propagation, branch-and-bound, and the specialized handlers) from the
-structure of the network and spec, and the progress lines on stderr show which
-routes fired. `--device` defaults to CUDA when available, CPU otherwise.
-
-The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
---results-file out.txt`, the form the VNNCOMP harness drives) is unchanged; see
-`vibecheck --help`.
 
 ## Programmatic use
 
@@ -150,21 +140,14 @@ print(r.verdict)   # 'unsat': y0 can never reach 100 on the unit box
 ```
 
 Each `forbid(W, b)` call adds one unsafe disjunct (all rows of `W @ y + b >= 0`
-holding at once); rows must be single-output thresholds or zero-bias differences,
-the same grammar VNNLIB benchmark properties use — for anything richer, pass
-VNNLIB text. Whatever the input form, verification always runs on serialized
-ONNX + VNNLIB: every `sat` witness is replayed against exactly those bytes by the
-same ORT-CPU forward the VNNCOMP scorer uses, and for a torch module the verdict
-is a statement about the exported graph.
+holding at once); its rows must be single-output thresholds or zero-bias
+differences. For anything richer, pass raw VNNLIB text instead.
 
 ## Tests
 
 ```bash
 # Unit tests: no external data, ~15 seconds
 .venv/bin/python -m pytest tests/
-
-# with line coverage
-.venv/bin/python -m pytest tests/ --cov=src/vibecheck --cov-report=term
 ```
 
 The [vnncomp2025_benchmarks](https://github.com/VNN-COMP/vnncomp2025_benchmarks)
