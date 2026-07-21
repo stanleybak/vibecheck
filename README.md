@@ -176,9 +176,9 @@ IFS=, read -r ONNX VNNLIB TIMEOUT < "$BENCH/instances.csv"
 vibecheck verify "$BENCH/$VNNLIB" --network N="$BENCH/$ONNX" --timeout "$TIMEOUT"   # -> unsat
 ```
 
-The expected verdict for each instance is published in the VNN-COMP report; for
-2025 see [arXiv:2512.19007](https://arxiv.org/abs/2512.19007), Table 70 (Id 0 is
-the row run above).
+The expected verdict for each instance is published in the
+[VNN-COMP 2025 report](https://arxiv.org/abs/2512.19007) (Table 70); Id 0 is the
+row run above.
 
 ## Versions
 
