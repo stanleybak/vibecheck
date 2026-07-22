@@ -12,11 +12,8 @@ build/
 # Local paths config
 tests/paths.yaml
 
-# Gurobi licensing is local-only -- never commit. The real node-locked license
-# lives solely in the VNNCOMP web form's post-install field, so post_install_tool.sh
-# (which holds it) is kept out of git entirely.
+# Gurobi licensing is local-only -- never commit.
 gurobi.lic
-vnncomp_scripts/post_install_tool.sh
 
 # Pytest
 .pytest_cache/
@@ -35,9 +32,16 @@ Thumbs.db
 
 # development files
 run_*.py
-# ...but the committed VNNCOMP batch runner is not a scratch script
-!vnncomp_scripts/run_benchmarks.py
 scratch/
+
+# Local dev-only tooling and notes (not part of the published tool)
+PIP_TODO.txt
+scripts/
+tools/
+vnncomp_scripts/
+
+# Internal benchmark records / design notes (not part of the published tool)
+docs/
 
 # Claude Code local config (agents, skills, periodic-campaign loop) — local-only,
 # not part of the published tool.

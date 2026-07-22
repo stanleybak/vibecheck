@@ -139,7 +139,7 @@ class VNNSpec:
     # sat-search finds the scorer-valid CE) instead of false-unsatting. The
     # bloat is purely conservative: it only ever WITHHOLDS `verified`, so it can
     # never turn a real `sat` into a false `unsat`. See main._verify (set only
-    # when `nonlinear_v2_augment`) and configs/adaptive_cruise_control_*.yaml.
+    # when `nonlinear_v2_augment`).
     unsat_margin_bloat: float = 0.0
 
     def check(self, output_lo, output_hi):
