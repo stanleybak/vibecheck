@@ -198,3 +198,5 @@ row run above.
 
 * [Stanley Bak](https://stanleybak.com) (lead)
 * Doug Wehbe (testing)
+
+The work was supported by the National Science Foundation under Award No. 2237229 and 2448869.
