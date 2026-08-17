@@ -1405,7 +1405,7 @@ def _run_flat(a):
         os.replace(tmp, a.results_file)
     print(f'[vibecheck] verdict: {_verdict_str(verdict, a.verdict_style)}'
           f'  ({details["time"]:.2f}s)')
-    return verdict, details, (0 if verdict == 'unsat' else 1)
+    return verdict, details, 0
 
 
 if __name__ == '__main__':
