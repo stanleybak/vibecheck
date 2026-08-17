@@ -9,7 +9,7 @@ description = "Vibe-Coded Neural Network Verification Tool"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 authors = [{ name = "Stanley Bak" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "scipy",
